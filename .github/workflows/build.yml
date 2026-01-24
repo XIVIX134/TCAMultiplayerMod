@@ -29,5 +29,5 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: TCAMultiplayer-DLL
-        path: src/bin/Release/netstandard2.0/TCAMultiplayer.dll
+        path: src/bin/Release/net472/TCAMultiplayer.dll
 

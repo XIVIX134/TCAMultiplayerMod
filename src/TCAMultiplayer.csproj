@@ -7,9 +7,9 @@
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     
-    <!-- Output directly to BepInEx plugins folder for easy testing -->
-    <OutputPath>..\..\..\BepInEx\plugins\TCAMultiplayer\</OutputPath>
-    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <!-- Standard output path for CI/Build -->
+    <OutputPath>bin\Release\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>true</AppendTargetFrameworkToOutputPath>
   </PropertyGroup>
 
   <!-- BepInEx and Harmony -->

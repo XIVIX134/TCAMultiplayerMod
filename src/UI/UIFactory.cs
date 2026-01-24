@@ -131,8 +131,8 @@ namespace TCAMultiplayer.UI
 
             input.text = initialValue;
             input.onValueChanged.AddListener(onValueChanged);
-            input.onSelect.AddListener((_) => { if (Falcon.Game2.UniPilot.LocalPlayer != null) Falcon.Game2.UniPilot.LocalPlayer.gameObject.SetActive(false); });
-            input.onDeselect.AddListener((_) => { if (Falcon.Game2.UniPilot.LocalPlayer != null) Falcon.Game2.UniPilot.LocalPlayer.gameObject.SetActive(true); });
+            input.onSelect.AddListener((_) => { if (Falcon.UniversalAircraft.UniAircraft.Player != null) Falcon.UniversalAircraft.UniAircraft.Player.gameObject.SetActive(false); });
+            input.onDeselect.AddListener((_) => { if (Falcon.UniversalAircraft.UniAircraft.Player != null) Falcon.UniversalAircraft.UniAircraft.Player.gameObject.SetActive(true); });
 
             return input;
         }
