@@ -5,3 +5,4 @@ bin/
 *.user
 BepInEx/
 *.log
+*.tmp

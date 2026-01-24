@@ -1,5 +1,0 @@
-            if (IsHost && Time.time - _lastStateBroadcast > STATE_BROADCAST_INTERVAL)
-            {
-                _lastStateBroadcast = Time.time;
-                Plugin.Instance?.Network?.BroadcastLobbyState();
-            }
