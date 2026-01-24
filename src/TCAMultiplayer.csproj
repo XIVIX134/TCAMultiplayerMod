@@ -15,11 +15,11 @@
   <!-- BepInEx and Harmony -->
   <ItemGroup>
     <Reference Include="BepInEx">
-      <HintPath>..\..\libs\BepInEx.dll</HintPath>
+      <HintPath>..\libs\BepInEx.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="0Harmony">
-      <HintPath>..\..\libs\0Harmony.dll</HintPath>
+      <HintPath>..\libs\0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
@@ -27,39 +27,39 @@
   <!-- Unity Engine -->
   <ItemGroup>
     <Reference Include="UnityEngine">
-      <HintPath>..\..\libs\UnityEngine.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>..\..\libs\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.PhysicsModule">
-      <HintPath>..\..\libs\UnityEngine.PhysicsModule.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.PhysicsModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.IMGUIModule">
-      <HintPath>..\..\libs\UnityEngine.IMGUIModule.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.IMGUIModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.InputLegacyModule">
-      <HintPath>..\..\libs\UnityEngine.InputLegacyModule.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.AudioModule">
-      <HintPath>..\..\libs\UnityEngine.AudioModule.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.AudioModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.ParticleSystemModule">
-      <HintPath>..\..\libs\UnityEngine.ParticleSystemModule.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.ParticleSystemModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.TextRenderingModule">
-      <HintPath>..\..\libs\UnityEngine.TextRenderingModule.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.TextRenderingModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.AnimationModule">
-      <HintPath>..\..\libs\UnityEngine.AnimationModule.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.AnimationModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
@@ -67,31 +67,31 @@
   <!-- Game Assembly -->
   <ItemGroup>
     <Reference Include="Assembly-CSharp">
-      <HintPath>..\..\libs\Assembly-CSharp.dll</HintPath>
+      <HintPath>..\libs\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.UI">
-      <HintPath>..\..\libs\UnityEngine.UI.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.UI.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Unity.TextMeshPro">
-      <HintPath>..\..\libs\Unity.TextMeshPro.dll</HintPath>
+      <HintPath>..\libs\Unity.TextMeshPro.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UniTask">
-      <HintPath>..\..\libs\UniTask.dll</HintPath>
+      <HintPath>..\libs\UniTask.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="ShapesRuntime">
-      <HintPath>..\..\libs\ShapesRuntime.dll</HintPath>
+      <HintPath>..\libs\ShapesRuntime.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Rewired_Core">
-      <HintPath>..\..\libs\Rewired_Core.dll</HintPath>
+      <HintPath>..\libs\Rewired_Core.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.UIModule">
-      <HintPath>..\..\libs\UnityEngine.UIModule.dll</HintPath>
+      <HintPath>..\libs\UnityEngine.UIModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
@@ -99,7 +99,7 @@
   <!-- Steam (for SteamTransport) -->
   <ItemGroup>
     <Reference Include="Facepunch.Steamworks.Win64">
-      <HintPath>..\..\libs\Facepunch.Steamworks.Win64.dll</HintPath>
+      <HintPath>..\libs\Facepunch.Steamworks.Win64.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>
