@@ -1,0 +1,33 @@
+name: Build Mod
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 6.0.x
+
+    - name: Restore dependencies
+      run: dotnet restore TCAMultiplayer.sln
+
+    - name: Build
+      run: dotnet build TCAMultiplayer.sln --configuration Release --no-restore
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: TCAMultiplayer-DLL
+        path: src/TCAMultiplayer/bin/Release/netstandard2.0/TCAMultiplayer.dll
+
