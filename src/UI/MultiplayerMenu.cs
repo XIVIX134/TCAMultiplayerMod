@@ -20,9 +20,9 @@ namespace TCAMultiplayer.UI
         private GameObject _backgroundPanel;
 
         private string _connectIP = "127.0.0.1";
-        private string _connectPort = "7777";
+        private string _connectPort = NetworkConfig.DEFAULT_PORT_STRING;
         private string _hostName = "TCA Server";
-        private string _hostPort = "7777";
+        private string _hostPort = NetworkConfig.DEFAULT_PORT_STRING;
         private string _username = "Player";
 
         public static async UniTask CreateAndRun()

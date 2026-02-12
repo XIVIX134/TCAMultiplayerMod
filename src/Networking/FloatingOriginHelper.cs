@@ -19,6 +19,7 @@ namespace TCAMultiplayer.Networking
         
         // Cached offset - updated each frame
         private static Vector3d _cachedTotalOffset = Vector3d.zero;
+        private static Vector3d _previousOffset = Vector3d.zero;
         private static float _lastUpdateTime = -1f;
         
         /// <summary>
@@ -143,7 +144,18 @@ namespace TCAMultiplayer.Networking
                     if (value != null)
                     {
                         // Could be Vector3, Vector3d, or custom type
+                        _previousOffset = _cachedTotalOffset;
                         _cachedTotalOffset = ConvertToVector3d(value);
+                        
+                        // Detect and log FloatingOrigin shifts
+                        double dx = _cachedTotalOffset.x - _previousOffset.x;
+                        double dy = _cachedTotalOffset.y - _previousOffset.y;
+                        double dz = _cachedTotalOffset.z - _previousOffset.z;
+                        double shiftSq = dx * dx + dy * dy + dz * dz;
+                        if (shiftSq > 1.0) // > 1m shift
+                        {
+                            Plugin.Log?.LogInfo($"[FloatingOriginHelper] Origin shifted! delta=({dx:F1},{dy:F1},{dz:F1}) new offset={_cachedTotalOffset}");
+                        }
                     }
                 }
             }

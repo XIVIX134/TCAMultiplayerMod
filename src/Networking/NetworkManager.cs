@@ -1,5 +1,6 @@
 using System;
 using UnityEngine;
+using TCAMultiplayer.Game;
 
 namespace TCAMultiplayer.Networking
 {
@@ -79,6 +80,7 @@ namespace TCAMultiplayer.Networking
             _router.RegisterHandler(PacketType.RadarLock, HandleRadarLock);
             _router.RegisterHandler(PacketType.RadarLockLost, HandleRadarLock);
             _router.RegisterHandler(PacketType.ProjectileImpact, HandleProjectileImpact);
+            _router.RegisterHandler(PacketType.KillConfirm, HandleKillConfirm);
 
             // Lobby packets - routed to LobbyManager
             _router.RegisterHandler(PacketType.LobbyState, HandleLobbyState);
@@ -224,6 +226,31 @@ namespace TCAMultiplayer.Networking
             }
         }
 
+        /// <summary>
+        /// Send kill confirmation packet to all peers for scoreboard sync.
+        /// Called by the victim when they are destroyed.
+        /// </summary>
+        public void SendKillConfirmation(ulong killerId, ulong victimId, string weaponName)
+        {
+            try
+            {
+                var packet = new KillConfirmPacket
+                {
+                    KillerId = killerId,
+                    VictimId = victimId,
+                    WeaponName = weaponName ?? "Unknown"
+                };
+
+                byte[] data = PacketSerializer.SerializeKillConfirm(packet);
+                SendPacket(PacketType.KillConfirm, data, reliable: true);
+                Plugin.Log.LogInfo($"[NetworkManager] Sent kill confirmation: {killerId} killed {victimId} with {weaponName}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogError($"[NetworkManager] SendKillConfirmation error: {ex.Message}");
+            }
+        }
+
         #endregion
 
         #region Transport Event Handlers
@@ -233,8 +260,15 @@ namespace TCAMultiplayer.Networking
             Plugin.Log.LogInfo($"[NetworkManager] Peer {peerId} connected!");
             _remoteAircraft.SetRemotePeer(peerId);
             OnPeerConnected?.Invoke(peerId);
-
+            
+            // Register both players in ScoreTracker with best-known names.
+            // Names will be updated again when lobby player-joined packets arrive.
             var lobby = Plugin.Instance?.Lobby;
+            string localName = lobby?.LocalPlayerName ?? lobby?.HostName ?? $"Player {LocalPeerId}";
+            string remoteName = $"Player {peerId}";
+            if (LocalPeerId != 0)
+                ScoreTracker.Instance?.RegisterPlayer(LocalPeerId, localName);
+            ScoreTracker.Instance?.RegisterPlayer(peerId, remoteName);
             if (lobby != null)
             {
                 if (IsHost)
@@ -344,6 +378,16 @@ namespace TCAMultiplayer.Networking
             Patches.WeaponPatches.HandleRadarLock(packet);
         }
 
+        private void HandleKillConfirm(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeKillConfirm(payload);
+            Plugin.Log.LogInfo($"[NetworkManager] Kill confirmed: {packet.KillerId} killed {packet.VictimId} with {packet.WeaponName}");
+            
+            // Record the kill in the scoreboard
+            Game.ScoreTracker.Instance?.RecordKill(packet.KillerId, packet.VictimId, packet.WeaponName);
+        }
+
         private void HandleProjectileImpact(ulong peerId, byte[] payload)
         {
             if (payload == null) return;
@@ -419,6 +463,11 @@ namespace TCAMultiplayer.Networking
             {
                 lobby.JoinLobby(LocalPeerId);
 
+                // Register players in ScoreTracker now that we have our real PeerId and names
+                ScoreTracker.Instance?.RegisterPlayer(LocalPeerId, lobby.LocalPlayerName);
+                // Host peer is always 1
+                ScoreTracker.Instance?.RegisterPlayer(1UL, packet.HostName ?? "Host");
+
                 var joinPacket = new LobbyPlayerJoinedPacket
                 {
                     PeerId = LocalPeerId,
@@ -442,6 +491,9 @@ namespace TCAMultiplayer.Networking
             if (payload == null) return;
             var packet = PacketSerializer.DeserializeLobbyPlayerJoined(payload);
             Plugin.Instance?.Lobby?.HandlePlayerJoined(packet.PeerId, packet.PlayerName);
+            
+            // Update ScoreTracker with the real player name now that we know it
+            ScoreTracker.Instance?.RegisterPlayer(packet.PeerId, packet.PlayerName);
         }
 
         private void HandleLobbyPlayerLeft(ulong peerId, byte[] payload)

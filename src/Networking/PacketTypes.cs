@@ -31,6 +31,7 @@ namespace TCAMultiplayer.Networking
         MissileLaunch = 32,
         RadarLock = 33,         // Sent when locking onto enemy (for RWR)
         RadarLockLost = 34,     // Sent when lock is broken
+        CountermeasureDeploy = 35, // Flares/chaff deployed
         
         // Damage (reliable)
         DamageDealt = 40,
@@ -42,6 +43,7 @@ namespace TCAMultiplayer.Networking
         Respawned = 51,
         AircraftChanged = 52,   // Sent when local player changes aircraft (respawn, new plane)
         Victory = 53,
+        KillConfirm = 54,       // Sent by victim to confirm a kill (for scoreboard sync)
         
         // Utility
         Ping = 100,
@@ -192,6 +194,15 @@ namespace TCAMultiplayer.Networking
     }
 
     /// <summary>
+    /// Countermeasure deployment packet (flares/chaff)
+    /// </summary>
+    public struct CountermeasurePacket
+    {
+        public ulong PlayerId;
+        public byte Type;       // 0 = flares, 1 = chaff, 2 = both
+    }
+
+    /// <summary>
     /// Aircraft state for network synchronization
     /// </summary>
     public struct AircraftStatePacket
@@ -262,6 +273,18 @@ namespace TCAMultiplayer.Networking
             get => (Flags & 0x08) != 0;
             set => Flags = (byte)(value ? Flags | 0x08 : Flags & ~0x08);
         }
+        
+        public bool IsFlareFiring
+        {
+            get => (Flags & 0x10) != 0;
+            set => Flags = (byte)(value ? Flags | 0x10 : Flags & ~0x10);
+        }
+        
+        public bool IsChaffFiring
+        {
+            get => (Flags & 0x20) != 0;
+            set => Flags = (byte)(value ? Flags | 0x20 : Flags & ~0x20);
+        }
     }
 
     /// <summary>
@@ -329,6 +352,17 @@ namespace TCAMultiplayer.Networking
         public ulong PlayerId;
         public string AircraftType; // e.g. "F-16", "AV-8B"
         public bool IsAlive;        // True = alive, False = destroyed
+    }
+
+    /// <summary>
+    /// Kill confirmation packet - sent by the destroyed player to confirm who killed them.
+    /// Both sides use this to update their scoreboard.
+    /// </summary>
+    public struct KillConfirmPacket
+    {
+        public ulong KillerId;      // Player who got the kill
+        public ulong VictimId;      // Player who was destroyed
+        public string WeaponName;   // Weapon that dealt the final blow
     }
 
     /// <summary>
@@ -469,6 +503,30 @@ namespace TCAMultiplayer.Networking
                     
                     Flags = reader.ReadByte(),
                     Timestamp = reader.ReadSingle()
+                };
+            }
+        }
+
+        public static byte[] SerializeCountermeasure(CountermeasurePacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
+            {
+                writer.Write(packet.PlayerId);
+                writer.Write(packet.Type);
+                return ms.ToArray();
+            }
+        }
+
+        public static CountermeasurePacket DeserializeCountermeasure(byte[] data)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var reader = new BinaryReader(ms))
+            {
+                return new CountermeasurePacket
+                {
+                    PlayerId = reader.ReadUInt64(),
+                    Type = reader.ReadByte()
                 };
             }
         }
@@ -631,6 +689,32 @@ namespace TCAMultiplayer.Networking
                     PlayerId = reader.ReadUInt64(),
                     AircraftType = reader.ReadString(),
                     IsAlive = reader.ReadBoolean()
+                };
+            }
+        }
+
+        public static byte[] SerializeKillConfirm(KillConfirmPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
+            {
+                writer.Write(packet.KillerId);
+                writer.Write(packet.VictimId);
+                writer.Write(packet.WeaponName ?? "Unknown");
+                return ms.ToArray();
+            }
+        }
+
+        public static KillConfirmPacket DeserializeKillConfirm(byte[] data)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var reader = new BinaryReader(ms))
+            {
+                return new KillConfirmPacket
+                {
+                    KillerId = reader.ReadUInt64(),
+                    VictimId = reader.ReadUInt64(),
+                    WeaponName = reader.ReadString()
                 };
             }
         }

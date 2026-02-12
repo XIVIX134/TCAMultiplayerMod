@@ -430,7 +430,8 @@ namespace TCAMultiplayer.Player
             {
                 if (_gameDataStoresType == null)
                 {
-                    _gameDataStoresType = Type.GetType("Falcon.Stores.GameDataStores, Assembly-CSharp");
+                    // Correct namespace is Falcon.GameDataStores (root namespace), NOT Falcon.Stores
+                    _gameDataStoresType = Type.GetType("Falcon.GameDataStores, Assembly-CSharp");
                 }
                 if (_gameDataStoresType == null)
                 {
@@ -529,6 +530,23 @@ namespace TCAMultiplayer.Player
                     if (prefab != null)
                     {
                         var instance = UnityEngine.Object.Instantiate(prefab);
+                        
+                        // If we loaded the base _Munition prefab, we MUST initialize it!
+                        if (path.Contains("_Munition"))
+                        {
+                            Plugin.Log?.LogInfo($"[RealCombatSync] Loaded base _Munition prefab. Attempting to initialize with type: {missileType}");
+                            var storeComp = instance.GetComponent("Store"); // Reflection-safe retrieval
+                            if (storeComp != null)
+                            {
+                                // Try to find InitializeStore method
+                                var initMethod = storeComp.GetType().GetMethod("InitializeStore", BindingFlags.Public | BindingFlags.Instance);
+                                if (initMethod != null)
+                                {
+                                    initMethod.Invoke(storeComp, new object[] { missileType });
+                                }
+                            }
+                        }
+                        
                         Plugin.Log?.LogInfo($"[RealCombatSync] Loaded missile from Resources: {path}");
                         return instance;
                     }

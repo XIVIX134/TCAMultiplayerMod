@@ -29,6 +29,8 @@ namespace TCAMultiplayer.Player
         public bool Afterburner { get; private set; }
         public bool GearDown { get; private set; }
         public bool IsFiring { get; private set; }
+        public bool IsFlareFiring { get; private set; }
+        public bool IsChaffFiring { get; private set; }
 
         public RemotePlayer(ulong playerId)
         {
@@ -70,6 +72,8 @@ namespace TCAMultiplayer.Player
             Afterburner = state.Afterburner;
             GearDown = state.GearDown;
             IsFiring = state.IsFiring;
+            IsFlareFiring = state.IsFlareFiring;
+            IsChaffFiring = state.IsChaffFiring;
         }
 
         /// <summary>

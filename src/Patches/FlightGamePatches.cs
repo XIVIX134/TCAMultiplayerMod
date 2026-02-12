@@ -50,7 +50,8 @@ namespace TCAMultiplayer.Patches
         private static FieldInfo _engineThrottleField = null;
 
         // FlightInput for control inputs
-        private static FieldInfo _flightInputField = null;
+        private static FieldInfo _flightInputField = null;          // UniPilot.FlightInput
+        private static FieldInfo _flightControlsField = null;       // UniAircraft.FlightControls (primary for player input)
         private static PropertyInfo _flightInputPitchProperty = null;
         private static PropertyInfo _flightInputRollProperty = null;
         private static PropertyInfo _flightInputYawProperty = null;
@@ -60,6 +61,14 @@ namespace TCAMultiplayer.Patches
         private static FieldInfo _flightInputThrottleField = null;
         private static PropertyInfo _flightInputIsAfterburningProperty = null;
         private static PropertyInfo _flightInputNozzleAnalogProperty = null;
+        // StickAndRudder sub-object on FlightInput (alternative raw input source)
+        private static FieldInfo _stickAndRudderField = null;
+        private static PropertyInfo _sarPitchProperty = null;
+        private static PropertyInfo _sarRollProperty = null;
+        private static PropertyInfo _sarYawProperty = null;
+        private static FieldInfo _sarPitchField = null;
+        private static FieldInfo _sarRollField = null;
+        private static FieldInfo _sarYawField = null;
 
         // Cached objects for reading state
         private static object _cachedFirstEngine = null;
@@ -120,7 +129,7 @@ namespace TCAMultiplayer.Patches
                 if (!_inFlight) return;
 
                 // Send state at fixed interval
-                if (Time.time - _lastStateSendTime >= NetworkConfig.STATE_SEND_INTERVAL)
+                if (Time.time - _lastStateSendTime >= NetworkConfig.CurrentStateSendInterval)
                 {
                     _lastStateSendTime = Time.time;
                     SendLocalPlayerState();
@@ -128,6 +137,9 @@ namespace TCAMultiplayer.Patches
 
                 // Check for respawn (aircraft changed)
                 CheckForRespawn();
+
+                // Poll for new missile launches (replaces broken Harmony Postfix)
+                WeaponPatches.PollMissileLaunches();
 
                 // Check radar lock state for RWR sync
                 if (_cachedUniAircraft != null)
@@ -145,12 +157,127 @@ namespace TCAMultiplayer.Patches
         private static string _lastAircraftName = null;
         private static bool _wasDestroyed = false;
 
+        // Timer-based death detection fallback:
+        // If we had an aircraft and then FindLocalPlayerAircraft returns null for this many seconds, trigger death
+        private static float _aircraftMissingTime = 0f;
+        private static bool _hadAircraftBefore = false;
+        private const float AIRCRAFT_MISSING_DEATH_THRESHOLD = 2.0f;
+
+        // Death cooldown: after death is detected, wait this many seconds before searching for new aircraft
+        // This prevents the respawn loop where the destroyed aircraft's GO is still alive and gets re-found
+        private static float _deathTime = 0f;
+        private const float RESPAWN_SEARCH_COOLDOWN = 5.0f;
+        
+        // Set to true once respawn UI is shown; prevents repeated CheckForRespawn logging
+        private static bool _respawnScreenShown = false;
+
+        // Cached reflection for HasBeenDestroyed check on UniAircraft
+        private static PropertyInfo _hasBeenDestroyedProp = null;
+        private static bool _hasBeenDestroyedPropChecked = false;
+
+        /// <summary>
+        /// Check if the UniAircraft component reports HasBeenDestroyed = true.
+        /// Uses reflection since UniAircraft is not directly accessible.
+        /// </summary>
+        private static bool IsAircraftMarkedDestroyed(Component uniAircraft)
+        {
+            if (uniAircraft == null) return false;
+
+            try
+            {
+                if (!_hasBeenDestroyedPropChecked)
+                {
+                    _hasBeenDestroyedPropChecked = true;
+                    var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                    var aircraftType = uniAircraft.GetType();
+                    _hasBeenDestroyedProp = aircraftType.GetProperty("HasBeenDestroyed", flags);
+                    if (_hasBeenDestroyedProp == null)
+                    {
+                        // Try as a field (backing field)
+                        var field = aircraftType.GetField("<HasBeenDestroyed>k__BackingField", flags);
+                        if (field != null)
+                        {
+                            // Wrap field access in a lambda-style approach via direct field read
+                            Plugin.Log?.LogInfo("[FlightGamePatches] Found HasBeenDestroyed backing field");
+                        }
+                        else
+                        {
+                            Plugin.Log?.LogWarning("[FlightGamePatches] HasBeenDestroyed property/field not found on UniAircraft");
+                        }
+                    }
+                    else
+                    {
+                        Plugin.Log?.LogInfo("[FlightGamePatches] Found HasBeenDestroyed property on UniAircraft");
+                    }
+                }
+
+                if (_hasBeenDestroyedProp != null)
+                {
+                    return (bool)_hasBeenDestroyedProp.GetValue(uniAircraft);
+                }
+
+                // Fallback: try backing field directly
+                var backingField = uniAircraft.GetType().GetField("<HasBeenDestroyed>k__BackingField",
+                    BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (backingField != null)
+                {
+                    return (bool)backingField.GetValue(uniAircraft);
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[FlightGamePatches] HasBeenDestroyed check error: {ex.Message}");
+            }
+
+            return false;
+        }
+
         private static void CheckForRespawn()
         {
             try
             {
-                // If we had a cached aircraft but it's now null or destroyed, check for new one
-                if (_cachedLocalAircraft == null || !_cachedLocalAircraft.activeInHierarchy)
+                // Determine if current aircraft is effectively dead/gone:
+                // 1. Cached reference is null (object destroyed by Unity)
+                // 2. GameObject is inactive
+                // 3. UniAircraft.HasBeenDestroyed == true (aircraft killed but GO may linger)
+                bool cachedIsNull = _cachedLocalAircraft == null;
+                bool cachedIsInactive = !cachedIsNull && !_cachedLocalAircraft.activeInHierarchy;
+                bool aircraftGone = cachedIsNull || cachedIsInactive;
+                
+                // Additional check: HasBeenDestroyed via reflection (catches case where GO is still active but aircraft is dead)
+                if (!aircraftGone && _cachedUniAircraft != null)
+                {
+                    bool markedDestroyed = IsAircraftMarkedDestroyed(_cachedUniAircraft);
+                    if (markedDestroyed)
+                    {
+                        if (LogHelper.ShouldLogInterval("FlightGamePatches.HasBeenDestroyedDetected", 5f))
+                            Plugin.Log?.LogInfo("[FlightGamePatches] Aircraft HasBeenDestroyed=true detected (GO still active)");
+                        aircraftGone = true;
+                    }
+                }
+
+                // Also check UniAircraft.Player as a backup source of truth
+                if (!aircraftGone)
+                {
+                    try
+                    {
+                        var playerAircraft = Falcon.UniversalAircraft.UniAircraft.Player;
+                        if (playerAircraft == null && _lastAircraftName != null)
+                        {
+                            Plugin.Log?.LogInfo("[FlightGamePatches] UniAircraft.Player is null but we had an aircraft — treating as gone");
+                            aircraftGone = true;
+                        }
+                    }
+                    catch { }
+                }
+
+                // Diagnostic logging (throttled) — suppress once respawn screen is shown
+                if (aircraftGone && !_respawnScreenShown && LogHelper.ShouldLogInterval("FlightGamePatches.CheckForRespawn.AircraftGone", 5f))
+                {
+                    Plugin.Log?.LogInfo($"[FlightGamePatches] CheckForRespawn: aircraftGone=true cachedNull={cachedIsNull} inactive={cachedIsInactive} lastAircraft={_lastAircraftName ?? "null"} wasDestroyed={_wasDestroyed} hadBefore={_hadAircraftBefore}");
+                }
+
+                if (aircraftGone)
                 {
                     if (_lastAircraftName != null)
                     {
@@ -158,23 +285,133 @@ namespace TCAMultiplayer.Patches
                         if (!_wasDestroyed)
                         {
                             _wasDestroyed = true;
-                            Plugin.Instance?.Network?.SendAircraftDestroyedNotification();
-                            Plugin.Log?.LogInfo("[FlightGamePatches] Local aircraft destroyed, sent notification");
+                            _deathTime = Time.time;
+                            Plugin.Log?.LogInfo($"[FlightGamePatches] Death detected! lastAircraft={_lastAircraftName} cachedNull={_cachedLocalAircraft == null}");
+                            
+                            // Only send destroyed notification if DamagePatches hasn't already handled it
+                            if (!DamagePatches.DestructionHandled)
+                            {
+                                Plugin.Instance?.Network?.SendAircraftDestroyedNotification();
+                                
+                                // Check if an enemy recently dealt damage — give them kill credit
+                                // This handles: enemy damages us → we crash shortly after
+                                float timeSinceLastDamage = Time.time - DamagePatches.LastDamageTime;
+                                if (DamagePatches.LastAttackerId != 0 && timeSinceLastDamage < 15f)
+                                {
+                                    ulong localId = Plugin.Instance?.Network?.LocalPeerId ?? 0;
+                                    Plugin.Log?.LogInfo($"[FlightGamePatches] Aircraft destroyed {timeSinceLastDamage:F1}s after last damage — crediting kill to {DamagePatches.LastAttackerId}");
+                                    
+                                    // Send kill confirmation to give attacker credit
+                                    Plugin.Instance?.Network?.SendKillConfirmation(DamagePatches.LastAttackerId, localId, DamagePatches.LastAttackerWeapon);
+                                    
+                                    // Record kill/death locally
+                                    Game.ScoreTracker.Instance?.RecordKill(DamagePatches.LastAttackerId, localId, DamagePatches.LastAttackerWeapon);
+                                }
+                                else
+                                {
+                                    Plugin.Log?.LogInfo("[FlightGamePatches] Aircraft destroyed (no recent attacker within 15s)");
+                                }
+                                
+                                // Reset last attacker tracking
+                                DamagePatches.LastAttackerId = 0;
+                                DamagePatches.LastAttackerWeapon = "";
+                                DamagePatches.LastDamageTime = 0f;
+                                
+                                // Show respawn UI
+                                Game.SpawnManager.Instance?.NotifyPlayerDied();
+                                _respawnScreenShown = true;
+                            }
+                            else
+                            {
+                                Plugin.Log?.LogInfo("[FlightGamePatches] Local aircraft destroyed (already handled by DamagePatches)");
+                                // SAFETY: Still trigger respawn UI in case DamagePatches missed it
+                                // (RespawnScreen.Show() is idempotent — won't double-create)
+                                Game.SpawnManager.Instance?.NotifyPlayerDied();
+                                _respawnScreenShown = true;
+                            }
+                        }
+                    }
+                    else if (_hadAircraftBefore)
+                    {
+                        // Timer-based fallback: we once had an aircraft, now FindLocalPlayerAircraft returns null
+                        // but _lastAircraftName was never set (edge case). Track missing time.
+                        _aircraftMissingTime += Time.deltaTime;
+                        if (_aircraftMissingTime >= AIRCRAFT_MISSING_DEATH_THRESHOLD && !_wasDestroyed)
+                        {
+                            _wasDestroyed = true;
+                            _deathTime = Time.time;
+                            Plugin.Log?.LogInfo("[FlightGamePatches] Death detected via timer fallback (aircraft missing >2s)");
+                            
+                            if (!DamagePatches.DestructionHandled)
+                            {
+                                Plugin.Instance?.Network?.SendAircraftDestroyedNotification();
+                                
+                                float timeSinceLastDamage = Time.time - DamagePatches.LastDamageTime;
+                                if (DamagePatches.LastAttackerId != 0 && timeSinceLastDamage < 15f)
+                                {
+                                    ulong localId = Plugin.Instance?.Network?.LocalPeerId ?? 0;
+                                    Plugin.Log?.LogInfo($"[FlightGamePatches] Timer-fallback death {timeSinceLastDamage:F1}s after last damage — crediting kill to {DamagePatches.LastAttackerId}");
+                                    Plugin.Instance?.Network?.SendKillConfirmation(DamagePatches.LastAttackerId, localId, DamagePatches.LastAttackerWeapon);
+                                    Game.ScoreTracker.Instance?.RecordKill(DamagePatches.LastAttackerId, localId, DamagePatches.LastAttackerWeapon);
+                                }
+                                
+                                DamagePatches.LastAttackerId = 0;
+                                DamagePatches.LastAttackerWeapon = "";
+                                DamagePatches.LastDamageTime = 0f;
+                                
+                                Game.SpawnManager.Instance?.NotifyPlayerDied();
+                                _respawnScreenShown = true;
+                            }
                         }
                     }
 
-                    // Try to find new aircraft
+                    // Clear cached references so we don't keep reading the destroyed aircraft
                     _cachedLocalAircraft = null;
                     _cachedUniAircraft = null;
+
+                    // COOLDOWN: Don't search for new aircraft immediately after death
+                    // The destroyed aircraft's GameObject can linger for seconds and gets re-found,
+                    // causing a false "respawn" that resets _wasDestroyed in an infinite loop
+                    if (_wasDestroyed && Time.time - _deathTime < RESPAWN_SEARCH_COOLDOWN)
+                    {
+                        // Still in cooldown — don't search for aircraft yet
+                        return;
+                    }
+
+                    // Try to find new aircraft (for respawn detection)
                     var newAircraft = FindLocalPlayerAircraft();
 
                     if (newAircraft != null && _wasDestroyed)
                     {
+                        // VALIDATE: Make sure this isn't the same destroyed aircraft lingering
+                        if (_cachedUniAircraft != null && IsAircraftMarkedDestroyed(_cachedUniAircraft))
+                        {
+                            Plugin.Log?.LogInfo("[FlightGamePatches] Found aircraft but it's still marked destroyed — ignoring");
+                            _cachedLocalAircraft = null;
+                            _cachedUniAircraft = null;
+                            return;
+                        }
+
                         // Respawned!
                         _wasDestroyed = false;
+                        _deathTime = 0f;
+                        _aircraftMissingTime = 0f;
+                        _respawnScreenShown = false;
+                        DamagePatches.DestructionHandled = false; // Reset for next death
+                        DamagePatches.LastAttackerId = 0;
+                        DamagePatches.LastAttackerWeapon = "";
+                        DamagePatches.LastDamageTime = 0f;
+                        _hasBeenDestroyedPropChecked = false; // Reset for new aircraft type
                         _lastAircraftName = newAircraft.name;
-                        Plugin.Instance?.Network?.SendAircraftRespawnNotification(newAircraft.name);
-                        Plugin.Log?.LogInfo($"[FlightGamePatches] Respawned with: {newAircraft.name}");
+                        
+                        // Use proper aircraft type name (e.g. "AV8B") not display name (e.g. "Kestrel 1 (MRGoldberg)")
+                        string respawnTypeName = GetLocalAircraftTypeName(_cachedUniAircraft);
+                        if (string.IsNullOrEmpty(respawnTypeName))
+                        {
+                            respawnTypeName = ReflectionHelper.MapAircraftNameFromString(newAircraft.name) ?? newAircraft.name;
+                        }
+                        Plugin.Instance?.Network?.SendAircraftRespawnNotification(respawnTypeName);
+                        Plugin.Log?.LogInfo($"[FlightGamePatches] Respawned with: {newAircraft.name} (type: {respawnTypeName})");
 
                         // Reinitialize reflection for new aircraft
                         _reflectionInitialized = false;
@@ -184,16 +421,32 @@ namespace TCAMultiplayer.Patches
                 {
                     // First time seeing this aircraft
                     _lastAircraftName = _cachedLocalAircraft.name;
+                    _hadAircraftBefore = true;
+                    _aircraftMissingTime = 0f;
+                    Plugin.Log?.LogInfo($"[FlightGamePatches] First aircraft detected: {_lastAircraftName}");
                 }
                 else if (_cachedLocalAircraft.name != _lastAircraftName)
                 {
                     // Aircraft changed (switched planes?)
                     _lastAircraftName = _cachedLocalAircraft.name;
-                    Plugin.Instance?.Network?.SendAircraftRespawnNotification(_cachedLocalAircraft.name);
-                    Plugin.Log?.LogInfo($"[FlightGamePatches] Aircraft changed to: {_cachedLocalAircraft.name}");
+                    _hadAircraftBefore = true;
+                    _aircraftMissingTime = 0f;
+                    // Use proper aircraft type name, not display name
+                    string changedTypeName = GetLocalAircraftTypeName(_cachedUniAircraft);
+                    if (string.IsNullOrEmpty(changedTypeName))
+                    {
+                        changedTypeName = ReflectionHelper.MapAircraftNameFromString(_cachedLocalAircraft.name) ?? _cachedLocalAircraft.name;
+                    }
+                    Plugin.Instance?.Network?.SendAircraftRespawnNotification(changedTypeName);
+                    Plugin.Log?.LogInfo($"[FlightGamePatches] Aircraft changed to: {_cachedLocalAircraft.name} (type: {changedTypeName})");
 
                     // Reinitialize reflection for new aircraft
                     _reflectionInitialized = false;
+                }
+                else
+                {
+                    // Aircraft still alive and same — reset missing timer
+                    _aircraftMissingTime = 0f;
                 }
             }
             catch (Exception ex)
@@ -227,6 +480,11 @@ namespace TCAMultiplayer.Patches
                 _enginesProperty = aircraftType.GetProperty("Engines", flags);
                 _flapsProperty = aircraftType.GetProperty("Flaps", flags);
 
+                // Get FlightControls field directly from UniAircraft
+                // This is the aircraft-level FlightInput which reflects actual player stick inputs
+                _flightControlsField = aircraftType.GetField("FlightControls", flags);
+                Plugin.Log?.LogInfo($"[FlightGamePatches] UniAircraft.FlightControls field: {(_flightControlsField != null ? "FOUND" : "NOT FOUND")}");
+
                 // Look for landing gear on aircraft itself
                 _landingGearProperty = aircraftType.GetProperty("LandingGear", flags)
                     ?? aircraftType.GetProperty("Gear", flags)
@@ -255,49 +513,103 @@ namespace TCAMultiplayer.Patches
                             Plugin.Log?.LogInfo($"  Field: {field.Name} ({field.FieldType.Name})");
                         }
 
-                        // Get FlightInput field - this contains pitch/roll/yaw
+                        // Get FlightInput field from pilot (secondary/fallback)
                         _flightInputField = pilotType.GetField("FlightInput", flags);
-                        if (_flightInputField != null)
+
+                        // Determine the FlightInput object to init properties from.
+                        // Prefer UniAircraft.FlightControls (reflects player stick inputs).
+                        // Fall back to UniPilot.FlightInput.
+                        object initFlightInput = null;
+
+                        if (_flightControlsField != null)
                         {
-                            _cachedFlightInput = _flightInputField.GetValue(uniPilot);
-                            if (_cachedFlightInput != null)
+                            initFlightInput = _flightControlsField.GetValue(uniAircraft);
+                            if (initFlightInput != null)
                             {
-                                var inputType = _cachedFlightInput.GetType();
-                                Plugin.Log?.LogInfo($"[FlightGamePatches] Found FlightInput: {inputType.Name}");
+                                Plugin.Log?.LogInfo($"[FlightGamePatches] Using UniAircraft.FlightControls as primary FlightInput source");
+                            }
+                        }
 
-                                // Dump FlightInput fields and properties
-                                Plugin.Log?.LogInfo("[FlightGamePatches] FlightInput FIELDS:");
-                                foreach (var field in inputType.GetFields(flags))
+                        if (initFlightInput == null && _flightInputField != null)
+                        {
+                            initFlightInput = _flightInputField.GetValue(uniPilot);
+                            Plugin.Log?.LogInfo($"[FlightGamePatches] Using UniPilot.FlightInput as fallback FlightInput source");
+                        }
+
+                        // Cache the initial reference (will be RE-READ each frame in SendLocalPlayerState)
+                        _cachedFlightInput = initFlightInput;
+
+                        if (initFlightInput != null)
+                        {
+                            var inputType = initFlightInput.GetType();
+                            Plugin.Log?.LogInfo($"[FlightGamePatches] Found FlightInput: {inputType.Name}");
+
+                            // Dump FlightInput fields and properties
+                            Plugin.Log?.LogInfo("[FlightGamePatches] FlightInput FIELDS:");
+                            foreach (var field in inputType.GetFields(flags))
+                            {
+                                Plugin.Log?.LogInfo($"  Field: {field.Name} ({field.FieldType.Name})");
+                            }
+                            Plugin.Log?.LogInfo("[FlightGamePatches] FlightInput PROPERTIES:");
+                            foreach (var prop in inputType.GetProperties(flags))
+                            {
+                                Plugin.Log?.LogInfo($"  Prop: {prop.Name} ({prop.PropertyType.Name})");
+                            }
+
+                            // Look for pitch/roll/yaw on FlightInput
+                            _flightInputPitchProperty = inputType.GetProperty("Pitch", flags);
+                            _flightInputRollProperty = inputType.GetProperty("Roll", flags);
+                            _flightInputYawProperty = inputType.GetProperty("Yaw", flags)
+                                ?? inputType.GetProperty("Rudder", flags);
+
+                            // Look for Throttle, IsAfterburning, and NozzleAnalog on FlightInput
+                            _flightInputThrottleField = inputType.GetField("Throttle", flags);
+                            _flightInputIsAfterburningProperty = inputType.GetProperty("IsAfterburning", flags);
+                            _flightInputNozzleAnalogProperty = inputType.GetProperty("NozzleAnalog", flags);
+
+                            _flightInputPitchField = inputType.GetField("pitch", flags)
+                                ?? inputType.GetField("Pitch", flags)
+                                ?? inputType.GetField("_pitch", flags);
+                            _flightInputRollField = inputType.GetField("roll", flags)
+                                ?? inputType.GetField("Roll", flags)
+                                ?? inputType.GetField("_roll", flags);
+                            _flightInputYawField = inputType.GetField("yaw", flags)
+                                ?? inputType.GetField("Yaw", flags)
+                                ?? inputType.GetField("rudder", flags)
+                                ?? inputType.GetField("Rudder", flags);
+
+                            // Explore StickAndRudder sub-object (raw stick input)
+                            _stickAndRudderField = inputType.GetField("StickAndRudder", flags);
+                            if (_stickAndRudderField != null)
+                            {
+                                var sarObj = _stickAndRudderField.GetValue(initFlightInput);
+                                if (sarObj != null)
                                 {
-                                    Plugin.Log?.LogInfo($"  Field: {field.Name} ({field.FieldType.Name})");
+                                    var sarType = sarObj.GetType();
+                                    Plugin.Log?.LogInfo($"[FlightGamePatches] Found StickAndRudder: {sarType.Name}");
+                                    Plugin.Log?.LogInfo("[FlightGamePatches] StickAndRudder FIELDS:");
+                                    foreach (var field in sarType.GetFields(flags))
+                                    {
+                                        Plugin.Log?.LogInfo($"  Field: {field.Name} ({field.FieldType.Name})");
+                                    }
+                                    Plugin.Log?.LogInfo("[FlightGamePatches] StickAndRudder PROPERTIES:");
+                                    foreach (var prop in sarType.GetProperties(flags))
+                                    {
+                                        Plugin.Log?.LogInfo($"  Prop: {prop.Name} ({prop.PropertyType.Name})");
+                                    }
+                                    _sarPitchProperty = sarType.GetProperty("Pitch", flags);
+                                    _sarRollProperty = sarType.GetProperty("Roll", flags);
+                                    _sarYawProperty = sarType.GetProperty("Yaw", flags)
+                                        ?? sarType.GetProperty("Rudder", flags);
+                                    _sarPitchField = sarType.GetField("Pitch", flags)
+                                        ?? sarType.GetField("pitch", flags);
+                                    _sarRollField = sarType.GetField("Roll", flags)
+                                        ?? sarType.GetField("roll", flags);
+                                    _sarYawField = sarType.GetField("Yaw", flags)
+                                        ?? sarType.GetField("yaw", flags)
+                                        ?? sarType.GetField("Rudder", flags)
+                                        ?? sarType.GetField("rudder", flags);
                                 }
-                                Plugin.Log?.LogInfo("[FlightGamePatches] FlightInput PROPERTIES:");
-                                foreach (var prop in inputType.GetProperties(flags))
-                                {
-                                    Plugin.Log?.LogInfo($"  Prop: {prop.Name} ({prop.PropertyType.Name})");
-                                }
-
-                                // Look for pitch/roll/yaw on FlightInput
-                                _flightInputPitchProperty = inputType.GetProperty("Pitch", flags);
-                                _flightInputRollProperty = inputType.GetProperty("Roll", flags);
-                                _flightInputYawProperty = inputType.GetProperty("Yaw", flags)
-                                    ?? inputType.GetProperty("Rudder", flags);
-
-                                // Look for Throttle, IsAfterburning, and NozzleAnalog on FlightInput
-                                _flightInputThrottleField = inputType.GetField("Throttle", flags);
-                                _flightInputIsAfterburningProperty = inputType.GetProperty("IsAfterburning", flags);
-                                _flightInputNozzleAnalogProperty = inputType.GetProperty("NozzleAnalog", flags);
-
-                                _flightInputPitchField = inputType.GetField("pitch", flags)
-                                    ?? inputType.GetField("Pitch", flags)
-                                    ?? inputType.GetField("_pitch", flags);
-                                _flightInputRollField = inputType.GetField("roll", flags)
-                                    ?? inputType.GetField("Roll", flags)
-                                    ?? inputType.GetField("_roll", flags);
-                                _flightInputYawField = inputType.GetField("yaw", flags)
-                                    ?? inputType.GetField("Yaw", flags)
-                                    ?? inputType.GetField("rudder", flags)
-                                    ?? inputType.GetField("Rudder", flags);
                             }
                         }
 
@@ -390,10 +702,16 @@ namespace TCAMultiplayer.Patches
                 Plugin.Log?.LogInfo($"  Engine Afterburner: {_engineAfterburnerField?.Name ?? "NOT FOUND"}");
                 Plugin.Log?.LogInfo($"  Gear IsGearLowered: {_gearIsDownProperty?.Name ?? "NOT FOUND"}");
                 Plugin.Log?.LogInfo($"  Flaps AreFlapsDown: {_flapsDeployedProperty?.Name ?? "NOT FOUND"}");
-                Plugin.Log?.LogInfo($"  FlightInput: {(_cachedFlightInput != null ? "FOUND" : "NOT FOUND")}");
+                Plugin.Log?.LogInfo($"  FlightControls field: {(_flightControlsField != null ? "FOUND" : "NOT FOUND")}");
+                Plugin.Log?.LogInfo($"  FlightInput (pilot): {(_flightInputField != null ? "FOUND" : "NOT FOUND")}");
+                Plugin.Log?.LogInfo($"  Active FlightInput: {(_cachedFlightInput != null ? "FOUND" : "NOT FOUND")}");
                 Plugin.Log?.LogInfo($"  FlightInput Pitch: prop={_flightInputPitchProperty?.Name ?? "null"} field={_flightInputPitchField?.Name ?? "null"}");
                 Plugin.Log?.LogInfo($"  FlightInput Roll: prop={_flightInputRollProperty?.Name ?? "null"} field={_flightInputRollField?.Name ?? "null"}");
                 Plugin.Log?.LogInfo($"  FlightInput Yaw: prop={_flightInputYawProperty?.Name ?? "null"} field={_flightInputYawField?.Name ?? "null"}");
+                Plugin.Log?.LogInfo($"  StickAndRudder: {(_stickAndRudderField != null ? "FOUND" : "NOT FOUND")}");
+                Plugin.Log?.LogInfo($"  SAR Pitch: prop={_sarPitchProperty?.Name ?? "null"} field={_sarPitchField?.Name ?? "null"}");
+                Plugin.Log?.LogInfo($"  SAR Roll: prop={_sarRollProperty?.Name ?? "null"} field={_sarRollField?.Name ?? "null"}");
+                Plugin.Log?.LogInfo($"  SAR Yaw: prop={_sarYawProperty?.Name ?? "null"} field={_sarYawField?.Name ?? "null"}");
                 Plugin.Log?.LogInfo("[FlightGamePatches] ========================================");
 
                 _reflectionInitialized = true;
@@ -443,6 +761,8 @@ namespace TCAMultiplayer.Patches
                 bool gearDown = true;
                 bool flapsDown = false;
                 bool isFiring = false;
+                bool isFlareFiring = false;
+                bool isChaffFiring = false;
                 float pitch = 0f;
                 float roll = 0f;
                 float yaw = 0f;
@@ -452,37 +772,81 @@ namespace TCAMultiplayer.Patches
                 {
                     try
                     {
+                        // CRITICAL: Re-read FlightInput object each frame!
+                        // The cached reference from init may be stale or point to the wrong object.
+                        // Prefer UniAircraft.FlightControls (reflects actual player stick input).
+                        object liveFlightInput = _cachedFlightInput;
+
+                        if (_flightControlsField != null)
+                        {
+                            var freshInput = _flightControlsField.GetValue(_cachedUniAircraft);
+                            if (freshInput != null) liveFlightInput = freshInput;
+                        }
+                        else if (_flightInputField != null)
+                        {
+                            // Re-read from pilot each frame in case object was replaced
+                            var uniPilot = _uniPilotProperty?.GetValue(_cachedUniAircraft);
+                            if (uniPilot != null)
+                            {
+                                var freshInput = _flightInputField.GetValue(uniPilot);
+                                if (freshInput != null) liveFlightInput = freshInput;
+                            }
+                        }
+
                         // Read from FlightInput (primary source for player inputs)
-                        if (_cachedFlightInput != null)
+                        if (liveFlightInput != null)
                         {
                             // Throttle from FlightInput
                             if (_flightInputThrottleField != null)
-                                throttle = Convert.ToSingle(_flightInputThrottleField.GetValue(_cachedFlightInput));
+                                throttle = Convert.ToSingle(_flightInputThrottleField.GetValue(liveFlightInput));
 
                             // Afterburner from FlightInput.IsAfterburning (boolean property)
                             if (_flightInputIsAfterburningProperty != null)
-                                afterburner = Convert.ToBoolean(_flightInputIsAfterburningProperty.GetValue(_cachedFlightInput));
+                                afterburner = Convert.ToBoolean(_flightInputIsAfterburningProperty.GetValue(liveFlightInput));
 
-                            // Pitch/Roll/Yaw
+                            // Pitch/Roll/Yaw — try FlightInput properties/fields first
                             if (_flightInputPitchProperty != null)
-                                pitch = Convert.ToSingle(_flightInputPitchProperty.GetValue(_cachedFlightInput));
+                                pitch = Convert.ToSingle(_flightInputPitchProperty.GetValue(liveFlightInput));
                             else if (_flightInputPitchField != null)
-                                pitch = Convert.ToSingle(_flightInputPitchField.GetValue(_cachedFlightInput));
+                                pitch = Convert.ToSingle(_flightInputPitchField.GetValue(liveFlightInput));
 
                             if (_flightInputRollProperty != null)
-                                roll = Convert.ToSingle(_flightInputRollProperty.GetValue(_cachedFlightInput));
+                                roll = Convert.ToSingle(_flightInputRollProperty.GetValue(liveFlightInput));
                             else if (_flightInputRollField != null)
-                                roll = Convert.ToSingle(_flightInputRollField.GetValue(_cachedFlightInput));
+                                roll = Convert.ToSingle(_flightInputRollField.GetValue(liveFlightInput));
 
                             if (_flightInputYawProperty != null)
-                                yaw = Convert.ToSingle(_flightInputYawProperty.GetValue(_cachedFlightInput));
+                                yaw = Convert.ToSingle(_flightInputYawProperty.GetValue(liveFlightInput));
                             else if (_flightInputYawField != null)
-                                yaw = Convert.ToSingle(_flightInputYawField.GetValue(_cachedFlightInput));
+                                yaw = Convert.ToSingle(_flightInputYawField.GetValue(liveFlightInput));
+
+                            // If pitch/roll/yaw are STILL zero, try StickAndRudder sub-object
+                            if (pitch == 0f && roll == 0f && yaw == 0f && _stickAndRudderField != null)
+                            {
+                                var sarObj = _stickAndRudderField.GetValue(liveFlightInput);
+                                if (sarObj != null)
+                                {
+                                    if (_sarPitchProperty != null)
+                                        pitch = Convert.ToSingle(_sarPitchProperty.GetValue(sarObj));
+                                    else if (_sarPitchField != null)
+                                        pitch = Convert.ToSingle(_sarPitchField.GetValue(sarObj));
+
+                                    if (_sarRollProperty != null)
+                                        roll = Convert.ToSingle(_sarRollProperty.GetValue(sarObj));
+                                    else if (_sarRollField != null)
+                                        roll = Convert.ToSingle(_sarRollField.GetValue(sarObj));
+
+                                    if (_sarYawProperty != null)
+                                        yaw = Convert.ToSingle(_sarYawProperty.GetValue(sarObj));
+                                    else if (_sarYawField != null)
+                                        yaw = Convert.ToSingle(_sarYawField.GetValue(sarObj));
+                                }
+                            }
 
                             // Nozzle angle (VTOL) - NozzleAnalog is 0-1, convert to angle
                             if (_flightInputNozzleAnalogProperty != null)
                             {
-                                float nozzleAnalog = Convert.ToSingle(_flightInputNozzleAnalogProperty.GetValue(_cachedFlightInput));
+                                float nozzleAnalog = Convert.ToSingle(_flightInputNozzleAnalogProperty.GetValue(liveFlightInput));
                                 // Get actual nozzle angle from engine if available
                                 nozzleAngle = nozzleAnalog * 90f; // Assume 90 deg max for now
                             }
@@ -524,8 +888,56 @@ namespace TCAMultiplayer.Patches
                             gearDown = Convert.ToBoolean(_gearIsDownProperty.GetValue(_cachedLandingGear));
                         }
 
-                        // Try to detect gun firing - look for Gun2 or weapon firing state
+                        // Try to detect gun firing and countermeasure state
                         isFiring = DetectGunFiring(_cachedUniAircraft);
+                        
+                        // Override: if the player has guns disabled (Master Arm off or wrong weapon selected), 
+                        // verify they actually have a gun selected and ammo
+                        if (isFiring && _cachedUniAircraft != null)
+                        {
+                            try
+                            {
+                                var fcProp = _cachedUniAircraft.GetType().GetProperty("FireControl", BindingFlags.Public | BindingFlags.Instance);
+                                if (fcProp != null)
+                                {
+                                    var fc = fcProp.GetValue(_cachedUniAircraft);
+                                    if (fc != null)
+                                    {
+                                        var fcType = fc.GetType();
+                                        // Check if gun is selected weapon
+                                        var gunProp = fcType.GetProperty("Gun", BindingFlags.Public | BindingFlags.Instance);
+                                        var activeWeaponProp = fcType.GetMethod("GetActiveWeapon", BindingFlags.Public | BindingFlags.Instance);
+                                        var masterArmProp = fcType.GetProperty("IsMasterArmOn", BindingFlags.Public | BindingFlags.Instance);
+                                        
+                                        if (gunProp != null && activeWeaponProp != null)
+                                        {
+                                            var gun = gunProp.GetValue(fc);
+                                            var activeWeapon = activeWeaponProp.Invoke(fc, null);
+                                            
+                                            // 1. Check if Master Arm is safe
+                                            if (masterArmProp != null)
+                                            {
+                                                bool isMasterArmOn = Convert.ToBoolean(masterArmProp.GetValue(fc));
+                                                if (!isMasterArmOn)
+                                                {
+                                                    isFiring = false;
+                                                }
+                                            }
+
+                                            // 2. Check if gun is the active weapon
+                                            if (gun == null || (activeWeapon != null && !ReferenceEquals(gun, activeWeapon)))
+                                            {
+                                                isFiring = false;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+
+                        isFlareFiring = DetectFlareFiring();
+                        isChaffFiring = DetectChaffFiring();
                     }
                     catch (Exception ex)
                     {
@@ -572,13 +984,17 @@ namespace TCAMultiplayer.Patches
                 state.GearDown = gearDown;
                 state.FlapsDown = flapsDown;
                 state.IsFiring = isFiring;
+                state.IsFlareFiring = isFlareFiring;
+                state.IsChaffFiring = isChaffFiring;
 
                 if (LogHelper.IsEnabled(LogCategory.Patches) &&
                     LogHelper.ShouldSample("FlightGamePatches.SendLocalPlayerState", LogHelper.HighFreqSampleRate))
                 {
                     LogHelper.Info(LogCategory.Patches,
                         $"[FlightGamePatches] State pos={absolutePos} vel={vel} throttle={throttle:F2} " +
-                        $"ab={afterburner} gear={gearDown} flaps={flapsDown} fire={isFiring}");
+                        $"pitch={pitch:F2} roll={roll:F2} yaw={yaw:F2} " +
+                        $"ab={afterburner} gear={gearDown} flaps={flapsDown} fire={isFiring}" +
+                        $" flare={isFlareFiring} chaff={isChaffFiring}");
                 }
 
                 Plugin.Instance.Network.SendAircraftState(state);
@@ -610,9 +1026,17 @@ namespace TCAMultiplayer.Patches
                         if (playerGo.GetComponent<TCAMultiplayer.Player.RemoteAircraftController>() == null &&
                             !playerGo.name.Contains("MP_Remote"))
                         {
+                            // Skip aircraft that is already marked destroyed (GO lingers during death animation)
+                            if (IsAircraftMarkedDestroyed(playerAircraft))
+                            {
+                                // Don't cache or return a destroyed aircraft — it will just cause re-detection spam
+                                return null;
+                            }
+
                             _cachedLocalAircraft = playerGo;
                             _cachedUniAircraft = playerAircraft;
-                            Plugin.Log?.LogInfo($"[FlightGamePatches] Using UniAircraft.Player as local aircraft: {_cachedLocalAircraft.name}");
+                            if (LogHelper.ShouldLogInterval("FlightGamePatches.PlayerAircraftFound", 10f))
+                                Plugin.Log?.LogInfo($"[FlightGamePatches] Using UniAircraft.Player as local aircraft: {_cachedLocalAircraft.name}");
                             return _cachedLocalAircraft;
                         }
                     }
@@ -650,6 +1074,12 @@ namespace TCAMultiplayer.Patches
                                 continue;
                             }
 
+                            // Skip aircraft that is already marked destroyed
+                            if (IsAircraftMarkedDestroyed(component))
+                            {
+                                continue;
+                            }
+
                             // This is likely the real player
                             _cachedLocalAircraft = go;
                             _cachedUniAircraft = component;
@@ -678,35 +1108,14 @@ namespace TCAMultiplayer.Patches
 
             try
             {
-                var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
-                var dataField = uniAircraft.GetType().GetField("Data", flags);
-                if (dataField != null)
-                {
-                    var data = dataField.GetValue(uniAircraft);
-                    if (data != null)
-                    {
-                        // Check public field Name (from LoadableData)
-                        var nameField = data.GetType().GetField("Name", BindingFlags.Public | BindingFlags.Instance);
-                        var value = nameField?.GetValue(data) as string;
-                        if (!string.IsNullOrEmpty(value)) return value;
-
-                        // Check properties
-                        var nameProp = data.GetType().GetProperty("Name") ??
-                                       data.GetType().GetProperty("InternalName");
-                        value = nameProp?.GetValue(data) as string;
-                        if (!string.IsNullOrEmpty(value)) return value;
-
-                        // Check RWR codes as fallback
-                        var rwrCodesField = data.GetType().GetField("RWRCodes", flags);
-                        value = rwrCodesField?.GetValue(data) as string;
-                        if (!string.IsNullOrEmpty(value)) return value;
-                    }
-                }
+                // Use shared helper for Data→Name extraction
+                var name = ReflectionHelper.GetAircraftNameFromData(uniAircraft);
+                if (!string.IsNullOrEmpty(name)) return name;
 
                 var go = uniAircraft.gameObject;
                 if (go != null)
                 {
-                    var mapped = MapAircraftNameFromString(go.name);
+                    var mapped = ReflectionHelper.MapAircraftNameFromString(go.name);
                     if (!string.IsNullOrEmpty(mapped)) return mapped;
                     return go.name;
                 }
@@ -719,66 +1128,163 @@ namespace TCAMultiplayer.Patches
             return string.Empty;
         }
 
-        private static string MapAircraftNameFromString(string value)
-        {
-            if (string.IsNullOrEmpty(value)) return null;
-            string lower = value.ToLowerInvariant();
-
-            if (lower.Contains("av8b") || lower.Contains("av-8b") || lower.Contains("harrier")) return "AV8B";
-            if (lower.Contains("f16") || lower.Contains("f-16")) return "F16C";
-            if (lower.Contains("f18") || lower.Contains("f-18") || lower.Contains("f/a-18")) return "F18C";
-            if (lower.Contains("f15") || lower.Contains("f-15")) return "F15C";
-            if (lower.Contains("su27") || lower.Contains("su-27")) return "Su27";
-            if (lower.Contains("mig29") || lower.Contains("mig-29")) return "MiG29";
-
-            return null;
-        }
-
         private static ulong GetLocalPlayerId()
         {
             return Plugin.Instance.Network.LocalPeerId;
         }
 
-        // Cached gun detection
+        // Cached gun/countermeasure detection
         private static object _cachedWeaponInput = null;
         private static FieldInfo _weaponInputIsFiringField = null;
+        private static FieldInfo _weaponInputIsFlareFiringField = null;
+        private static FieldInfo _weaponInputIsChaffFiringField = null;
         private static bool _gunReflectionInitialized = false;
+
+        // Cached direct input access
+        private static object _directPlayerInput = null;
+        private static FieldInfo _directWeaponInputField = null;
+        private static FieldInfo _directIsFiringField = null;
+        private static FieldInfo _directIsFlareFiringField = null;
+        private static FieldInfo _directIsChaffFiringField = null;
 
         /// <summary>
         /// Detect if the aircraft is currently firing its gun
-        /// Uses WeaponInput.IsFiring from the WeaponControls field on UniAircraft
+        /// Uses robust detection: check UniAircraft first, then fallback to FlightGame.PlayerInput
         /// </summary>
         private static bool DetectGunFiring(Component aircraft)
         {
             try
             {
+                // Method 1: Check UniAircraft.WeaponControls (Primary)
                 if (!_gunReflectionInitialized)
                 {
                     InitializeGunReflection(aircraft);
                 }
 
-                // Primary method: Check WeaponInput.IsFiring
-                if (_cachedWeaponInput != null && _weaponInputIsFiringField != null)
+                // Re-read WeaponControls each frame (object reference may change)
+                if (_weaponInputIsFiringField != null && _cachedUniAircraft != null)
                 {
-                    return Convert.ToBoolean(_weaponInputIsFiringField.GetValue(_cachedWeaponInput));
+                    var weaponControlsField = _cachedUniAircraft.GetType().GetField("WeaponControls",
+                        BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (weaponControlsField != null)
+                    {
+                        var liveWeaponInput = weaponControlsField.GetValue(_cachedUniAircraft);
+                        if (liveWeaponInput != null)
+                        {
+                            _cachedWeaponInput = liveWeaponInput;
+                        }
+                    }
                 }
 
-                // Fallback: Check if mouse button is pressed
-                // This is less reliable but works as a backup
-                if (Input.GetMouseButton(0))
+                if (_cachedWeaponInput != null && _weaponInputIsFiringField != null)
                 {
-                    return true;
+                    bool isFiring = Convert.ToBoolean(_weaponInputIsFiringField.GetValue(_cachedWeaponInput));
+                    if (isFiring) return true; // If true, return immediately
+                }
+
+                // Method 2: Check FlightGame.PlayerInput (Fallback/Override)
+                // This catches cases where UniAircraft.WeaponControls is stale or not updated for local player
+                if (FlightGameInstance != null)
+                {
+                    if (_directPlayerInput == null)
+                    {
+                        // Init direct input reflection
+                        var flightGameType = FlightGameInstance.GetType();
+                        var playerInputField = flightGameType.GetField("PlayerInput", BindingFlags.Public | BindingFlags.Instance);
+                        if (playerInputField != null)
+                        {
+                            _directPlayerInput = playerInputField.GetValue(FlightGameInstance);
+                            if (_directPlayerInput != null)
+                            {
+                                var playerInputType = _directPlayerInput.GetType();
+                                _directWeaponInputField = playerInputType.GetField("WeaponInput", BindingFlags.Public | BindingFlags.Instance);
+                                if (_directWeaponInputField != null)
+                                {
+                                    var wiType = _directWeaponInputField.FieldType;
+                                    _directIsFiringField = wiType.GetField("IsFiring", BindingFlags.Public | BindingFlags.Instance);
+                                    _directIsFlareFiringField = wiType.GetField("IsFlareFiring", BindingFlags.Public | BindingFlags.Instance);
+                                    _directIsChaffFiringField = wiType.GetField("IsChaffFiring", BindingFlags.Public | BindingFlags.Instance);
+                                    
+                                    Plugin.Log?.LogInfo("[FlightGamePatches] Direct PlayerInput reflection initialized");
+                                }
+                            }
+                        }
+                    }
+
+                    if (_directPlayerInput != null && _directWeaponInputField != null && _directIsFiringField != null)
+                    {
+                        var wi = _directWeaponInputField.GetValue(_directPlayerInput);
+                        if (wi != null)
+                        {
+                            return Convert.ToBoolean(_directIsFiringField.GetValue(wi));
+                        }
+                    }
                 }
             }
             catch (Exception ex)
             {
-                // Silent fail - gun detection isn't critical
                 if (!_gunReflectionInitialized)
                 {
                     Plugin.Log?.LogWarning($"[FlightGamePatches] Gun detection error: {ex.Message}");
                 }
             }
 
+            return false;
+        }
+
+        /// <summary>
+        /// Detect if the aircraft is currently deploying flares
+        /// </summary>
+        private static bool DetectFlareFiring()
+        {
+            try
+            {
+                // Method 1: UniAircraft
+                if (_cachedWeaponInput != null && _weaponInputIsFlareFiringField != null)
+                {
+                    bool firing = Convert.ToBoolean(_weaponInputIsFlareFiringField.GetValue(_cachedWeaponInput));
+                    if (firing) return true;
+                }
+                
+                // Method 2: Direct PlayerInput
+                if (_directPlayerInput != null && _directWeaponInputField != null && _directIsFlareFiringField != null)
+                {
+                    var wi = _directWeaponInputField.GetValue(_directPlayerInput);
+                    if (wi != null)
+                    {
+                        return Convert.ToBoolean(_directIsFlareFiringField.GetValue(wi));
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        /// <summary>
+        /// Detect if the aircraft is currently deploying chaff
+        /// </summary>
+        private static bool DetectChaffFiring()
+        {
+            try
+            {
+                // Method 1: UniAircraft
+                if (_cachedWeaponInput != null && _weaponInputIsChaffFiringField != null)
+                {
+                    bool firing = Convert.ToBoolean(_weaponInputIsChaffFiringField.GetValue(_cachedWeaponInput));
+                    if (firing) return true;
+                }
+                
+                // Method 2: Direct PlayerInput
+                if (_directPlayerInput != null && _directWeaponInputField != null && _directIsChaffFiringField != null)
+                {
+                    var wi = _directWeaponInputField.GetValue(_directPlayerInput);
+                    if (wi != null)
+                    {
+                        return Convert.ToBoolean(_directIsChaffFiringField.GetValue(wi));
+                    }
+                }
+            }
+            catch { }
             return false;
         }
 
@@ -804,12 +1310,20 @@ namespace TCAMultiplayer.Patches
 
                         // Get IsFiring field - it's a public bool field
                         _weaponInputIsFiringField = weaponInputType.GetField("IsFiring", flags);
+                        _weaponInputIsFlareFiringField = weaponInputType.GetField("IsFlareFiring", flags);
+                        _weaponInputIsChaffFiringField = weaponInputType.GetField("IsChaffFiring", flags);
 
                         if (_weaponInputIsFiringField != null)
                         {
                             Plugin.Log?.LogInfo("[FlightGamePatches] Found WeaponInput.IsFiring field - gun detection ready!");
                         }
-                        else
+                        
+                        if (_weaponInputIsFlareFiringField != null || _weaponInputIsChaffFiringField != null)
+                        {
+                            Plugin.Log?.LogInfo($"[FlightGamePatches] Countermeasure detection: Flare={_weaponInputIsFlareFiringField != null} Chaff={_weaponInputIsChaffFiringField != null}");
+                        }
+                        
+                        if (_weaponInputIsFiringField == null)
                         {
                             Plugin.Log?.LogWarning("[FlightGamePatches] WeaponInput.IsFiring field not found");
 
@@ -848,11 +1362,34 @@ namespace TCAMultiplayer.Patches
             _cachedLandingGear = null;
             _cachedWeaponInput = null;
             _weaponInputIsFiringField = null;
+            _weaponInputIsFlareFiringField = null;
+            _weaponInputIsChaffFiringField = null;
             _gunReflectionInitialized = false;
+            
+            // Clear direct input cache
+            _directPlayerInput = null;
+            _directWeaponInputField = null;
+            _directIsFiringField = null;
+            _directIsFlareFiringField = null;
+            _directIsChaffFiringField = null;
+            
+            _flightControlsField = null;
+            _stickAndRudderField = null;
+            _sarPitchProperty = null;
+            _sarRollProperty = null;
+            _sarYawProperty = null;
+            _sarPitchField = null;
+            _sarRollField = null;
+            _sarYawField = null;
             _inFlight = false;
             _reflectionInitialized = false;
             _lastAircraftName = null;
             _wasDestroyed = false;
+            _hadAircraftBefore = false;
+            _aircraftMissingTime = 0f;
+            _hasBeenDestroyedPropChecked = false;
+            _hasBeenDestroyedProp = null;
+            _respawnScreenShown = false;
             WeaponPatches.ClearState();
         }
     }

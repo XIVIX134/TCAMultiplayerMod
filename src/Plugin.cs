@@ -37,11 +37,13 @@ namespace TCAMultiplayer
         public NetworkManager Network { get; private set; }
         public GameStateMachine GameState { get; private set; }
 
-        // Lobby system components
+        // Lobby system components (ALL UI is native Canvas+TMP — see LobbyUI.cs header)
         public LobbyManager Lobby { get; private set; }
         public LanDiscovery Discovery { get; private set; }
-        public LobbyUI LobbyUI { get; private set; }
         public SpawnManager Spawner { get; private set; }
+        public ScoreTracker Scores { get; private set; }
+        public ScoreboardHUD ScoreboardHUD { get; private set; }
+        public RespawnScreen RespawnUI { get; private set; }
 
         private Harmony _harmony;
         private GameObject _runnerObject;
@@ -68,13 +70,11 @@ namespace TCAMultiplayer
                 Log.LogInfo("Initializing lobby system...");
                 Lobby = new LobbyManager();
                 Discovery = new LanDiscovery();
-                LobbyUI = new LobbyUI();
                 Spawner = new SpawnManager();
+                Scores = new ScoreTracker();
+                ScoreboardHUD = new ScoreboardHUD();
 
-                // Initialize lobby UI with references
-                LobbyUI.Initialize(Lobby, Discovery);
-
-                // Wire up lobby events
+                // Wire up lobby events (native UI handles its own wiring via MultiplayerMenu)
                 SetupLobbyEvents();
 
                 Log.LogInfo("Applying Harmony patches...");
@@ -98,6 +98,36 @@ namespace TCAMultiplayer
 
                 // Initialize combat sync
                 Player.RealCombatSync.Initialize();
+
+                // Create native respawn screen (attached to persistent runner)
+                RespawnUI = _runnerObject.AddComponent<RespawnScreen>();
+                RespawnUI.Initialize();
+
+                // Wire respawn events (must be after RespawnUI is created)
+                RespawnUI.OnRespawnRequested += (airfield, spawnType) =>
+                {
+                    Log.LogInfo($"[Plugin] Native respawn: airfield={airfield} spawnType={spawnType}");
+
+                    if (string.IsNullOrEmpty(airfield))
+                    {
+                        var airfields = AirfieldHelper.GetAirfieldNames();
+                        if (airfields.Length > 0) airfield = airfields[0];
+                    }
+
+                    string aircraftName = "AV8B"; // TODO: aircraft selection in respawn UI
+                    Lobby?.SendRespawnRequest();
+                    bool success = Spawner?.SpawnPlayerAtAirfield(airfield, aircraftName, spawnType) ?? false;
+
+                    if (success)
+                    {
+                        RespawnUI?.Hide();
+                        GameState?.OnSpawnComplete();
+                    }
+                    else
+                    {
+                        Log.LogError("[Plugin] Native respawn failed!");
+                    }
+                };
 
                 Log.LogInfo("===========================================");
                 Log.LogInfo("TCA Multiplayer loaded successfully!");
@@ -131,74 +161,14 @@ namespace TCAMultiplayer
         /// </summary>
         private void SetupLobbyEvents()
         {
-            // LobbyUI -> Network/Lobby
-            LobbyUI.OnHostGame += (hostName, port) =>
-            {
-                Log.LogInfo($"[Plugin] Hosting game: {hostName} on port {port}");
-                GameState?.StartHosting(port, hostName);
-                Network?.StartHost(port);
-                Lobby?.CreateLobby(Network.LocalPeerId, hostName);
-                Discovery?.StartBroadcasting(hostName, port, "ActionIsland", 1, 8);
-            };
+            // All host/join/leave/ready/airfield/start actions are handled directly
+            // by MultiplayerMenu.cs (native Canvas UI). No IMGUI event wiring needed.
 
-            LobbyUI.OnJoinGame += (ip, port) =>
-            {
-                Log.LogInfo($"[Plugin] Joining game: {ip}:{port}");
-                GameState?.StartConnecting(ip, port);
-                Network?.StartClient(ip, port);
-            };
-
-            LobbyUI.OnLeaveLobby += () =>
-            {
-                Log.LogInfo("[Plugin] Leaving lobby");
-                GameState?.Disconnect();
-                Network?.Disconnect();
-                Discovery?.StopBroadcasting();
-                Discovery?.StopListening();
-                Lobby?.LeaveLobby();
-            };
-
-            LobbyUI.OnReadyToggle += () =>
-            {
-                bool newReady = !Lobby.LocalIsReady;
-                Lobby?.SetLocalReady(newReady);
-                Lobby?.SendPlayerReady(newReady);
-            };
-
-            LobbyUI.OnAirfieldSelected += (airfieldName) =>
-            {
-                Lobby?.SetLocalAirfield(airfieldName);
-                Lobby?.SendAirfieldSelect(airfieldName);
-            };
-
-            LobbyUI.OnSpawnTypeChanged += (spawnType) =>
-            {
-                // SetSpawnSettings already sends the packet via LobbyManager
-                Lobby?.SetSpawnSettings(spawnType);
-            };
-
-            LobbyUI.OnStartGame += () =>
-            {
-                Log.LogInfo("[Plugin] Starting game");
-                Lobby?.StartGame();
-                Lobby?.SendStartGame(Lobby.MapName, Lobby.SpawnType);
-            };
-
-            LobbyUI.OnRespawnRequest += () =>
-            {
-                Log.LogInfo("[Plugin] Respawn requested");
-                Lobby?.SendRespawnRequest();
-                // Respawn will be handled by SpawnManager
-                Spawner?.Respawn();
-                LobbyUI?.HideRespawnScreen();
-            };
-
-            // Lobby events -> UI/Network
+            // Lobby events -> scene loading / spawning
             Lobby.OnGameStarting += async () =>
             {
                 Log.LogInfo("[Plugin] Game starting - loading scenes...");
                 GameState?.StartLoading();
-                LobbyUI?.SetScreen(LobbyScreen.Loading);
 
                 try
                 {
@@ -283,10 +253,10 @@ namespace TCAMultiplayer
                 DoSpawn();
             };
 
-            // SpawnManager events
+            // SpawnManager events — show NATIVE respawn screen
             Spawner.OnPlayerDied += () =>
             {
-                LobbyUI?.ShowRespawnScreen();
+                RespawnUI?.Show();
             };
         }
 
@@ -304,9 +274,26 @@ namespace TCAMultiplayer
 
             Log.LogInfo($"[Plugin] Spawning at {airfield} with type {Lobby?.SpawnType}");
             Spawner?.SpawnPlayerAtAirfield(airfield, "AV8B", Lobby?.SpawnType ?? LobbySpawnType.Runway);
-            LobbyUI?.SetScreen(LobbyScreen.InGame);
             GameState?.OnSpawnComplete();
-            LobbyUI?.Hide();
+
+            // Ensure ScoreTracker has all players registered with correct names at game start
+            RegisterAllPlayersInScoreTracker();
+        }
+
+        /// <summary>
+        /// Register all known lobby players in ScoreTracker with their real names.
+        /// Called at spawn time when all player info is available.
+        /// </summary>
+        private void RegisterAllPlayersInScoreTracker()
+        {
+            if (Scores == null || Lobby == null) return;
+
+            foreach (var kvp in Lobby.Players)
+            {
+                string name = kvp.Value.PlayerName ?? $"Player {kvp.Key}";
+                Scores.RegisterPlayer(kvp.Key, name);
+                Log.LogInfo($"[Plugin] ScoreTracker registered: {name} (PeerId: {kvp.Key})");
+            }
         }
 
         private void BindLoggingConfig()
@@ -333,7 +320,6 @@ namespace TCAMultiplayer
         private bool _showDebugUI = false;
         private int _updateCount = 0;
         private float _lastLogTime = 0f;
-        private float _lastAirfieldRefresh = 0f;
 
         // GUI style with rich text support
         private GUIStyle _richTextStyle;
@@ -342,9 +328,6 @@ namespace TCAMultiplayer
         private void Start()
         {
             Plugin.Log?.LogInfo("[PluginRunner] Started!");
-
-            // Initialize lobby UI - Don't show IMGUI by default, use MultiplayerMenu
-            // Plugin.Instance?.LobbyUI?.Show();
         }
 
         private void Update()
@@ -359,19 +342,7 @@ namespace TCAMultiplayer
                 Plugin.Log?.LogInfo($"[PluginRunner] Updates:{_updateCount} Sent:{net?.PacketsSent ?? 0} Recv:{net?.PacketsReceived ?? 0}");
             }
 
-            // Refresh airfield list periodically when in lobby
-            if (Time.unscaledTime - _lastAirfieldRefresh > 2f)
-            {
-                _lastAirfieldRefresh = Time.unscaledTime;
-                if (Plugin.Instance?.LobbyUI?.CurrentScreen == LobbyScreen.Lobby)
-                {
-                    var airfields = AirfieldHelper.GetAirfieldNames();
-                    if (airfields.Length > 0)
-                    {
-                        Plugin.Instance.LobbyUI.SetAirfields(airfields);
-                    }
-                }
-            }
+            // Airfield list refresh is handled by MultiplayerMenu.RefreshUI() natively
 
             try
             {
@@ -379,6 +350,11 @@ namespace TCAMultiplayer
                 {
                     _showDebugUI = !_showDebugUI;
                     Plugin.Log?.LogInfo($"Debug UI toggled: {(_showDebugUI ? "Open" : "Closed")}");
+                }
+                if (Input.GetKeyDown(KeyCode.F8))
+                {
+                    NetworkConfig.IsThrottled = !NetworkConfig.IsThrottled;
+                    Plugin.Log?.LogInfo($"Bandwidth throttle: {(NetworkConfig.IsThrottled ? "ON (30Hz)" : "OFF (128Hz)")}");
                 }
             }
             catch { }
@@ -390,6 +366,7 @@ namespace TCAMultiplayer
             // Periodic cleanup to prevent memory leaks
             Player.RealCombatSync.PeriodicCleanup();
             Plugin.Instance?.GameState?.Update();
+            Plugin.Instance?.ScoreboardHUD?.Update();
         }
 
         private void OnGUI()
@@ -459,6 +436,9 @@ namespace TCAMultiplayer
                 {
                     DrawDebugPanel();
                 }
+
+                // Draw scoreboard HUD (kill counter, kill feed, TAB scoreboard)
+                Plugin.Instance?.ScoreboardHUD?.OnGUI();
             }
             catch (Exception ex)
             {

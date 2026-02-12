@@ -52,7 +52,7 @@ namespace TCAMultiplayer.Networking
         
         // Host info (when broadcasting)
         private string _hostName = "TCA Game";
-        private int _gamePort = 7777;
+        private int _gamePort = NetworkConfig.DEFAULT_PORT;
         private int _playerCount = 1;
         private int _maxPlayers = 8;
         private string _mapName = "ActionIsland";

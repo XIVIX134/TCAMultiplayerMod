@@ -126,11 +126,12 @@ namespace TCAMultiplayer.Game
                 
                 var names = new List<string>();
                 _cachedAirfields.Clear();
+                var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 
                 foreach (var airfield in airfields)
                 {
                     string name = GetAirfieldDisplayName(airfield);
-                    if (!string.IsNullOrEmpty(name))
+                    if (!string.IsNullOrEmpty(name) && seenNames.Add(name))
                     {
                         names.Add(name);
                         _cachedAirfields[name] = airfield;

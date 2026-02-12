@@ -8,6 +8,10 @@ namespace TCAMultiplayer.Networking
     /// between past states using Hermite spline interpolation for smooth movement.
     /// Renders at a configurable delay behind real-time to ensure we always have
     /// two states to interpolate between.
+    /// 
+    /// IMPORTANT: Positions are stored in ABSOLUTE (double-precision) world coordinates
+    /// to be immune to FloatingOrigin shifts. Conversion to local Unity space happens
+    /// only at render time in GetInterpolatedState().
     /// </summary>
     public class InterpolationBuffer
     {
@@ -16,7 +20,7 @@ namespace TCAMultiplayer.Networking
         /// </summary>
         public struct Snapshot
         {
-            public Vector3 Position;
+            public Vector3d AbsolutePosition;   // Stored in absolute world coords (immune to FloatingOrigin)
             public Quaternion Rotation;
             public Vector3 Velocity;
             public Vector3 AngularVelocity;
@@ -34,6 +38,7 @@ namespace TCAMultiplayer.Networking
         private bool _loggedFull = false;
         
         // Smoothing state - applies additional smoothing on top of interpolation
+        // Stored in LOCAL space (recomputed each frame from absolute)
         private Vector3 _smoothedPosition;
         private Quaternion _smoothedRotation;
         private bool _smoothingInitialized = false;
@@ -83,14 +88,15 @@ namespace TCAMultiplayer.Networking
         }
         
         /// <summary>
-        /// Add a new snapshot to the buffer
+        /// Add a new snapshot to the buffer.
+        /// Position must be in ABSOLUTE world coordinates (not local Unity space).
         /// </summary>
-        public void AddSnapshot(Vector3 position, Quaternion rotation, Vector3 velocity, 
+        public void AddSnapshot(Vector3d absolutePosition, Quaternion rotation, Vector3 velocity, 
             Vector3 angularVelocity, float remoteTimestamp)
         {
             var snapshot = new Snapshot
             {
-                Position = position,
+                AbsolutePosition = absolutePosition,
                 Rotation = rotation,
                 Velocity = velocity,
                 AngularVelocity = angularVelocity,
@@ -117,14 +123,15 @@ namespace TCAMultiplayer.Networking
             // Initialize smoothing if this is the first snapshot
             if (!_smoothingInitialized)
             {
-                _smoothedPosition = position;
+                _smoothedPosition = FloatingOriginHelper.AbsoluteToLocal(absolutePosition);
                 _smoothedRotation = rotation;
                 _smoothingInitialized = true;
             }
         }
         
         /// <summary>
-        /// Get interpolated state at the current render time (now - delay)
+        /// Get interpolated state at the current render time (now - delay).
+        /// Returns position in LOCAL Unity space (converted from absolute at render time).
         /// Uses RemoteTime (sender timestamps) for interpolation bracketing to
         /// eliminate jitter from variable network arrival times.
         /// Uses Hermite spline interpolation for smooth movement curves.
@@ -169,7 +176,9 @@ namespace TCAMultiplayer.Networking
                 }
             }
             
-            Vector3 rawPosition;
+            // Interpolation is done in ABSOLUTE space (doubles) then converted to local at the end.
+            // This prevents FloatingOrigin shifts from causing position jumps.
+            Vector3d rawAbsolutePosition;
             Quaternion rawRotation;
             bool isExtrapolating = false;
             
@@ -180,10 +189,10 @@ namespace TCAMultiplayer.Networking
                 float t = (remoteRenderTime - before.RemoteTime) / duration;
                 t = Mathf.Clamp01(t);
                 
-                // Use Hermite spline interpolation for position
-                rawPosition = HermiteInterpolate(
-                    before.Position, before.Velocity,
-                    after.Position, after.Velocity,
+                // Use Hermite spline interpolation for position (in absolute space)
+                rawAbsolutePosition = HermiteInterpolateAbsolute(
+                    before.AbsolutePosition, before.Velocity,
+                    after.AbsolutePosition, after.Velocity,
                     duration, t);
                 
                 // Use smooth squad interpolation for rotation
@@ -203,10 +212,12 @@ namespace TCAMultiplayer.Networking
                     timeSince = MaxExtrapolationTime;
                 }
                 
-                // Extrapolate position using velocity with damping
-                // Apply slight damping to prevent runaway extrapolation
+                // Extrapolate position using velocity with damping (in absolute space)
                 float dampFactor = 1f - Mathf.Clamp01(timeSince / MaxExtrapolationTime) * 0.3f;
-                rawPosition = before.Position + before.Velocity * timeSince * dampFactor;
+                rawAbsolutePosition = new Vector3d(
+                    before.AbsolutePosition.x + before.Velocity.x * timeSince * dampFactor,
+                    before.AbsolutePosition.y + before.Velocity.y * timeSince * dampFactor,
+                    before.AbsolutePosition.z + before.Velocity.z * timeSince * dampFactor);
                 
                 // Extrapolate rotation using angular velocity
                 Vector3 angularDelta = before.AngularVelocity * timeSince * Mathf.Rad2Deg;
@@ -215,7 +226,7 @@ namespace TCAMultiplayer.Networking
             // Case 3: Only have after (shouldn't happen normally)
             else if (after.IsValid)
             {
-                rawPosition = after.Position;
+                rawAbsolutePosition = after.AbsolutePosition;
                 rawRotation = after.Rotation;
             }
             // Fallback - get newest snapshot
@@ -224,7 +235,7 @@ namespace TCAMultiplayer.Networking
                 var newest = GetNewestSnapshot();
                 if (newest.IsValid)
                 {
-                    rawPosition = newest.Position;
+                    rawAbsolutePosition = newest.AbsolutePosition;
                     rawRotation = newest.Rotation;
                     isExtrapolating = true;
                 }
@@ -234,38 +245,55 @@ namespace TCAMultiplayer.Networking
                 }
             }
             
+            // Convert absolute position to local Unity space using CURRENT FloatingOrigin offset.
+            // This is the key fix: all snapshots store absolute coords, and we convert here
+            // using the latest offset, so FloatingOrigin shifts don't cause jumps.
+            Vector3 rawLocalPosition = FloatingOriginHelper.AbsoluteToLocal(rawAbsolutePosition);
+            
+            // Detect FloatingOrigin shift: if the raw local position jumped far from the
+            // smoothed position, the origin shifted. Snap the smoothed position to avoid
+            // the smoothing layer causing a slow drift back from the wrong position.
+            float posDelta = (rawLocalPosition - _smoothedPosition).sqrMagnitude;
+            if (posDelta > 10000f) // > 100m means FloatingOrigin shifted
+            {
+                _smoothedPosition = rawLocalPosition;
+            }
+            
             // Apply additional smoothing layer to reduce micro-jitter
             // Use frame-rate independent smoothing
             float dt = Time.deltaTime;
             float posSmoothT = 1f - Mathf.Pow(1f - PositionSmoothingFactor, dt * 60f);
             float rotSmoothT = 1f - Mathf.Pow(1f - RotationSmoothingFactor, dt * 60f);
             
-            _smoothedPosition = Vector3.Lerp(_smoothedPosition, rawPosition, posSmoothT);
+            _smoothedPosition = Vector3.Lerp(_smoothedPosition, rawLocalPosition, posSmoothT);
             _smoothedRotation = Quaternion.Slerp(_smoothedRotation, rawRotation, rotSmoothT);
             
             return (_smoothedPosition, _smoothedRotation, isExtrapolating);
         }
         
         /// <summary>
-        /// Hermite spline interpolation using positions and velocities
-        /// Creates smooth curves that respect velocity at endpoints
+        /// Hermite spline interpolation using absolute positions (doubles) and velocities.
+        /// Creates smooth curves that respect velocity at endpoints.
         /// </summary>
-        private Vector3 HermiteInterpolate(Vector3 p0, Vector3 v0, Vector3 p1, Vector3 v1, float duration, float t)
+        private Vector3d HermiteInterpolateAbsolute(Vector3d p0, Vector3 v0, Vector3d p1, Vector3 v1, float duration, float t)
         {
             // Scale velocities by duration for proper interpolation
-            Vector3 m0 = v0 * duration;
-            Vector3 m1 = v1 * duration;
+            double m0x = v0.x * duration, m0y = v0.y * duration, m0z = v0.z * duration;
+            double m1x = v1.x * duration, m1y = v1.y * duration, m1z = v1.z * duration;
             
             // Hermite basis functions
-            float t2 = t * t;
-            float t3 = t2 * t;
+            double t2 = t * (double)t;
+            double t3 = t2 * t;
             
-            float h00 = 2f * t3 - 3f * t2 + 1f;  // position at p0
-            float h10 = t3 - 2f * t2 + t;         // tangent at p0
-            float h01 = -2f * t3 + 3f * t2;       // position at p1
-            float h11 = t3 - t2;                   // tangent at p1
+            double h00 = 2.0 * t3 - 3.0 * t2 + 1.0;  // position at p0
+            double h10 = t3 - 2.0 * t2 + t;            // tangent at p0
+            double h01 = -2.0 * t3 + 3.0 * t2;         // position at p1
+            double h11 = t3 - t2;                        // tangent at p1
             
-            return h00 * p0 + h10 * m0 + h01 * p1 + h11 * m1;
+            return new Vector3d(
+                h00 * p0.x + h10 * m0x + h01 * p1.x + h11 * m1x,
+                h00 * p0.y + h10 * m0y + h01 * p1.y + h11 * m1y,
+                h00 * p0.z + h10 * m0z + h01 * p1.z + h11 * m1z);
         }
         
         /// <summary>

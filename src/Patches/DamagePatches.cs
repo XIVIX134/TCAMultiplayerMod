@@ -24,6 +24,30 @@ namespace TCAMultiplayer.Patches
         // Damage type constants
         private const byte DAMAGE_TYPE_BULLET = 0;
         private const byte DAMAGE_TYPE_EXPLOSIVE = 1;
+        
+        /// <summary>
+        /// Set to true when we've already handled destruction via DamagePatches
+        /// so that FlightGamePatches.CheckForRespawn doesn't double-fire.
+        /// Reset to false on respawn.
+        /// </summary>
+        public static bool DestructionHandled { get; set; } = false;
+
+        /// <summary>
+        /// Track the last remote attacker for kill credit on delayed deaths.
+        /// When a player takes damage then crashes shortly after, the attacker
+        /// still gets kill credit within a 15-second window.
+        /// </summary>
+        public static ulong LastAttackerId { get; set; } = 0;
+        public static string LastAttackerWeapon { get; set; } = "";
+        public static float LastDamageTime { get; set; } = 0f;
+
+        // Explosion debounce: a single Explosion.Trigger() can call ApplyDamageFromExplosion
+        // on the same victim multiple times in one frame (multiple Damageable children hit).
+        // We aggregate the first hit and skip subsequent ones within the debounce window.
+        private static ulong _lastExplosionVictimId = 0;
+        private static float _lastExplosionTime = 0f;
+        private static float _lastExplosionDamage = 0f;
+        private const float EXPLOSION_DEBOUNCE_SECONDS = 0.15f;
 
         /// <summary>
         /// Get the local player's peer ID
@@ -166,6 +190,24 @@ namespace TCAMultiplayer.Patches
                     return false;
                 }
 
+                // DEBOUNCE: A single Explosion.Trigger() hits multiple Damageable children on the
+                // same aircraft in the same frame, producing 3+ damage packets. We send only the first
+                // one and aggregate damage, skipping subsequent hits within the debounce window.
+                ulong victimId = controller.PlayerId;
+                if (victimId == _lastExplosionVictimId &&
+                    Time.time - _lastExplosionTime < EXPLOSION_DEBOUNCE_SECONDS)
+                {
+                    // Duplicate explosion hit on same victim within debounce window — skip
+                    _lastExplosionDamage += damageSource.Damage;
+                    Plugin.Log?.LogInfo($"[DamagePatches] EXPLOSION debounced (accumulated {_lastExplosionDamage} total), skipping duplicate on victim {victimId}");
+                    return false; // Skip — first hit already sent
+                }
+
+                // First hit in a new explosion — record for debounce tracking
+                _lastExplosionVictimId = victimId;
+                _lastExplosionTime = Time.time;
+                _lastExplosionDamage = damageSource.Damage;
+
                 // This is EXPLOSION damage on a REMOTE aircraft clone (missile hit!)
                 Plugin.Log?.LogInfo($"[DamagePatches] EXPLOSION hit on remote aircraft! Damage: {damageSource.Damage}, Weapon: {damageSource.Weapon}");
 
@@ -175,7 +217,7 @@ namespace TCAMultiplayer.Patches
                 // Build damage packet - mark as explosive
                 var packet = new DamagePacket
                 {
-                    VictimId = controller.PlayerId,
+                    VictimId = victimId,
                     AttackerId = GetLocalPlayerId(),
                     Damage = damageSource.Damage,
                     Penetration = damageSource.Penetration,
@@ -192,11 +234,11 @@ namespace TCAMultiplayer.Patches
 
                 Plugin.Log?.LogInfo($"[DamagePatches] Sent EXPLOSION damage packet: {packet.Damage} damage from {packet.WeaponName}");
 
-                // Also send impact packet for FX
+                // Send ONE impact packet for FX (not per sub-hit)
                 var impactPacket = new ProjectileImpactPacket
                 {
                     AttackerId = GetLocalPlayerId(),
-                    VictimId = controller.PlayerId,
+                    VictimId = victimId,
                     ImpactType = 1, // explosive
                     EffectType = 2, // explosion effect
                     ImpactPosX = absoluteHitPos.x,
@@ -231,15 +273,31 @@ namespace TCAMultiplayer.Patches
         {
             try
             {
-                Plugin.Log?.LogInfo($"[DamagePatches] Received damage: {packet.Damage} from player {packet.AttackerId}, weapon: {packet.WeaponName}");
+                Plugin.Log?.LogInfo($"[DamagePatches] Received damage: {packet.Damage} type={packet.DamageType} from player {packet.AttackerId}, weapon: {packet.WeaponName}");
+
+                // === MISSILE DOUBLE-DAMAGE PREVENTION (Fix #7) ===
+                // When a missile is synced via RealCombatSync, it becomes a REAL missile on the victim's machine.
+                // The game's own Explosion.Trigger() already applies damage locally when it hits.
+                // If we also apply the damage packet from the shooter, damage is doubled.
+                // Solution: Skip explosive/missile damage packets — the local missile handles it.
+                if (packet.DamageType == DAMAGE_TYPE_EXPLOSIVE)
+                {
+                    Plugin.Log?.LogInfo($"[DamagePatches] Skipping explosive damage packet (missile damage handled locally by game engine). " +
+                        $"Attacker={packet.AttackerId}, weapon={packet.WeaponName}, damage={packet.Damage}");
+                    
+                    // Still track the attacker for kill credit
+                    LastAttackerId = packet.AttackerId;
+                    LastAttackerWeapon = packet.WeaponName;
+                    LastDamageTime = Time.time;
+                    return;
+                }
 
                 // === HIT VALIDATION ===
                 // Validate the damage packet to prevent cheating
 
                 // 1. Validate damage amount (reasonable bounds)
                 const int MAX_REASONABLE_DAMAGE = 10000;
-                const int MIN_DAMAGE = 1;
-                if (packet.Damage < MIN_DAMAGE || packet.Damage > MAX_REASONABLE_DAMAGE)
+                if (packet.Damage < 0 || packet.Damage > MAX_REASONABLE_DAMAGE)
                 {
                     Plugin.Log?.LogWarning($"[DamagePatches] Rejecting damage packet: unreasonable damage value {packet.Damage}");
                     return;
@@ -283,6 +341,13 @@ namespace TCAMultiplayer.Patches
 
                 Plugin.Log?.LogInfo($"[DamagePatches] Hit validated: distance={hitDistance:F1}m, pos absolute={absoluteHitPos} local={localHitPos}");
 
+                // Zero damage (non-penetrating hit) — valid packet but no HP reduction needed
+                if (packet.Damage <= 0)
+                {
+                    Plugin.Log?.LogInfo($"[DamagePatches] Non-penetrating hit from {packet.AttackerId} (0 damage), skipping apply");
+                    return;
+                }
+
                 // Find Damageable component
                 var damageable = localAircraft.GetComponentInChildren<Damageable>();
                 if (damageable == null)
@@ -314,6 +379,13 @@ namespace TCAMultiplayer.Patches
                     Plugin.Log?.LogWarning($"[DamagePatches] ApplyDamageFromImpact threw exception (damage may not have applied): {applyEx.Message}");
                     // Continue execution - don't let a single damage application failure break the whole system
                 }
+
+                // Track last attacker for kill credit on delayed deaths
+                // (e.g., damage weakens aircraft → aircraft crashes seconds later)
+                LastAttackerId = packet.AttackerId;
+                LastAttackerWeapon = packet.WeaponName;
+                LastDamageTime = Time.time;
+
                 if (LogHelper.IsEnabled(LogCategory.Damage) &&
                     LogHelper.ShouldSample("DamagePatches.ApplyDetails", LogHelper.HighFreqSampleRate))
                 {
@@ -323,10 +395,20 @@ namespace TCAMultiplayer.Patches
                 }
 
                 // Check if destroyed
-                if (damageable.IsDestroyed)
+                if (damageable.IsDestroyed && !DestructionHandled)
                 {
+                    DestructionHandled = true;
                     Plugin.Log?.LogInfo("[DamagePatches] Local aircraft destroyed by enemy fire!");
                     Plugin.Instance?.Network?.SendAircraftDestroyedNotification();
+                    
+                    // Send kill confirmation so the attacker (and all peers) get scoreboard credit
+                    Plugin.Instance?.Network?.SendKillConfirmation(packet.AttackerId, GetLocalPlayerId(), packet.WeaponName);
+                    
+                    // Record the kill locally too
+                    Game.ScoreTracker.Instance?.RecordKill(packet.AttackerId, GetLocalPlayerId(), packet.WeaponName);
+                    
+                    // Trigger respawn UI
+                    Game.SpawnManager.Instance?.NotifyPlayerDied();
                 }
             }
             catch (Exception ex)

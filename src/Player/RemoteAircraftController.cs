@@ -35,11 +35,15 @@ namespace TCAMultiplayer.Player
         private bool _gearDown = true;
         private bool _flapsDown = false;
         private bool _isFiring = false;
+        private bool _isFlareFiring = false;
+        private bool _isChaffFiring = false;
         
         /// <summary>
         /// Whether the remote player is firing their gun (read by FireControlPatches)
         /// </summary>
         public bool IsFiring => _isFiring;
+        public bool IsFlareFiring => _isFlareFiring;
+        public bool IsChaffFiring => _isChaffFiring;
         private float _throttle = 0f;
         private float _pitch = 0f;
         private float _roll = 0f;
@@ -342,13 +346,27 @@ namespace TCAMultiplayer.Player
             
             _isFiring = state.IsFiring;
             
+            // Update countermeasure state
+            bool prevFlare = _isFlareFiring;
+            bool prevChaff = _isChaffFiring;
+            _isFlareFiring = state.IsFlareFiring;
+            _isChaffFiring = state.IsChaffFiring;
+            
+            // Set countermeasure state on the remote aircraft's WeaponInput so the game
+            // spawns flare/chaff objects natively (same system the AI uses)
+            // if (_isFlareFiring != prevFlare || _isChaffFiring != prevChaff)
+            // {
+            //    SetRemoteCountermeasureState(_isFlareFiring, _isChaffFiring);
+            // }
+            
             if (LogHelper.IsEnabled(LogCategory.Player) &&
                 LogHelper.ShouldSample("RemoteAircraftController.UpdateFromState", LogHelper.HighFreqSampleRate))
             {
                 LogHelper.Info(LogCategory.Player,
                     $"[RemoteAircraftController] State t={state.Timestamp:F2} throttle={_throttle:F2} " +
                     $"pitch={_pitch:F2} roll={_roll:F2} yaw={_yaw:F2} nozzle={_nozzleAngle:F1} " +
-                    $"flags=AB:{_afterburnerActive} Gear:{_gearDown} Flaps:{_flapsDown} Fire:{_isFiring}");
+                    $"flags=AB:{_afterburnerActive} Gear:{_gearDown} Flaps:{_flapsDown} Fire:{_isFiring}" +
+                    $" Flare:{_isFlareFiring} Chaff:{_isChaffFiring}");
             }
         }
         
@@ -365,6 +383,9 @@ namespace TCAMultiplayer.Player
             
             // Update gun fire effects
             UpdateGunFireEffects();
+            
+            // Update countermeasures (manual tick needed because UniAircraft is disabled)
+            UpdateCountermeasures(_isFlareFiring, _isChaffFiring);
         }
         
         private void UpdateGunFireEffects()
@@ -540,8 +561,8 @@ namespace TCAMultiplayer.Player
         }
 
         /// <summary>
-        /// Called when the remote player's aircraft is destroyed
-        /// Hide/disable visuals but don't destroy the object (may respawn)
+        /// Called when the remote player's aircraft is destroyed.
+        /// Spawns explosion VFX and schedules the GameObject for destruction.
         /// </summary>
         public void OnDestroyed()
         {
@@ -555,15 +576,24 @@ namespace TCAMultiplayer.Player
                 }
                 
                 IsDestroyed = true;
-                Plugin.Log?.LogInfo($"[RemoteAircraftController] Remote aircraft destroyed!");
+                Plugin.Log?.LogInfo($"[RemoteAircraftController] Remote aircraft destroyed! Spawning explosion and scheduling despawn.");
                 
-                // Could play explosion effect here
-                // For now, just disable renderers temporarily
-                var renderers = GetComponentsInChildren<Renderer>(true);
-                foreach (var r in renderers)
+                // Spawn explosion VFX at aircraft position
+                try
                 {
-                    if (r != null)
-                        r.enabled = false;
+                    CombatVfxManager.SpawnExplosion(transform.position, 10f, 500);
+                }
+                catch (Exception vfxEx)
+                {
+                    Plugin.Log?.LogWarning($"[RemoteAircraftController] Explosion VFX error: {vfxEx.Message}");
+                }
+                
+                // Disable colliders immediately to prevent further damage detection
+                var colliders = GetComponentsInChildren<Collider>(true);
+                foreach (var col in colliders)
+                {
+                    if (col != null)
+                        col.enabled = false;
                 }
                 
                 // Stop any particle effects
@@ -576,21 +606,30 @@ namespace TCAMultiplayer.Player
                 // Stop afterburner
                 SetAfterburnerState(false);
                 
-                // Disable colliders to prevent further damage detection
-                var colliders = GetComponentsInChildren<Collider>(true);
-                foreach (var col in colliders)
+                // Disable renderers so the aircraft disappears
+                var renderers = GetComponentsInChildren<Renderer>(true);
+                foreach (var r in renderers)
                 {
-                    if (col != null)
-                        col.enabled = false;
+                    if (r != null)
+                        r.enabled = false;
                 }
                 
-                Plugin.Log?.LogInfo("[RemoteAircraftController] Disabled all renderers and colliders");
+                // Schedule actual GameObject destruction after a short delay
+                // This gives time for the explosion VFX to play
+                Destroy(gameObject, DESPAWN_DELAY);
+                
+                Plugin.Log?.LogInfo($"[RemoteAircraftController] Aircraft will be destroyed in {DESPAWN_DELAY}s");
             }
             catch (Exception ex)
             {
                 Plugin.Log?.LogWarning($"[RemoteAircraftController] OnDestroyed error: {ex.Message}");
             }
         }
+        
+        /// <summary>
+        /// Delay before destroyed aircraft GameObject is removed
+        /// </summary>
+        private const float DESPAWN_DELAY = 2.0f;
         
         /// <summary>
         /// Reset destroyed state (called when respawning)
@@ -625,10 +664,89 @@ namespace TCAMultiplayer.Player
             Plugin.Log?.LogInfo("[RemoteAircraftController] Reset destroyed state, re-enabled renderers and colliders");
         }
 
+        // Countermeasure reflection cache
+        private object _cachedCountermeasures;
+        private MethodInfo _cmUpdateMethod;
+        private FieldInfo _cmFlareContinuousField;
+        private FieldInfo _cmChaffContinuousField;
+        private bool _cmInitialized = false;
+        
+        /// <summary>
+        /// Update countermeasure state and MANUALLY tick the launcher since UniAircraft is disabled
+        /// </summary>
+        private void UpdateCountermeasures(bool flare, bool chaff)
+        {
+            try
+            {
+                if (!_cmInitialized)
+                {
+                    InitializeCountermeasures();
+                }
+                
+                if (_cachedCountermeasures != null)
+                {
+                    // Set flags
+                    _cmFlareContinuousField?.SetValue(_cachedCountermeasures, flare);
+                    _cmChaffContinuousField?.SetValue(_cachedCountermeasures, chaff);
+                    
+                    // Manually tick Update() since the parent UniAircraft component is disabled
+                    _cmUpdateMethod?.Invoke(_cachedCountermeasures, null);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (LogHelper.ShouldLogInterval("RemoteAircraftController.UpdateCountermeasures", 5f))
+                {
+                    Plugin.Log?.LogWarning($"[RemoteAircraftController] UpdateCountermeasures error: {ex.Message}");
+                }
+            }
+        }
+
+        private void InitializeCountermeasures()
+        {
+            try
+            {
+                _cmInitialized = true;
+                
+                // Get UniAircraft component (it's disabled, but exists)
+                var uniAircraftType = Type.GetType("Falcon.UniversalAircraft.UniAircraft, Assembly-CSharp");
+                if (uniAircraftType == null) return;
+                
+                var uniAircraft = GetComponent(uniAircraftType);
+                if (uniAircraft == null)
+                {
+                    // Try getting from children if not on root
+                    uniAircraft = GetComponentInChildren(uniAircraftType, true);
+                }
+                
+                if (uniAircraft == null) return;
+                
+                // Get Countermeasures property
+                var cmProp = uniAircraftType.GetProperty("Countermeasures", BindingFlags.Public | BindingFlags.Instance);
+                if (cmProp == null) return;
+                
+                _cachedCountermeasures = cmProp.GetValue(uniAircraft);
+                if (_cachedCountermeasures == null) return;
+                
+                // Get CountermeasureLauncher type and members
+                var cmType = _cachedCountermeasures.GetType();
+                _cmUpdateMethod = cmType.GetMethod("Update", BindingFlags.Public | BindingFlags.Instance);
+                _cmFlareContinuousField = cmType.GetField("IsFlareContinouslyLaunching", BindingFlags.Public | BindingFlags.Instance);
+                _cmChaffContinuousField = cmType.GetField("IsChaffContinouslyLaunching", BindingFlags.Public | BindingFlags.Instance);
+                
+                Plugin.Log?.LogInfo($"[RemoteAircraftController] Countermeasures initialized: Update={_cmUpdateMethod != null}, Flare={_cmFlareContinuousField != null}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[RemoteAircraftController] CM Init error: {ex.Message}");
+            }
+        }
+
         private void OnDestroy()
         {
             // Unregister from RemoteAircraftRegistry
             RemoteAircraftRegistry.UnregisterRemote(gameObject);
+            _cachedCountermeasures = null;
             
             Plugin.Log?.LogInfo($"[RemoteAircraftController] Destroyed for player {PlayerId}");
         }

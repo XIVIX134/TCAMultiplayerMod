@@ -22,7 +22,10 @@ namespace TCAMultiplayer.Networking
         public uint LastSequenceNumber { get; set; } = 0;
 
         // Clock synchronization
-        public float ClockOffset { get; set; } = 0f; // Remote time - Local time
+        // ClockOffset = Local time - Remote time (positive means local clock is ahead)
+        // Used in InterpolationBuffer: remoteRenderTime = Time.time - ClockOffset - delay
+        public float ClockOffset { get; set; } = 0f;
+        public bool ClockOffsetInitialized { get; set; } = false;
 
         // Display state (what we actually render)
         public Vector3 DisplayPosition { get; set; } = Vector3.zero;
@@ -349,6 +352,15 @@ namespace TCAMultiplayer.Networking
                     state.Controller = null;
                     return;
                 }
+                
+                // Silently ensure Rigidbody stays kinematic (UniAircraft should be disabled but safety check)
+                var rb = state.Aircraft.GetComponent<Rigidbody>();
+                if (rb != null && !rb.isKinematic)
+                {
+                    rb.isKinematic = true;
+                    rb.useGravity = false;
+                }
+                
                 var (position, rotation, isExtrapolating) = state.Buffer.GetInterpolatedState();
 
                 state.DisplayPosition = position;
@@ -363,7 +375,7 @@ namespace TCAMultiplayer.Networking
                 }
                 state.WasExtrapolating = state.IsExtrapolating;
 
-                // Apply to object
+                // Apply to object — position is in local space, converted from absolute in GetInterpolatedState
                 state.Aircraft.transform.position = state.DisplayPosition;
                 state.Aircraft.transform.rotation = state.DisplayRotation;
             }
@@ -471,10 +483,24 @@ namespace TCAMultiplayer.Networking
                 state.LastSequenceNumber = packet.SequenceNumber;
                 state.LastUpdateTime = Time.time;
 
-                // Calculate clock offset from timestamp difference
-                // ClockOffset = RemoteTime - LocalTime (positive means remote is ahead)
-                float expectedLocalTime = Time.time;
-                state.ClockOffset = packet.Timestamp - expectedLocalTime;
+                // Calculate clock offset: how much AHEAD local time is vs remote time.
+                // ClockOffset = LocalTime - RemoteTime (positive means local is ahead of remote)
+                // Used in InterpolationBuffer as: remoteRenderTime = Time.time - ClockOffset - delay
+                //   = localNow - (local - remote) - delay = remoteNow - delay  (correct!)
+                float instantOffset = Time.time - packet.Timestamp;
+                
+                // Smooth the clock offset using exponential moving average to prevent jitter
+                // On first packet, snap to the value; thereafter, smooth with alpha=0.05
+                if (!state.ClockOffsetInitialized)
+                {
+                    state.ClockOffset = instantOffset;
+                    state.ClockOffsetInitialized = true;
+                }
+                else
+                {
+                    const float CLOCK_SMOOTH_ALPHA = 0.05f;
+                    state.ClockOffset = state.ClockOffset + CLOCK_SMOOTH_ALPHA * (instantOffset - state.ClockOffset);
+                }
 
                 // Propagate clock offset to interpolation buffer for RemoteTime-based interpolation
                 state.Buffer.ClockOffset = state.ClockOffset;
@@ -491,7 +517,8 @@ namespace TCAMultiplayer.Networking
                     "RemoteAircraftManager.StatePacket", LogHelper.HighFreqSampleRate);
 
                 // Incoming packets use ABSOLUTE (floating-origin independent) coordinates.
-                // Convert to local Unity world coordinates before applying/interpolating.
+                // Store absolute positions in the buffer; conversion to local happens at render time.
+                // This prevents FloatingOrigin shifts from invalidating stored snapshots.
                 var absolutePos = new Vector3d(packet.PosX, packet.PosY, packet.PosZ);
                 Vector3 localPos = FloatingOriginHelper.AbsoluteToLocal(absolutePos);
                 Quaternion rotation = new Quaternion(packet.RotX, packet.RotY, packet.RotZ, packet.RotW);
@@ -499,7 +526,7 @@ namespace TCAMultiplayer.Networking
                 Vector3 angularVelocity = new Vector3(packet.AngVelX, packet.AngVelY, packet.AngVelZ);
 
                 state.LastVelocity = velocity;
-                state.Buffer.AddSnapshot(localPos, rotation, velocity, angularVelocity, packet.Timestamp);
+                state.Buffer.AddSnapshot(absolutePos, rotation, velocity, angularVelocity, packet.Timestamp);
 
                 // Don't create aircraft if waiting for respawn
                 if (state.NeedsRespawn)
@@ -556,6 +583,7 @@ namespace TCAMultiplayer.Networking
 
         /// <summary>
         /// Handle remote aircraft destroyed notification.
+        /// Spawns explosion, despawns the aircraft, and marks the state for respawn.
         /// </summary>
         public void HandleDestroyed(ulong peerId)
         {
@@ -571,13 +599,23 @@ namespace TCAMultiplayer.Networking
 
                 if (state.Controller != null)
                 {
+                    // This will spawn explosion VFX and schedule Destroy(gameObject, 2.0f)
                     state.Controller.OnDestroyed();
                 }
 
                 state.NeedsRespawn = true;
                 state.DestroyedTime = Time.time;
+                
+                // Null out the Aircraft/Controller references immediately so we stop
+                // trying to interpolate a dying aircraft. The actual GameObject will
+                // self-destruct after the explosion delay.
+                state.Aircraft = null;
+                state.Controller = null;
+                state.Buffer.Clear();
+                state.UsingRealAircraft = false;
+                state.ClockOffsetInitialized = false;
 
-                Plugin.Log.LogInfo($"[RemoteAircraftManager] Peer {peerId} marked as destroyed, waiting for respawn");
+                Plugin.Log.LogInfo($"[RemoteAircraftManager] Peer {peerId} destroyed — aircraft despawned, waiting for respawn");
             }
             catch (Exception ex)
             {
@@ -928,7 +966,10 @@ namespace TCAMultiplayer.Networking
         }
 
         /// <summary>
-        /// Get faction from the current map
+        /// Get ENEMY (Red) faction from the current map.
+        /// Remote aircraft must be on the opposing team so the game's 
+        /// damage system, IFF, and targeting treat them as hostile.
+        /// Falls back to Blue faction if Red is not available.
         /// </summary>
         private static object GetMapFaction(string mapName)
         {
@@ -940,19 +981,64 @@ namespace TCAMultiplayer.Networking
                 if (gameDataMapsType != null && mapDataType != null)
                 {
                     var getByName = gameDataMapsType.GetMethod("GetByName", BindingFlags.Public | BindingFlags.Static);
-                    var getFaction = mapDataType.GetMethod("GetPrimaryBlueFaction", BindingFlags.Public | BindingFlags.Instance);
-
-                    if (getByName != null && getFaction != null)
+                    
+                    if (getByName != null)
                     {
                         var mapData = getByName.Invoke(null, new object[] { mapName });
                         if (mapData != null)
                         {
-                            return getFaction.Invoke(mapData, null);
+                            // Try RED faction first (enemy team) — this makes remote aircraft hostile
+                            var getRedFaction = mapDataType.GetMethod("GetPrimaryRedFaction", BindingFlags.Public | BindingFlags.Instance);
+                            if (getRedFaction != null)
+                            {
+                                var redFaction = getRedFaction.Invoke(mapData, null);
+                                if (redFaction != null)
+                                {
+                                    Plugin.Log?.LogInfo($"[RemoteAircraftManager] Using RED faction for remote aircraft: {redFaction}");
+                                    return redFaction;
+                                }
+                            }
+                            
+                            // Try alternative names for enemy faction
+                            foreach (string methodName in new[] { "GetPrimaryOpforFaction", "GetRedFaction", "GetEnemyFaction" })
+                            {
+                                var altMethod = mapDataType.GetMethod(methodName, BindingFlags.Public | BindingFlags.Instance);
+                                if (altMethod != null)
+                                {
+                                    var altFaction = altMethod.Invoke(mapData, null);
+                                    if (altFaction != null)
+                                    {
+                                        Plugin.Log?.LogInfo($"[RemoteAircraftManager] Using enemy faction via {methodName}: {altFaction}");
+                                        return altFaction;
+                                    }
+                                }
+                            }
+                            
+                            // Log all available methods on MapData for debugging
+                            Plugin.Log?.LogWarning("[RemoteAircraftManager] Could not find Red faction method. Available MapData methods:");
+                            foreach (var method in mapDataType.GetMethods(BindingFlags.Public | BindingFlags.Instance))
+                            {
+                                if (method.Name.Contains("Faction") || method.Name.Contains("faction"))
+                                {
+                                    Plugin.Log?.LogInfo($"  MapData method: {method.Name} -> {method.ReturnType.Name}");
+                                }
+                            }
+                            
+                            // Fallback to Blue faction (same team — not ideal but at least spawns)
+                            var getBlueFaction = mapDataType.GetMethod("GetPrimaryBlueFaction", BindingFlags.Public | BindingFlags.Instance);
+                            if (getBlueFaction != null)
+                            {
+                                Plugin.Log?.LogWarning("[RemoteAircraftManager] Falling back to BLUE faction — remote will be friendly!");
+                                return getBlueFaction.Invoke(mapData, null);
+                            }
                         }
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[RemoteAircraftManager] GetMapFaction error: {ex.Message}");
+            }
 
             return null;
         }
@@ -967,29 +1053,13 @@ namespace TCAMultiplayer.Networking
                 var player = Falcon.UniversalAircraft.UniAircraft.Player;
                 if (player != null)
                 {
-                    // Try to get aircraft name from data
-                    var dataField = player.GetType().GetField("Data", BindingFlags.Public | BindingFlags.Instance);
-                    if (dataField != null)
-                    {
-                        var data = dataField.GetValue(player);
-                        if (data != null)
-                        {
-                            // Check public field Name first (UniAircraftData.Name is a field, not a property)
-                            var nameField = data.GetType().GetField("Name", BindingFlags.Public | BindingFlags.Instance);
-                            var value = nameField?.GetValue(data) as string;
-                            if (!string.IsNullOrEmpty(value)) return value;
-
-                            // Fallback to properties
-                            var nameProp = data.GetType().GetProperty("Name") ??
-                                           data.GetType().GetProperty("InternalName");
-                            value = nameProp?.GetValue(data) as string;
-                            if (!string.IsNullOrEmpty(value)) return value;
-                        }
-                    }
+                    // Use shared helper for Data→Name extraction
+                    var name = ReflectionHelper.GetAircraftNameFromData(player);
+                    if (!string.IsNullOrEmpty(name)) return name;
 
                     // Fallback: parse from GameObject name
                     string goName = player.gameObject.name;
-                    var mapped = MapAircraftNameFromString(goName);
+                    var mapped = ReflectionHelper.MapAircraftNameFromString(goName);
                     if (!string.IsNullOrEmpty(mapped)) return mapped;
                 }
             }
@@ -1063,6 +1133,33 @@ namespace TCAMultiplayer.Networking
             {
                 // Disable player-specific components
                 DisableAIPilot(aircraft);
+
+                // CRITICAL: Disable UniAircraft component to prevent its FixedUpdate from
+                // resetting isKinematic=false every physics frame. The remote aircraft is
+                // driven purely by network interpolation, not the game's physics simulation.
+                var uniAircraft = aircraft.GetComponent<Falcon.UniversalAircraft.UniAircraft>();
+                if (uniAircraft != null)
+                {
+                    uniAircraft.enabled = false;
+                    Plugin.Log.LogInfo("[RemoteAircraftManager] Disabled UniAircraft component (prevents physics FixedUpdate)");
+                }
+
+                // CRITICAL: Make Rigidbody kinematic to prevent physics from fighting
+                // with our manual position updates. Without this, the game's physics engine
+                // and FloatingOrigin both move the aircraft independently, causing teleportation.
+                var rb = aircraft.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    rb.isKinematic = true;
+                    rb.useGravity = false;
+                    rb.interpolation = RigidbodyInterpolation.None;
+                    rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+                    Plugin.Log.LogInfo("[RemoteAircraftManager] Set Rigidbody to kinematic (prevents physics/position fight)");
+                }
+                else
+                {
+                    Plugin.Log.LogWarning("[RemoteAircraftManager] No Rigidbody found on remote aircraft");
+                }
 
                 // Disable cockpit camera
                 var cockpitCams = aircraft.GetComponentsInChildren<Camera>(true);
@@ -1206,20 +1303,6 @@ namespace TCAMultiplayer.Networking
             }
         }
 
-        private static string MapAircraftNameFromString(string value)
-        {
-            if (string.IsNullOrEmpty(value)) return null;
-            string lower = value.ToLowerInvariant();
-
-            if (lower.Contains("av8b") || lower.Contains("av-8b") || lower.Contains("harrier")) return "AV8B";
-            if (lower.Contains("f16") || lower.Contains("f-16")) return "F16C";
-            if (lower.Contains("f18") || lower.Contains("f-18")) return "F18C";
-            if (lower.Contains("f15") || lower.Contains("f-15")) return "F15C";
-            if (lower.Contains("su27") || lower.Contains("su-27")) return "Su27";
-            if (lower.Contains("mig29") || lower.Contains("mig-29")) return "MiG29";
-
-            return null;
-        }
 
         private static bool TrySetPilotBypass(Component uniAircraft, bool bypass)
         {
