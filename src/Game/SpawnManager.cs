@@ -6,96 +6,96 @@ using TCAMultiplayer.Networking;
 namespace TCAMultiplayer.Game
 {
     /// <summary>
-    /// Manages synchronized player spawning using the game's native systems
+    /// Manages synchronized player spawning using the game's native systems.
+    /// Simplified: Uses SpawnPlayerAtPosition directly (SpawnPlayerAtAirfield crashes with dummy factions).
     /// </summary>
     public class SpawnManager
     {
-        // Singleton
         public static SpawnManager Instance { get; private set; }
-        
+
         // Cached reflection info
         private static Type _flightGameType;
-        private static Type _gameLogicType;
-        private static Type _playerSpawnParamsType;
         private static Type _startLocationType;
         private static Type _jFactionType;
         private static Type _gameDataFactionsType;
         
+        // MapData reflection for proper faction lookup
+        private static Type _gameDataMapsType;
+        private static Type _mapDataType;
+        private static MethodInfo _getMapByNameMethod;
+        private static MethodInfo _getPrimaryBlueFactionMethod;
+
         private static PropertyInfo _flightGameInstanceProp;
         private static FieldInfo _flightGameInstanceField;
-        private static MethodInfo _spawnPlayerAtAirfieldMethod;
         private static MethodInfo _spawnPlayerAtPositionMethod;
         private static MethodInfo _startFlightMethod;
         private static MethodInfo _getFactionByNameMethod;
-        
+
         private static bool _initialized = false;
-        
+
         // State
         public bool IsSpawned { get; private set; }
         public string SpawnedAirfield { get; private set; }
         public LobbySpawnType SpawnedType { get; private set; }
-        
+
         // Events
         public event Action OnSpawnComplete;
+        public event Action OnSpawnFailed;
         public event Action OnPlayerDied;
-        
+
         public SpawnManager()
         {
             Instance = this;
         }
-        
+
         /// <summary>
-        /// Initialize reflection
+        /// Initialize reflection (called automatically on first spawn).
         /// </summary>
         public static void Initialize()
         {
             if (_initialized) return;
-            
+
             try
             {
                 var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
-                
-                // FlightGame type
+
                 _flightGameType = Type.GetType("Falcon.Game2.FlightGame, Assembly-CSharp");
                 if (_flightGameType != null)
                 {
                     _flightGameInstanceProp = _flightGameType.GetProperty("Instance", flags);
                     _flightGameInstanceField = _flightGameType.GetField("Instance", flags);
-                    _spawnPlayerAtAirfieldMethod = _flightGameType.GetMethod("SpawnPlayerAtAirfield", flags);
                     _spawnPlayerAtPositionMethod = _flightGameType.GetMethod("SpawnPlayerAtPosition", flags);
                     _startFlightMethod = _flightGameType.GetMethod("StartFlight", flags);
-                    
-                    Plugin.Log?.LogInfo($"[SpawnManager] FlightGame found: SpawnPlayerAtAirfield={_spawnPlayerAtAirfieldMethod != null}");
+
+                    Plugin.Log?.LogInfo($"[SpawnManager] FlightGame found: SpawnPlayerAtPosition={_spawnPlayerAtPositionMethod != null}");
                 }
-                
-                // GameLogic type
-                _gameLogicType = Type.GetType("Falcon.Game2.GameLogic, Assembly-CSharp");
-                
-                // PlayerSpawnParams type
-                _playerSpawnParamsType = Type.GetType("Falcon.Game2.PlayerSpawnParams, Assembly-CSharp");
-                if (_playerSpawnParamsType != null)
-                {
-                    Plugin.Log?.LogInfo("[SpawnManager] PlayerSpawnParams type found");
-                }
-                
-                // StartLocation enum
+
                 _startLocationType = Type.GetType("Falcon.Game2.InstantAction.StartLocation, Assembly-CSharp");
-                if (_startLocationType != null)
-                {
-                    Plugin.Log?.LogInfo("[SpawnManager] StartLocation type found");
-                }
-                
-                // JFaction type
                 _jFactionType = Type.GetType("Falcon.Factions.JFaction, Assembly-CSharp");
-                
-                // GameDataFactions for getting factions
-                _gameDataFactionsType = Type.GetType("Falcon.Database.GameDataFactions, Assembly-CSharp");
+
+                _gameDataFactionsType = Type.GetType("Falcon.GameDataFactions, Assembly-CSharp");
                 if (_gameDataFactionsType != null)
                 {
                     _getFactionByNameMethod = _gameDataFactionsType.GetMethod("GetByName", flags);
-                    Plugin.Log?.LogInfo($"[SpawnManager] GameDataFactions found: GetByName={_getFactionByNameMethod != null}");
                 }
                 
+                // MapData reflection for faction lookup via map
+                _gameDataMapsType = Type.GetType("Falcon.GameDataMaps, Assembly-CSharp");
+                if (_gameDataMapsType != null)
+                {
+                    _getMapByNameMethod = _gameDataMapsType.GetMethod("GetByName", flags);
+                    Plugin.Log?.LogInfo($"[SpawnManager] GameDataMaps found: GetByName={_getMapByNameMethod != null}");
+                }
+                
+                _mapDataType = Type.GetType("Falcon.Game2.MapData, Assembly-CSharp");
+                if (_mapDataType != null)
+                {
+                    _getPrimaryBlueFactionMethod = _mapDataType.GetMethod("GetPrimaryBlueFaction", flags);
+                    Plugin.Log?.LogInfo($"[SpawnManager] MapData found: GetPrimaryBlueFaction={_getPrimaryBlueFactionMethod != null}");
+                }
+                
+                Plugin.Log?.LogInfo("[SpawnManager] MapData reflection initialized");
+
                 _initialized = true;
             }
             catch (Exception ex)
@@ -104,34 +104,57 @@ namespace TCAMultiplayer.Game
                 _initialized = true;
             }
         }
-        
+
         /// <summary>
-        /// Get FlightGame.Instance
+        /// Get FlightGame.Instance through multiple fallback methods.
         /// </summary>
         private static object GetFlightGameInstance()
         {
+            // 1. Try the instance captured by our patch (fastest)
+            if (Patches.FlightGamePatches.FlightGameInstance != null)
+                return Patches.FlightGamePatches.FlightGameInstance;
+
+            // 2. Try the static Instance property/field via reflection
             try
             {
                 if (_flightGameInstanceProp != null)
                 {
-                    return _flightGameInstanceProp.GetValue(null);
+                    var val = _flightGameInstanceProp.GetValue(null);
+                    if (val != null) return val;
                 }
                 if (_flightGameInstanceField != null)
                 {
-                    return _flightGameInstanceField.GetValue(null);
+                    var val = _flightGameInstanceField.GetValue(null);
+                    if (val != null) return val;
                 }
             }
             catch { }
+
+            // 3. Last resort: Find it in the scene
+            if (_flightGameType != null)
+            {
+                try
+                {
+                    var objects = UnityEngine.Object.FindObjectsOfType(_flightGameType, true) as UnityEngine.Object[];
+                    if (objects != null && objects.Length > 0)
+                    {
+                        Plugin.Log?.LogInfo("[SpawnManager] Found FlightGame via FindObjectsOfType");
+                        return objects[0];
+                    }
+                }
+                catch { }
+            }
+
             return null;
         }
-        
+
         /// <summary>
-        /// Get a faction by name
+        /// Get a faction by name.
         /// </summary>
         private static object GetFaction(string factionName)
         {
             if (_getFactionByNameMethod == null) return null;
-            
+
             try
             {
                 return _getFactionByNameMethod.Invoke(null, new object[] { factionName });
@@ -141,183 +164,241 @@ namespace TCAMultiplayer.Game
         }
         
         /// <summary>
-        /// Spawn the local player at an airfield using the game's native system
+        /// Get faction from the current map using MapData.GetPrimaryBlueFaction().
+        /// This is the canonical way the game gets a valid faction for spawning.
         /// </summary>
-        public bool SpawnPlayerAtAirfield(string airfieldName, string aircraftName, LobbySpawnType spawnType, string factionName = "USA")
+        private static object GetMapFaction(string mapName)
         {
-            Initialize();
-            
-            if (_spawnPlayerAtAirfieldMethod == null || _playerSpawnParamsType == null)
+            if (_getMapByNameMethod == null || _getPrimaryBlueFactionMethod == null)
             {
-                Plugin.Log?.LogError("[SpawnManager] Cannot spawn - reflection not available");
-                return SpawnPlayerFallback(airfieldName, spawnType);
+                Plugin.Log?.LogWarning("[SpawnManager] MapData reflection not available");
+                return null;
             }
             
             try
             {
-                // Get FlightGame instance
-                var flightGame = GetFlightGameInstance();
-                if (flightGame == null)
+                var mapData = _getMapByNameMethod.Invoke(null, new object[] { mapName });
+                if (mapData == null)
                 {
-                    Plugin.Log?.LogError("[SpawnManager] FlightGame.Instance is null");
-                    return SpawnPlayerFallback(airfieldName, spawnType);
+                    Plugin.Log?.LogWarning($"[SpawnManager] Map not found: {mapName}");
+                    return null;
                 }
                 
-                // Create PlayerSpawnParams
-                var spawnParams = Activator.CreateInstance(_playerSpawnParamsType);
-                
-                // Set fields
-                SetField(spawnParams, "AircraftName", aircraftName ?? "AV8B");
-                SetField(spawnParams, "LoadoutName", "Clean");
-                SetField(spawnParams, "AmmoBeltName", "Mixed");
-                SetField(spawnParams, "Faction", factionName);
-                SetField(spawnParams, "Airfield", airfieldName);
-                
-                // Set StartLocation enum
-                if (_startLocationType != null)
+                var faction = _getPrimaryBlueFactionMethod.Invoke(mapData, null);
+                if (faction != null)
                 {
-                    object startLocation = Enum.ToObject(_startLocationType, (int)spawnType);
-                    SetField(spawnParams, "StartLocation", startLocation);
+                    Plugin.Log?.LogInfo($"[SpawnManager] Using map faction: {faction}");
+                    return faction;
                 }
-                
-                // Get faction
-                var faction = GetFaction(factionName);
-                if (faction == null)
-                {
-                    Plugin.Log?.LogWarning($"[SpawnManager] Faction not found: {factionName}, using null");
-                }
-                
-                // Call SpawnPlayerAtAirfield(PlayerSpawnParams, JFaction, bool inNavMode)
-                _spawnPlayerAtAirfieldMethod.Invoke(flightGame, new object[] { spawnParams, faction, true });
-                
-                // Mark as spawned
-                IsSpawned = true;
-                SpawnedAirfield = airfieldName;
-                SpawnedType = spawnType;
-                
-                Plugin.Log?.LogInfo($"[SpawnManager] Spawned player at {airfieldName} ({spawnType}) in {aircraftName}");
-                
-                OnSpawnComplete?.Invoke();
-                return true;
             }
             catch (Exception ex)
             {
-                Plugin.Log?.LogError($"[SpawnManager] SpawnPlayerAtAirfield error: {ex.Message}");
-                return SpawnPlayerFallback(airfieldName, spawnType);
+                Plugin.Log?.LogWarning($"[SpawnManager] GetMapFaction error: {ex.Message}");
+            }
+            
+            return null;
+        }
+
+        /// <summary>
+        /// Get any available faction (fallback when specific faction not found).
+        /// First tries MapData.GetPrimaryBlueFaction, then falls back to hardcoded names.
+        /// </summary>
+        private static object GetAnyFaction(string mapName = "ActionIsland")
+        {
+            // Try map-specific faction first (the canonical approach)
+            var mapFaction = GetMapFaction(mapName);
+            if (mapFaction != null) return mapFaction;
+            
+            Plugin.Log?.LogWarning("[SpawnManager] MapData faction lookup failed, trying fallback names...");
+            
+            // Fallback: Try common faction names
+            string[] names = { "Blue", "US", "USA", "NATO", "USMC", "Player", "Ally" };
+            foreach (var name in names)
+            {
+                var f = GetFaction(name);
+                if (f != null)
+                {
+                    Plugin.Log?.LogInfo($"[SpawnManager] Using fallback faction: {name}");
+                    return f;
+                }
+            }
+
+            // Last resort: Try to find any JFaction in resources
+            if (_jFactionType != null)
+            {
+                var factions = Resources.FindObjectsOfTypeAll(_jFactionType);
+                if (factions != null && factions.Length > 0)
+                {
+                    Plugin.Log?.LogWarning($"[SpawnManager] Using resource fallback faction: {factions[0]}");
+                    return factions[0];
+                }
+            }
+
+            Plugin.Log?.LogError("[SpawnManager] No faction found - spawn will fail!");
+            return null;
+        }
+
+        /// <summary>
+        /// Destroy any existing player aircraft to prevent duplicates.
+        /// </summary>
+        private void DestroyExistingPlayer()
+        {
+            try
+            {
+                var flightGame = GetFlightGameInstance();
+                if (flightGame == null) return;
+
+                var prop = _flightGameType?.GetProperty("PlayerAircraft");
+                if (prop == null) return;
+
+                var aircraft = prop.GetValue(flightGame);
+                if (aircraft != null)
+                {
+                    Plugin.Log?.LogWarning("[SpawnManager] Destroying existing player aircraft");
+                    var component = aircraft as Component;
+                    if (component != null)
+                        UnityEngine.Object.Destroy(component.gameObject);
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[SpawnManager] DestroyExistingPlayer error: {ex.Message}");
             }
         }
-        
+
         /// <summary>
-        /// Fallback spawn using direct position
+        /// Spawn player at an airfield.
         /// </summary>
-        private bool SpawnPlayerFallback(string airfieldName, LobbySpawnType spawnType)
+        public bool SpawnPlayerAtAirfield(string airfieldName, string aircraftName, LobbySpawnType spawnType)
         {
-            Plugin.Log?.LogInfo("[SpawnManager] Using fallback spawn method");
-            
-            // Get spawn point from AirfieldHelper
+            Initialize();
+            DestroyExistingPlayer();
+
+            // Get spawn position from airfield
             var (position, rotation) = AirfieldHelper.GetSpawnPoint(airfieldName, spawnType);
-            
+
             if (position == Vector3.zero)
             {
-                Plugin.Log?.LogError("[SpawnManager] Could not get spawn point");
+                Plugin.Log?.LogError($"[SpawnManager] Could not get spawn point for airfield: {airfieldName}");
+                OnSpawnFailed?.Invoke();
                 return false;
             }
-            
-            // Try direct position spawn
-            return SpawnPlayerAtPosition(position, rotation, "AV8B", spawnType);
+
+            SpawnedAirfield = airfieldName;
+            return SpawnPlayerAtPosition(position, rotation, aircraftName ?? "AV8B", spawnType);
         }
-        
+
         /// <summary>
-        /// Spawn player at a specific position
+        /// Spawn player at a specific position.
         /// </summary>
         public bool SpawnPlayerAtPosition(Vector3 position, Quaternion rotation, string aircraftName, LobbySpawnType spawnType)
         {
             Initialize();
-            
+
             if (_spawnPlayerAtPositionMethod == null)
             {
                 Plugin.Log?.LogError("[SpawnManager] SpawnPlayerAtPosition method not available");
+                OnSpawnFailed?.Invoke();
                 return false;
             }
-            
+
             try
             {
                 var flightGame = GetFlightGameInstance();
                 if (flightGame == null)
                 {
-                    Plugin.Log?.LogError("[SpawnManager] FlightGame.Instance is null");
+                    Plugin.Log?.LogError("[SpawnManager] FlightGame.Instance is null - cannot spawn");
+                    OnSpawnFailed?.Invoke();
                     return false;
                 }
-                
-                var faction = GetFaction("USA");
+
+                var mapName = Plugin.Instance?.Lobby?.MapName ?? "ActionIsland";
+                var faction = GetAnyFaction(mapName);
+                if (faction == null)
+                {
+                    Plugin.Log?.LogError("[SpawnManager] No faction found - spawn may fail");
+                }
+
                 bool isGrounded = spawnType != LobbySpawnType.Air;
-                
-                // SpawnPlayerAtPosition(string aircraftName, Vector3 position, Quaternion rotation, 
-                //                       string loadout, string ammoBelt, bool isGrounded, 
-                //                       JFaction faction, bool inNavMode, int count)
+
+                Plugin.Log?.LogInfo($"[SpawnManager] Spawning {aircraftName} at ({position.x:F0}, {position.y:F0}, {position.z:F0})");
+
                 _spawnPlayerAtPositionMethod.Invoke(flightGame, new object[]
                 {
                     aircraftName,
                     position,
                     rotation,
-                    "Clean",
-                    "Mixed",
+                    "Clean",    // Loadout
+                    "Mixed",    // Ammo belt
                     isGrounded,
                     faction,
-                    true,
-                    1
+                    true,       // Is player
+                    1           // Skin index
                 });
-                
+
                 IsSpawned = true;
                 SpawnedType = spawnType;
-                
-                Plugin.Log?.LogInfo($"[SpawnManager] Spawned player at position ({position.x:F0}, {position.y:F0}, {position.z:F0})");
-                
+
+                // Initialize flight mode
+                InitializeFlightMode(flightGame, spawnType);
+
+                Plugin.Log?.LogInfo("[SpawnManager] Spawn complete!");
                 OnSpawnComplete?.Invoke();
                 return true;
             }
             catch (Exception ex)
             {
-                Plugin.Log?.LogError($"[SpawnManager] SpawnPlayerAtPosition error: {ex.Message}");
+                Plugin.Log?.LogError($"[SpawnManager] Spawn error: {ex.Message}");
+                OnSpawnFailed?.Invoke();
                 return false;
             }
         }
-        
+
         /// <summary>
-        /// Helper to set field value via reflection
+        /// Initialize the game's flight mode after spawning.
         /// </summary>
-        private static void SetField(object obj, string fieldName, object value)
+        private void InitializeFlightMode(object flightGame, LobbySpawnType spawnType)
         {
+            if (_startFlightMethod == null) return;
+
             try
             {
-                var field = obj.GetType().GetField(fieldName, BindingFlags.Public | BindingFlags.Instance);
-                if (field != null)
+                // FlightType.Freeflight = 1
+                object mode = 1;
+
+                // StartLocation enum
+                object startLocation = 0;
+                if (_startLocationType != null)
                 {
-                    field.SetValue(obj, value);
+                    startLocation = Enum.ToObject(_startLocationType, (int)spawnType);
                 }
+
+                Plugin.Log?.LogInfo("[SpawnManager] Calling StartFlight(Freeflight)...");
+                _startFlightMethod.Invoke(flightGame, new object[] { mode, startLocation });
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[SpawnManager] StartFlight failed: {ex.Message}");
+            }
         }
-        
+
         /// <summary>
-        /// Respawn the player at their original airfield
+        /// Respawn the player at their previous airfield.
         /// </summary>
         public bool Respawn()
         {
             if (string.IsNullOrEmpty(SpawnedAirfield))
             {
-                Plugin.Log?.LogWarning("[SpawnManager] No spawn airfield recorded");
-                return false;
+                Plugin.Log?.LogWarning("[SpawnManager] No spawn airfield recorded - using default");
+                SpawnedAirfield = "DefaultAirfield";
             }
-            
+
             IsSpawned = false;
-            
-            // Re-use the stored airfield and spawn type
             return SpawnPlayerAtAirfield(SpawnedAirfield, "AV8B", SpawnedType);
         }
-        
+
         /// <summary>
-        /// Notify that the player has died
+        /// Notify that the player has died.
         /// </summary>
         public void NotifyPlayerDied()
         {
@@ -325,20 +406,18 @@ namespace TCAMultiplayer.Game
             Plugin.Log?.LogInfo("[SpawnManager] Player died");
             OnPlayerDied?.Invoke();
         }
-        
+
         /// <summary>
-        /// Check if the game's flight systems are ready for spawning
+        /// Check if FlightGame is ready for spawning.
         /// </summary>
         public bool IsFlightReady()
         {
             Initialize();
-            
-            var flightGame = GetFlightGameInstance();
-            return flightGame != null;
+            return GetFlightGameInstance() != null;
         }
-        
+
         /// <summary>
-        /// Reset state
+        /// Reset spawn state.
         /// </summary>
         public void Reset()
         {

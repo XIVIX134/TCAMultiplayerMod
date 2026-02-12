@@ -60,6 +60,13 @@ namespace TCAMultiplayer.Networking
         public float RotationSmoothingFactor { get; set; } = 0.3f;
         
         /// <summary>
+        /// Clock offset between local and remote time (local - remote).
+        /// Set by RemoteAircraftManager from clock sync.
+        /// Used to convert local time to remote time domain for interpolation.
+        /// </summary>
+        public float ClockOffset { get; set; } = 0f;
+        
+        /// <summary>
         /// Number of snapshots currently in buffer
         /// </summary>
         public int Count => _count;
@@ -69,7 +76,7 @@ namespace TCAMultiplayer.Networking
         /// </summary>
         public bool HasData => _count >= 1;
         
-        public InterpolationBuffer(int capacity = 30)
+        public InterpolationBuffer(int capacity = NetworkConfig.INTERPOLATION_BUFFER_CAPACITY)
         {
             _capacity = capacity;
             _buffer = new Snapshot[capacity];
@@ -118,7 +125,9 @@ namespace TCAMultiplayer.Networking
         
         /// <summary>
         /// Get interpolated state at the current render time (now - delay)
-        /// Uses Hermite spline interpolation for smooth movement curves
+        /// Uses RemoteTime (sender timestamps) for interpolation bracketing to
+        /// eliminate jitter from variable network arrival times.
+        /// Uses Hermite spline interpolation for smooth movement curves.
         /// </summary>
         public (Vector3 position, Quaternion rotation, bool isExtrapolating) GetInterpolatedState()
         {
@@ -127,13 +136,15 @@ namespace TCAMultiplayer.Networking
                 return (Vector3.zero, Quaternion.identity, false);
             }
             
-            float renderTime = Time.time - InterpolationDelay;
+            // Convert current local time to remote time domain using clock offset
+            // ClockOffset = local - remote, so remoteNow = localNow - ClockOffset
+            float remoteRenderTime = Time.time - ClockOffset - InterpolationDelay;
             
-            // Find the two snapshots surrounding renderTime
+            // Find the two snapshots surrounding remoteRenderTime using RemoteTime
             Snapshot before = Snapshot.Invalid;
             Snapshot after = Snapshot.Invalid;
             
-            // Search through buffer for bracketing snapshots
+            // Search through buffer for bracketing snapshots (using RemoteTime)
             for (int i = 0; i < _count; i++)
             {
                 int idx = (_writeIndex - 1 - i + _capacity) % _capacity;
@@ -141,17 +152,17 @@ namespace TCAMultiplayer.Networking
                 
                 if (!snap.IsValid) continue;
                 
-                if (snap.LocalTime <= renderTime)
+                if (snap.RemoteTime <= remoteRenderTime)
                 {
-                    if (!before.IsValid || snap.LocalTime > before.LocalTime)
+                    if (!before.IsValid || snap.RemoteTime > before.RemoteTime)
                     {
                         before = snap;
                     }
                 }
                 
-                if (snap.LocalTime >= renderTime)
+                if (snap.RemoteTime >= remoteRenderTime)
                 {
-                    if (!after.IsValid || snap.LocalTime < after.LocalTime)
+                    if (!after.IsValid || snap.RemoteTime < after.RemoteTime)
                     {
                         after = snap;
                     }
@@ -163,26 +174,27 @@ namespace TCAMultiplayer.Networking
             bool isExtrapolating = false;
             
             // Case 1: We have both before and after - use Hermite interpolation
-            if (before.IsValid && after.IsValid && before.LocalTime != after.LocalTime)
+            if (before.IsValid && after.IsValid && before.RemoteTime != after.RemoteTime)
             {
-                float t = (renderTime - before.LocalTime) / (after.LocalTime - before.LocalTime);
+                float duration = after.RemoteTime - before.RemoteTime;
+                float t = (remoteRenderTime - before.RemoteTime) / duration;
                 t = Mathf.Clamp01(t);
                 
                 // Use Hermite spline interpolation for position
                 rawPosition = HermiteInterpolate(
                     before.Position, before.Velocity,
                     after.Position, after.Velocity,
-                    after.LocalTime - before.LocalTime, t);
+                    duration, t);
                 
                 // Use smooth squad interpolation for rotation
                 rawRotation = SmoothSlerpRotation(before.Rotation, after.Rotation, 
                     before.AngularVelocity, after.AngularVelocity,
-                    after.LocalTime - before.LocalTime, t);
+                    duration, t);
             }
             // Case 2: Only have before (most common when delay is working) - extrapolate
             else if (before.IsValid)
             {
-                float timeSince = renderTime - before.LocalTime;
+                float timeSince = remoteRenderTime - before.RemoteTime;
                 isExtrapolating = timeSince > 0.01f;
                 
                 // Limit extrapolation time
@@ -328,9 +340,10 @@ namespace TCAMultiplayer.Networking
             
             var oldest = GetOldestSnapshot();
             var newest = GetNewestSnapshot();
-            float span = newest.LocalTime - oldest.LocalTime;
+            float localSpan = newest.LocalTime - oldest.LocalTime;
+            float remoteSpan = newest.RemoteTime - oldest.RemoteTime;
             
-            return $"Count:{_count} Span:{span:F2}s";
+            return $"Count:{_count} LocalSpan:{localSpan:F2}s RemoteSpan:{remoteSpan:F2}s ClkOff:{ClockOffset:F3}s";
         }
     }
 }

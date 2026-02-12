@@ -8,10 +8,15 @@ namespace TCAMultiplayer.Networking
     /// </summary>
     public enum PacketType : byte
     {
-        // Connection
+        // Legacy connection packet types (superseded by Lobby packets 60-70)
+        // Kept for backward compatibility but not used in current protocol
+        [Obsolete("Use LobbyPlayerJoined (61) instead")]
         PlayerJoin = 1,
+        [Obsolete("Use LobbyPlayerLeft (62) instead")]
         PlayerLeave = 2,
+        [Obsolete("Use LobbyPlayerReady (63) instead")]
         PlayerReady = 3,
+        [Obsolete("Use LobbyStartGame (66) instead")]
         GameStart = 4,
         
         // State Sync (high frequency, unreliable)
@@ -192,6 +197,12 @@ namespace TCAMultiplayer.Networking
     public struct AircraftStatePacket
     {
         public ulong PlayerId;
+
+        // Sequence number for ordering (to drop out-of-order packets)
+        public uint SequenceNumber;
+
+        // Aircraft type for initial spawn (optional, may be empty)
+        public string AircraftType;
         
         // Position (world space - doubles for precision with FloatingOrigin)
         public double PosX;
@@ -283,6 +294,7 @@ namespace TCAMultiplayer.Networking
 
     /// <summary>
     /// Missile launch packet - sent when a missile is fired at target
+    /// Uses absolute (double-precision) coordinates for floating-origin sync
     /// </summary>
     public struct MissileLaunchPacket
     {
@@ -290,9 +302,9 @@ namespace TCAMultiplayer.Networking
         public ulong TargetId;      // Target player (if locked)
         public string MissileType;  // e.g. "AIM-9L", "AIM-120"
         public byte SeekerType;     // 0 = IR, 1 = Radar, 2 = Unguided
-        public float LaunchPosX;    // Launch position
-        public float LaunchPosY;
-        public float LaunchPosZ;
+        public double LaunchPosX;   // Launch position (ABSOLUTE coordinates)
+        public double LaunchPosY;
+        public double LaunchPosZ;
         public float LaunchDirX;    // Launch direction
         public float LaunchDirY;
         public float LaunchDirZ;
@@ -386,6 +398,9 @@ namespace TCAMultiplayer.Networking
             using (var writer = new BinaryWriter(ms))
             {
                 writer.Write(state.PlayerId);
+                writer.Write(state.SequenceNumber);
+
+                writer.Write(state.AircraftType ?? string.Empty);
                 
                 writer.Write(state.PosX);
                 writer.Write(state.PosY);
@@ -425,6 +440,9 @@ namespace TCAMultiplayer.Networking
                 return new AircraftStatePacket
                 {
                     PlayerId = reader.ReadUInt64(),
+                    SequenceNumber = reader.ReadUInt32(),
+
+                    AircraftType = reader.ReadString(),
                     
                     PosX = reader.ReadDouble(),
                     PosY = reader.ReadDouble(),
@@ -553,9 +571,9 @@ namespace TCAMultiplayer.Networking
                     TargetId = reader.ReadUInt64(),
                     MissileType = reader.ReadString(),
                     SeekerType = reader.ReadByte(),
-                    LaunchPosX = reader.ReadSingle(),
-                    LaunchPosY = reader.ReadSingle(),
-                    LaunchPosZ = reader.ReadSingle(),
+                    LaunchPosX = reader.ReadDouble(),
+                    LaunchPosY = reader.ReadDouble(),
+                    LaunchPosZ = reader.ReadDouble(),
                     LaunchDirX = reader.ReadSingle(),
                     LaunchDirY = reader.ReadSingle(),
                     LaunchDirZ = reader.ReadSingle()

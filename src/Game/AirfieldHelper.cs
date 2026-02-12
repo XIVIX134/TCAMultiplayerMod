@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
+using TCAMultiplayer.Networking;
 
 namespace TCAMultiplayer.Game
 {
@@ -27,7 +28,7 @@ namespace TCAMultiplayer.Game
         private static Dictionary<string, object> _cachedAirfields = new Dictionary<string, object>();
         private static string[] _cachedAirfieldNames = new string[0];
         private static float _lastCacheTime = 0f;
-        private const float CACHE_DURATION = 5f;
+        // CACHE_DURATION now in NetworkConfig
         
         /// <summary>
         /// Initialize reflection
@@ -102,7 +103,7 @@ namespace TCAMultiplayer.Game
             Initialize();
             
             // Use cache if recent
-            if (Time.unscaledTime - _lastCacheTime < CACHE_DURATION && _cachedAirfieldNames.Length > 0)
+            if (Time.unscaledTime - _lastCacheTime < NetworkConfig.AIRFIELD_CACHE_DURATION && _cachedAirfieldNames.Length > 0)
             {
                 return _cachedAirfieldNames;
             }
@@ -113,6 +114,10 @@ namespace TCAMultiplayer.Game
                 
                 // Find all Airfield2 objects in scene
                 var airfields = UnityEngine.Object.FindObjectsOfType(_airfield2Type) as Component[];
+                if (LogHelper.ShouldLogInterval("AirfieldHelper.GetAirfieldNames", 10f))
+                {
+                    Plugin.Log?.LogInfo($"[AirfieldHelper] Searching for airfields of type {_airfield2Type.Name}... Found: {airfields?.Length ?? 0}");
+                }
                 if (airfields == null || airfields.Length == 0)
                 {
                     Plugin.Log?.LogWarning("[AirfieldHelper] No airfields found in scene");

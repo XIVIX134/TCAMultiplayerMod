@@ -34,8 +34,10 @@ namespace TCAMultiplayer.UI
         
         // UI state
         private bool _showUI = false;
+        private bool _isConnecting = false;
         private Vector2 _playerListScroll;
         private Vector2 _gameListScroll;
+        private Vector2 _airfieldListScroll;
         
         // Input fields
         private string _hostName = "";
@@ -181,6 +183,11 @@ namespace TCAMultiplayer.UI
         private void OnLobbyStateChanged()
         {
             // Update UI state from lobby
+            if (_lobbyManager.IsInLobby && CurrentScreen != LobbyScreen.Lobby && CurrentScreen != LobbyScreen.InGame && CurrentScreen != LobbyScreen.Loading && CurrentScreen != LobbyScreen.Respawn)
+            {
+                _isConnecting = false;
+                SetScreen(LobbyScreen.Lobby);
+            }
         }
         
         private void OnGameStarting()
@@ -407,10 +414,15 @@ namespace TCAMultiplayer.UI
                     GUILayout.Label($"{game.IPAddress}:{game.Port} | {game.PlayerCount}/{game.MaxPlayers} players | {game.MapName}", _labelStyle);
                     GUILayout.EndVertical();
                     
-                    if (GUILayout.Button("Join", GUILayout.Width(80), GUILayout.Height(40)))
+                    if (_isConnecting)
                     {
+                        GUILayout.Label("Connecting...", _labelStyle, GUILayout.Width(80), GUILayout.Height(40));
+                    }
+                    else if (GUILayout.Button("Join", GUILayout.Width(80), GUILayout.Height(40)))
+                    {
+                        _isConnecting = true;
                         OnJoinGame?.Invoke(game.IPAddress, game.Port);
-                        CurrentScreen = LobbyScreen.Lobby;
+                        // Don't set screen here - wait for connection
                     }
                     GUILayout.EndHorizontal();
                     GUILayout.Space(5);
@@ -464,18 +476,24 @@ namespace TCAMultiplayer.UI
             
             GUILayout.Space(30);
             
-            if (GUILayout.Button("Connect", _buttonStyle, GUILayout.Height(50)))
+            if (_isConnecting)
+            {
+                GUILayout.Label("Connecting...", _labelStyle);
+            }
+            else if (GUILayout.Button("Connect", _buttonStyle, GUILayout.Height(50)))
             {
                 int port = 7777;
                 int.TryParse(_connectPort, out port);
+                _isConnecting = true;
                 OnJoinGame?.Invoke(_connectIP, port);
-                CurrentScreen = LobbyScreen.Lobby;
+                // Don't set screen here - wait for connection
             }
             
             GUILayout.Space(10);
             
             if (GUILayout.Button("Back", _buttonStyle, GUILayout.Height(40)))
             {
+                _isConnecting = false;
                 CurrentScreen = LobbyScreen.MainMenu;
             }
             
@@ -536,12 +554,25 @@ namespace TCAMultiplayer.UI
             GUILayout.Label("Select Airfield:", _headerStyle);
             if (_airfieldNames.Length > 0)
             {
-                int newIndex = GUILayout.SelectionGrid(_selectedAirfieldIndex, _airfieldNames, 3, GUILayout.Height(60));
-                if (newIndex != _selectedAirfieldIndex)
+                float listHeight = Mathf.Min(_airfieldNames.Length * 35f, 140f);
+                _airfieldListScroll = GUILayout.BeginScrollView(_airfieldListScroll, _boxStyle, GUILayout.Height(listHeight));
+                
+                for (int i = 0; i < _airfieldNames.Length; i++)
                 {
-                    _selectedAirfieldIndex = newIndex;
-                    OnAirfieldSelected?.Invoke(_airfieldNames[_selectedAirfieldIndex]);
+                    bool isSelected = (i == _selectedAirfieldIndex);
+                    Color origBg = GUI.backgroundColor;
+                    if (isSelected) GUI.backgroundColor = Color.cyan;
+                    
+                    if (GUILayout.Button(_airfieldNames[i], _buttonStyle, GUILayout.Height(30)))
+                    {
+                        _selectedAirfieldIndex = i;
+                        OnAirfieldSelected?.Invoke(_airfieldNames[i]);
+                    }
+                    
+                    GUI.backgroundColor = origBg;
                 }
+                
+                GUILayout.EndScrollView();
             }
             else
             {
@@ -567,8 +598,16 @@ namespace TCAMultiplayer.UI
             // Ready button
             bool isReady = _lobbyManager?.LocalIsReady ?? false;
             string readyText = isReady ? "Not Ready" : "Ready";
+            bool hasAirfield = !string.IsNullOrEmpty(_lobbyManager?.LocalSelectedAirfield);
+            
+            if (!hasAirfield)
+            {
+                GUI.enabled = false;
+                readyText = "Select Airfield to Ready";
+            }
+            
             Color originalColor = GUI.backgroundColor;
-            GUI.backgroundColor = isReady ? Color.red : Color.green;
+            GUI.backgroundColor = isReady ? Color.red : (hasAirfield ? Color.green : Color.gray);
             
             if (GUILayout.Button(readyText, _buttonStyle, GUILayout.Height(45)))
             {
@@ -576,6 +615,7 @@ namespace TCAMultiplayer.UI
             }
             
             GUI.backgroundColor = originalColor;
+            GUI.enabled = true;
             
             GUILayout.Space(5);
             
@@ -585,7 +625,14 @@ namespace TCAMultiplayer.UI
                 bool allReady = _lobbyManager?.AreAllPlayersReady ?? false;
                 GUI.enabled = allReady;
                 
-                if (GUILayout.Button("Start Game", _buttonStyle, GUILayout.Height(45)))
+                string startText = "Start Game";
+                if (!allReady)
+                {
+                    if (_lobbyManager?.PlayerCount == 1) startText = "Ready Up to Start (Solo)";
+                    else startText = "Waiting for Ready...";
+                }
+                
+                if (GUILayout.Button(startText, _buttonStyle, GUILayout.Height(45)))
                 {
                     OnStartGame?.Invoke();
                 }
@@ -594,7 +641,7 @@ namespace TCAMultiplayer.UI
                 
                 if (!allReady && _lobbyManager?.PlayerCount >= 2)
                 {
-                    GUILayout.Label("<color=yellow>Waiting for all players to ready up...</color>", _labelStyle);
+                    GUILayout.Label("<color=yellow>All players must be READY to start</color>", _labelStyle);
                 }
                 else if (_lobbyManager?.PlayerCount < 2)
                 {

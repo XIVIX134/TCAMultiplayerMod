@@ -61,7 +61,9 @@ namespace TCAMultiplayer.UI
             var text = go.GetComponentInChildren<TextMeshProUGUI>();
             if (text != null)
             {
-                text.text = label;
+                text.richText = true;
+                text.parseCtrlCharacters = true;
+                text.text = label; // Set text AFTER enabling richText
             }
 
             return button;
@@ -75,7 +77,9 @@ namespace TCAMultiplayer.UI
             go.name = "Text: " + text;
             
             var tmp = go.GetComponent<TextMeshProUGUI>();
-            tmp.text = text;
+            tmp.richText = true;
+            tmp.parseCtrlCharacters = true;
+            tmp.text = text; // Set text AFTER enabling richText
             tmp.fontSize = fontSize;
             tmp.alignment = alignment;
             

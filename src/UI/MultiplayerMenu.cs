@@ -18,7 +18,7 @@ namespace TCAMultiplayer.UI
         private LobbyScreen _currentScreen = LobbyScreen.MainMenu;
         private GameObject _contentRoot;
         private GameObject _backgroundPanel;
-        
+
         private string _connectIP = "127.0.0.1";
         private string _connectPort = "7777";
         private string _hostName = "TCA Server";
@@ -35,13 +35,68 @@ namespace TCAMultiplayer.UI
         private void OnEnable()
         {
             if (LobbyManager.Instance != null)
+            {
                 LobbyManager.Instance.OnLobbyStateChanged += OnLobbyStateChanged;
+                LobbyManager.Instance.OnSpawnPlayers += OnSpawnPlayers;
+            }
+            if (Plugin.Instance?.Network != null)
+            {
+                Plugin.Instance.Network.OnPeerConnected += OnPeerConnected;
+                Plugin.Instance.Network.OnPeerDisconnected += OnPeerDisconnected;
+            }
         }
 
         private void OnDisable()
         {
             if (LobbyManager.Instance != null)
+            {
                 LobbyManager.Instance.OnLobbyStateChanged -= OnLobbyStateChanged;
+                LobbyManager.Instance.OnSpawnPlayers -= OnSpawnPlayers;
+            }
+            if (Plugin.Instance?.Network != null)
+            {
+                Plugin.Instance.Network.OnPeerConnected -= OnPeerConnected;
+                Plugin.Instance.Network.OnPeerDisconnected -= OnPeerDisconnected;
+            }
+        }
+
+        private void OnPeerConnected(ulong peerId)
+        {
+            if (_currentScreen == LobbyScreen.DirectConnect || _currentScreen == LobbyScreen.Browse)
+            {
+                SetScreen(LobbyScreen.Lobby);
+            }
+            else
+            {
+                RefreshUI();
+            }
+        }
+
+        private void OnPeerDisconnected(ulong peerId)
+        {
+            if (_currentScreen == LobbyScreen.Lobby)
+            {
+                SetScreen(LobbyScreen.MainMenu);
+            }
+            else
+            {
+                RefreshUI();
+            }
+        }
+
+        private void OnSpawnPlayers()
+        {
+            // Close menu when game starts
+            _isCloseRequested = true;
+        }
+
+        private void Update()
+        {
+            // Fallback: Check if spawn happened but event missed
+            if (!_isCloseRequested && SpawnManager.Instance != null && SpawnManager.Instance.IsSpawned)
+            {
+                _isCloseRequested = true;
+            }
         }
 
         private void OnLobbyStateChanged()
@@ -108,13 +163,13 @@ namespace TCAMultiplayer.UI
             contentRect.anchorMax = new Vector2(0.5f, 0.5f);
             contentRect.pivot = new Vector2(0.5f, 0.5f);
             contentRect.sizeDelta = new Vector2(800, 800);
-            
+
             var layout = _contentRoot.AddComponent<VerticalLayoutGroup>();
-            layout.childControlHeight = false;
+            layout.childControlHeight = true; // Control height to prevent overlap
             layout.childControlWidth = true;
             layout.childForceExpandHeight = false;
             layout.childForceExpandWidth = true;
-            layout.spacing = 20;
+            layout.spacing = 15;
             layout.padding = new RectOffset(50, 50, 50, 50);
             layout.childAlignment = TextAnchor.UpperCenter;
         }
@@ -140,7 +195,7 @@ namespace TCAMultiplayer.UI
             UIFactory.CreateNativeButton("HOST GAME", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.HostSetup));
             UIFactory.CreateNativeButton("BROWSE LAN", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.Browse));
             UIFactory.CreateNativeButton("DIRECT CONNECT", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.DirectConnect));
-            
+
             var spacer = new GameObject("Spacer", typeof(RectTransform), typeof(LayoutElement));
             spacer.transform.SetParent(_contentRoot.transform, false);
             spacer.GetComponent<LayoutElement>().flexibleHeight = 1;
@@ -153,11 +208,11 @@ namespace TCAMultiplayer.UI
             UIFactory.CreateNativeText("HOST SETTINGS", _contentRoot.transform, 36);
             UIFactory.CreateLabelInputRow("Server Name:", _hostName, _contentRoot.transform, val => _hostName = val);
             UIFactory.CreateLabelInputRow("Port:", _hostPort, _contentRoot.transform, val => _hostPort = val);
-            
+
             UIFactory.CreateNativeButton("START SERVER", _contentRoot.transform).onClick.AddListener(() => {
                 int.TryParse(_hostPort, out int port);
+                Plugin.Instance?.GameState?.StartHosting(port, _hostName);
                 Plugin.Instance?.Network?.StartHost(port);
-                Plugin.Instance.State.ConnectionStatus = ConnectionStatus.Hosting;
                 Plugin.Instance.Lobby?.CreateLobby(Plugin.Instance.Network.LocalPeerId, _hostName);
                 Plugin.Instance.Discovery?.StartBroadcasting(_hostName, port, "ActionIsland", 1, 8);
                 SetScreen(LobbyScreen.Lobby);
@@ -170,38 +225,110 @@ namespace TCAMultiplayer.UI
             var lobby = LobbyManager.Instance;
             bool isHost = lobby?.IsHost ?? false;
             UIFactory.CreateNativeText(isHost ? "LOBBY (HOST)" : "LOBBY (CLIENT)", _contentRoot.transform, 36);
-            
+
             var playerGroup = UIFactory.CreateVerticalGroup(_contentRoot.transform, 5, 10);
             playerGroup.AddComponent<Image>().color = new Color(1, 1, 1, 0.05f);
-            
+
             if (lobby != null)
             {
                 var pList = new List<LobbyPlayerInfo>(lobby.Players.Values);
                 foreach (var p in pList)
                 {
-                    string status = p.IsReady ? "<color=lime>[READY]</color>" : "<color=yellow>[WAIT]</color>";
-                    UIFactory.CreateNativeText($"{p.PlayerName} | {p.SelectedAirfield} | {status}", playerGroup.transform, 20, TextAlignmentOptions.Left);
+                    string statusText = p.IsReady ? "[READY]" : "[WAIT]";
+                    Color statusColor = p.IsReady ? Color.green : Color.yellow;
+                    
+                    var playerText = UIFactory.CreateNativeText($"{p.PlayerName} | {p.SelectedAirfield} | {statusText}", playerGroup.transform, 20, TextAlignmentOptions.Left);
+                    
+                    // Manually color just the status part by finding its position
+                    if (playerText != null)
+                    {
+                        // Force the entire text to use vertex coloring
+                        playerText.enableVertexGradient = false;
+                        playerText.color = Color.white;
+                        
+                        // Use ForceMeshUpdate to apply vertex colors
+                        playerText.ForceMeshUpdate();
+                        
+                        var textInfo = playerText.textInfo;
+                        if (textInfo != null && textInfo.characterCount > 0)
+                        {
+                            int statusIndex = playerText.text.LastIndexOf(statusText);
+                            if (statusIndex >= 0)
+                            {
+                                for (int i = 0; i < textInfo.characterCount; i++)
+                                {
+                                    if (i >= statusIndex && i < statusIndex + statusText.Length)
+                                    {
+                                        if (!textInfo.characterInfo[i].isVisible) continue;
+                                        
+                                        int materialIndex = textInfo.characterInfo[i].materialReferenceIndex;
+                                        int vertexIndex = textInfo.characterInfo[i].vertexIndex;
+                                        
+                                        Color32[] newVertexColors = textInfo.meshInfo[materialIndex].colors32;
+                                        newVertexColors[vertexIndex + 0] = statusColor;
+                                        newVertexColors[vertexIndex + 1] = statusColor;
+                                        newVertexColors[vertexIndex + 2] = statusColor;
+                                        newVertexColors[vertexIndex + 3] = statusColor;
+                                    }
+                                }
+                                playerText.UpdateVertexData(TMP_VertexDataUpdateFlags.Colors32);
+                            }
+                        }
+                    }
                 }
             }
 
             UIFactory.CreateNativeText("Select Airfield:", _contentRoot.transform, 18, TextAlignmentOptions.Left);
-            var afGroup = new GameObject("AFGrid", typeof(RectTransform)).transform;
-            afGroup.SetParent(_contentRoot.transform, false);
-            var grid = afGroup.gameObject.AddComponent<GridLayoutGroup>();
-            grid.cellSize = new Vector2(220, 40);
+            var afGroup = new GameObject("AFGrid", typeof(RectTransform));
+            afGroup.transform.SetParent(_contentRoot.transform, false);
+            
+            var grid = afGroup.AddComponent<GridLayoutGroup>();
+            grid.cellSize = new Vector2(340, 45);
             grid.spacing = new Vector2(10, 10);
             grid.constraint = GridLayoutGroup.Constraint.FixedColumnCount;
-            grid.constraintCount = 3;
+            grid.constraintCount = 2;
 
-            foreach (var name in AirfieldHelper.GetAirfieldNames())
+            // Add LayoutElement to ensure the VerticalLayoutGroup sees the height
+            var le = afGroup.AddComponent<LayoutElement>();
+            
+            // Add ContentSizeFitter to calculate the size
+            var fitter = afGroup.AddComponent<ContentSizeFitter>();
+            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+
+            var names = AirfieldHelper.GetAirfieldNames();
+            Plugin.Log?.LogInfo($"[MultiplayerMenu] Drawing lobby airfield grid. Name count: {names?.Length ?? 0}");
+
+            if (names == null || names.Length == 0)
             {
-                var btn = UIFactory.CreateNativeButton(name, afGroup, 40);
-                if (lobby?.LocalSelectedAirfield == name) btn.GetComponent<Image>().color = Color.cyan;
-                btn.onClick.AddListener(() => {
-                    lobby?.SetLocalAirfield(name);
-                    Plugin.Instance.Network?.SendLobbyAirfieldSelect(name);
-                    RefreshUI();
-                });
+                UIFactory.CreateNativeText("<color=red>No airfields found! (Enter Arena Map first)</color>", _contentRoot.transform, 16);
+            }
+            else
+            {
+                int buttonsCreated = 0;
+                foreach (var name in names)
+                {
+                    var btn = UIFactory.CreateNativeButton(name, afGroup.transform, 40);
+                    if (btn != null)
+                    {
+                        buttonsCreated++;
+                        if (lobby?.LocalSelectedAirfield == name)
+                        {
+                            var img = btn.GetComponent<Image>();
+                            if (img != null) img.color = Color.cyan;
+                        }
+                        btn.onClick.AddListener(() => {
+                            lobby?.SetLocalAirfield(name);
+                            Plugin.Instance.Lobby?.SendAirfieldSelect(name);
+                            RefreshUI();
+                        });
+                    }
+                    else
+                    {
+                        Plugin.Log?.LogWarning($"[MultiplayerMenu] Failed to create button for airfield: {name} (UIFactory returned null)");
+                    }
+                }
+                Plugin.Log?.LogInfo($"[MultiplayerMenu] Created {buttonsCreated} airfield buttons.");
             }
 
             var spacer = new GameObject("Spacer", typeof(RectTransform), typeof(LayoutElement));
@@ -209,10 +336,21 @@ namespace TCAMultiplayer.UI
             spacer.GetComponent<LayoutElement>().flexibleHeight = 1;
 
             var readyBtn = UIFactory.CreateNativeButton(lobby.LocalIsReady ? "NOT READY" : "READY", _contentRoot.transform);
-            readyBtn.GetComponent<Image>().color = lobby.LocalIsReady ? Color.red : Color.green;
+            
+            // Disable READY if no airfield selected
+            bool hasAirfield = !string.IsNullOrEmpty(lobby.LocalSelectedAirfield);
+            readyBtn.interactable = hasAirfield;
+            
+            readyBtn.GetComponent<Image>().color = !hasAirfield ? Color.gray : (lobby.LocalIsReady ? Color.red : Color.green);
+            
+            if (!hasAirfield)
+            {
+                UIFactory.CreateNativeText("<color=orange>SELECT AN AIRFIELD TO READY UP</color>", _contentRoot.transform, 14);
+            }
+
             readyBtn.onClick.AddListener(() => {
                 lobby.SetLocalReady(!lobby.LocalIsReady);
-                Plugin.Instance.Network?.SendLobbyPlayerReady(lobby.LocalIsReady);
+                Plugin.Instance.Lobby?.SendPlayerReady(lobby.LocalIsReady);
                 RefreshUI();
             });
 
@@ -223,15 +361,15 @@ namespace TCAMultiplayer.UI
                 start.onClick.AddListener(() => {
                     Plugin.Log?.LogInfo("[MultiplayerMenu] Starting game...");
                     lobby.StartGame();
-                    Plugin.Instance.Network?.SendLobbyStartGame(lobby.MapName, lobby.SpawnType);
+                    Plugin.Instance.Lobby?.SendStartGame(lobby.MapName, lobby.SpawnType);
                 });
             }
 
             UIFactory.CreateNativeButton("LEAVE", _contentRoot.transform).onClick.AddListener(() => {
+                Plugin.Instance?.GameState?.Disconnect();
                 Plugin.Instance?.Network?.Disconnect();
-                Plugin.Instance.Discovery?.StopBroadcasting();
-                Plugin.Instance.Lobby?.LeaveLobby();
-                Plugin.Instance.State.ConnectionStatus = ConnectionStatus.Disconnected;
+                Plugin.Instance?.Discovery?.StopBroadcasting();
+                Plugin.Instance?.Lobby?.LeaveLobby();
                 SetScreen(LobbyScreen.MainMenu);
             });
         }
@@ -241,15 +379,24 @@ namespace TCAMultiplayer.UI
             UIFactory.CreateNativeText("DIRECT CONNECT", _contentRoot.transform, 36);
             UIFactory.CreateLabelInputRow("IP:", _connectIP, _contentRoot.transform, v => _connectIP = v);
             UIFactory.CreateLabelInputRow("Port:", _connectPort, _contentRoot.transform, v => _connectPort = v);
-            
+
             var spacer = new GameObject("Spacer", typeof(RectTransform), typeof(LayoutElement));
             spacer.transform.SetParent(_contentRoot.transform, false);
             spacer.GetComponent<LayoutElement>().flexibleHeight = 1;
 
             UIFactory.CreateNativeButton("CONNECT", _contentRoot.transform).onClick.AddListener(() => {
                 int.TryParse(_connectPort, out int p);
-                Plugin.Instance?.Network?.StartClient(_connectIP, p);
-                SetScreen(LobbyScreen.Lobby);
+
+                // ... logging ...
+                if (Plugin.Instance == null) { /* ... */ return; }
+                /* ... */
+
+                Plugin.Log?.LogInfo($"[MultiplayerMenu] Direct connect to {_connectIP}:{p}");
+                Plugin.Instance.GameState?.StartConnecting(_connectIP, p);
+                Plugin.Instance.Network.StartClient(_connectIP, p);
+                
+                // Don't transition immediately - wait for OnPeerConnected callback
+                RefreshUI();
             });
             UIFactory.CreateNativeButton("BACK", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.MainMenu));
         }
@@ -257,12 +404,17 @@ namespace TCAMultiplayer.UI
         private void DrawBrowse()
         {
             UIFactory.CreateNativeText("LAN BROWSER", _contentRoot.transform, 36);
-            
+
             var listContainer = UIFactory.CreateVerticalGroup(_contentRoot.transform, 5, 0);
-            listContainer.GetComponent<LayoutElement>().flexibleHeight = 1;
             
+            // Adjust layout to make room for BACK button
+            var le = listContainer.GetComponent<LayoutElement>();
+            if (le == null) le = listContainer.AddComponent<LayoutElement>();
+            le.flexibleHeight = 1;
+            le.minHeight = 400;
+
             var games = Plugin.Instance?.Discovery?.GetDiscoveredGames() ?? new List<DiscoveredGame>();
-            
+
             if (games.Count == 0)
             {
                 UIFactory.CreateNativeText("Searching...", listContainer.transform, 18);
@@ -273,10 +425,33 @@ namespace TCAMultiplayer.UI
                 {
                     var btn = UIFactory.CreateNativeButton($"{game.HostName} ({game.IPAddress})", listContainer.transform, 40);
                     btn.onClick.AddListener(() => {
-                        Plugin.Log?.LogInfo($"[MultiplayerMenu] Joining game: {game.IPAddress}:{game.Port}");
-                        Plugin.Instance?.Network?.StartClient(game.IPAddress, game.Port);
-                        Plugin.Instance.State.ConnectionStatus = ConnectionStatus.Connecting;
-                        SetScreen(LobbyScreen.Lobby);
+                        // Defensive logging to trace connection issues
+                        if (Plugin.Instance == null)
+                        {
+                            Plugin.Log?.LogError("[MultiplayerMenu] Plugin.Instance is NULL! Cannot connect.");
+                            return;
+                        }
+                        if (Plugin.Instance.GameState == null)
+                        {
+                            Plugin.Log?.LogError("[MultiplayerMenu] GameState is NULL! Cannot track connection state.");
+                        }
+                        if (Plugin.Instance.Network == null)
+                        {
+                            Plugin.Log?.LogError("[MultiplayerMenu] Network is NULL! Cannot connect.");
+                            return;
+                        }
+
+                        Plugin.Log?.LogInfo($"[MultiplayerMenu] LAN browse - joining game: {game.IPAddress}:{game.Port}");
+                        Plugin.Log?.LogInfo($"[MultiplayerMenu] GameState before connect: {Plugin.Instance.GameState?.CurrentState}");
+
+                        bool stateStarted = Plugin.Instance.GameState?.StartConnecting(game.IPAddress, game.Port) ?? false;
+                        Plugin.Log?.LogInfo($"[MultiplayerMenu] StartConnecting result: {stateStarted}, state now: {Plugin.Instance.GameState?.CurrentState}");
+
+                        Plugin.Instance.Network.StartClient(game.IPAddress, game.Port);
+                        
+                        // Don't transition immediately - wait for OnPeerConnected callback
+                        // (same fix as DirectConnect screen)
+                        RefreshUI();
                     });
                 }
             }

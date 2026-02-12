@@ -90,6 +90,8 @@ D:\Tiny.Combat.Arena.v0.14.1.4\TCAMultiplayer\
     │
     ├── Networking\
     │   ├── NetworkManager.cs       # Core network logic + aircraft cloning
+    │   ├── GameStateMachine.cs     # Single source of truth for game state
+    │   ├── LobbyManager.cs         # Lobby state, player list, ready status
     │   ├── InterpolationBuffer.cs  # Hermite spline interpolation (30 samples)
     │   ├── PacketTypes.cs          # Packet definitions + serialization
     │   ├── DirectTransport.cs      # Raw UDP socket implementation
@@ -220,6 +222,55 @@ if (seekerType == 2) // Reflection failed
         seekerType = 1; // Radar
 }
 ```
+
+### Session: January 28, 2026
+
+#### Refactoring: Lobby & State Management Overhaul
+
+**Objective:** Consolidate state management into GameStateMachine as single source of truth.
+
+**Changes Made:**
+
+1. **SpawnManager Faction Lookup (Tasks 1-2)**
+   - Added MapData reflection for `GetPrimaryBlueFaction()` 
+   - Fixed spawn crash by using game's native faction lookup instead of hardcoded names
+   - Faction is now retrieved via `GameDataMaps.GetByName(mapName).GetPrimaryBlueFaction()`
+
+2. **Solo Mode Support (Task 3)**
+   - Added `SoloModeEnabled` property to LobbyManager
+   - Host can now start game with 1 player (no clients required)
+   - Useful for testing spawn and game flow
+
+3. **GameStateMachine Integration (Task 4)**
+   - Wired all game flow transitions in Plugin.cs:
+     - `StartLoading()` on game start
+     - `OnLoadingComplete()` after scenes loaded
+     - `StartSpawning()` when all players loaded
+     - `OnSpawnComplete()` after successful spawn
+
+4. **State Property Delegation (Tasks 6-7)**
+   - LobbyManager.IsHost/IsInLobby now delegate to GameStateMachine
+   - NetworkManager.IsHost now delegates to GameStateMachine
+   - Removed redundant local state management
+
+5. **MultiplayerState Deprecation (Task 8)**
+   - Marked `MultiplayerState` class as `[Obsolete]`
+   - Marked `ConnectionStatus` enum as `[Obsolete]`
+   - Updated PluginRunner UI to use GameStateMachine.CurrentState
+   - UI now shows proper states: Disconnected, Hosting, In Lobby, Connecting, Loading, Spawning, In Game, Respawning
+
+6. **Log Spam Reduction (Task 5)**
+   - Reduced "SendPacket dropped" log frequency from 1s to 10s
+   - Clarified message that host may be waiting for clients
+
+**Files Modified:**
+- `src/Plugin.cs` - GameStateMachine integration, UI updates
+- `src/Networking/LobbyManager.cs` - State delegation, solo mode
+- `src/Networking/NetworkManager.cs` - State delegation
+- `src/Networking/DirectTransport.cs` - Removed ConnectionStatus assignments
+- `src/Networking/GameStateMachine.cs` - (existing, no changes)
+- `src/Game/SpawnManager.cs` - MapData faction lookup
+- `src/UI/MultiplayerMenu.cs` - Removed ConnectionStatus assignments
 
 ---
 
@@ -662,6 +713,7 @@ The project references these DLLs from `libs/`:
 | 0.2.0 | Jan 2025 | Aircraft cloning, visual state sync |
 | 0.3.0 | Jan 2025 | Combat systems, damage sync |
 | 0.3.1 | Jan 23, 2025 | Bug fixes: destroy handling, seeker detection |
+| 0.4.0 | Jan 28, 2026 | Lobby & State Management refactor, Solo mode |
 
 ---
 
@@ -673,4 +725,4 @@ The project references these DLLs from `libs/`:
 
 ---
 
-*Last Updated: January 23, 2025*
+*Last Updated: January 28, 2026*
