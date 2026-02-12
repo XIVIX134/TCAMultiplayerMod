@@ -125,7 +125,9 @@ namespace TCAMultiplayer.Patches
             try
             {
                 if (Plugin.Instance == null || Plugin.Instance.Network == null) return;
-                if (!Plugin.Instance.Network.IsConnected) return;
+                // Use GameStateMachine.IsConnected instead of Network.IsConnected
+                // This supports solo mode where the host has no clients connected
+                if (Plugin.Instance.GameState == null || !Plugin.Instance.GameState.IsConnected) return;
                 if (!_inFlight) return;
 
                 // Send state at fixed interval
@@ -193,12 +195,11 @@ namespace TCAMultiplayer.Patches
                     _hasBeenDestroyedProp = aircraftType.GetProperty("HasBeenDestroyed", flags);
                     if (_hasBeenDestroyedProp == null)
                     {
-                        // Try as a field (backing field)
-                        var field = aircraftType.GetField("<HasBeenDestroyed>k__BackingField", flags);
+                        // Use robust backing field resolver instead of hardcoded name
+                        var field = ReflectionHelper.GetBackingField(aircraftType, "HasBeenDestroyed", flags);
                         if (field != null)
                         {
-                            // Wrap field access in a lambda-style approach via direct field read
-                            Plugin.Log?.LogInfo("[FlightGamePatches] Found HasBeenDestroyed backing field");
+                            Plugin.Log?.LogInfo($"[FlightGamePatches] Found HasBeenDestroyed backing field: {field.Name}");
                         }
                         else
                         {
@@ -216,8 +217,8 @@ namespace TCAMultiplayer.Patches
                     return (bool)_hasBeenDestroyedProp.GetValue(uniAircraft);
                 }
 
-                // Fallback: try backing field directly
-                var backingField = uniAircraft.GetType().GetField("<HasBeenDestroyed>k__BackingField",
+                // Fallback: use robust backing field resolver
+                var backingField = ReflectionHelper.GetBackingField(uniAircraft.GetType(), "HasBeenDestroyed",
                     BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 if (backingField != null)
                 {
@@ -416,6 +417,46 @@ namespace TCAMultiplayer.Patches
                         // Reinitialize reflection for new aircraft
                         _reflectionInitialized = false;
                     }
+                }
+                else if (_wasDestroyed && _cachedLocalAircraft != null)
+                {
+                    // CRITICAL FIX: We have an aircraft but _wasDestroyed is still true
+                    // This happens when SendLocalPlayerState found the new aircraft before CheckForRespawn
+                    // We need to detect respawn here!
+                    
+                    // Validate: Make sure this isn't the same destroyed aircraft lingering
+                    if (_cachedUniAircraft != null && IsAircraftMarkedDestroyed(_cachedUniAircraft))
+                    {
+                        Plugin.Log?.LogInfo("[FlightGamePatches] Found aircraft but it's still marked destroyed — ignoring");
+                        _cachedLocalAircraft = null;
+                        _cachedUniAircraft = null;
+                        return;
+                    }
+
+                    // Respawned!
+                    _wasDestroyed = false;
+                    _deathTime = 0f;
+                    _aircraftMissingTime = 0f;
+                    _respawnScreenShown = false;
+                    DamagePatches.DestructionHandled = false; // Reset for next death
+                    DamagePatches.LastAttackerId = 0;
+                    DamagePatches.LastAttackerWeapon = "";
+                    DamagePatches.LastDamageTime = 0f;
+                    _hasBeenDestroyedPropChecked = false; // Reset for new aircraft type
+                    _lastAircraftName = _cachedLocalAircraft.name;
+                    _hadAircraftBefore = true;
+                    
+                    // Use proper aircraft type name (e.g. "AV8B") not display name (e.g. "Kestrel 1 (MRGoldberg)")
+                    string respawnTypeName = GetLocalAircraftTypeName(_cachedUniAircraft);
+                    if (string.IsNullOrEmpty(respawnTypeName))
+                    {
+                        respawnTypeName = ReflectionHelper.MapAircraftNameFromString(_cachedLocalAircraft.name) ?? _cachedLocalAircraft.name;
+                    }
+                    Plugin.Instance?.Network?.SendAircraftRespawnNotification(respawnTypeName);
+                    Plugin.Log?.LogInfo($"[FlightGamePatches] Respawned with: {_cachedLocalAircraft.name} (type: {respawnTypeName})");
+
+                    // Reinitialize reflection for new aircraft
+                    _reflectionInitialized = false;
                 }
                 else if (_lastAircraftName == null)
                 {
@@ -763,6 +804,8 @@ namespace TCAMultiplayer.Patches
                 bool isFiring = false;
                 bool isFlareFiring = false;
                 bool isChaffFiring = false;
+                bool isNavMode = true;  // Default to NavMode (gun safety on)
+                bool isWeightOnWheels = true;  // Default to on ground
                 float pitch = 0f;
                 float roll = 0f;
                 float yaw = 0f;
@@ -853,13 +896,24 @@ namespace TCAMultiplayer.Patches
                         }
 
                         // Try to get actual nozzle angle from first engine
+                        // VTOLNozzleAngle is a FIELD on UniEngine, not a property
                         if (_cachedFirstEngine != null)
                         {
                             var engineType = _cachedFirstEngine.GetType();
-                            var nozzleAngleProp = engineType.GetProperty("VTOLNozzleAngle", BindingFlags.Public | BindingFlags.Instance);
-                            if (nozzleAngleProp != null)
+                            // Try the method first (preferred)
+                            var getTrueNozzleAngle = engineType.GetMethod("GetTrueNozzleAngle", BindingFlags.Public | BindingFlags.Instance);
+                            if (getTrueNozzleAngle != null)
                             {
-                                nozzleAngle = Convert.ToSingle(nozzleAngleProp.GetValue(_cachedFirstEngine));
+                                nozzleAngle = Convert.ToSingle(getTrueNozzleAngle.Invoke(_cachedFirstEngine, null));
+                            }
+                            else
+                            {
+                                // Fallback to field
+                                var nozzleAngleField = engineType.GetField("VTOLNozzleAngle", BindingFlags.Public | BindingFlags.Instance);
+                                if (nozzleAngleField != null)
+                                {
+                                    nozzleAngle = Convert.ToSingle(nozzleAngleField.GetValue(_cachedFirstEngine));
+                                }
                             }
                         }
 
@@ -938,6 +992,12 @@ namespace TCAMultiplayer.Patches
 
                         isFlareFiring = DetectFlareFiring();
                         isChaffFiring = DetectChaffFiring();
+                        
+                        // Read IsNavMode (gun safety) from FireControl
+                        isNavMode = ReadIsNavMode(_cachedUniAircraft);
+                        
+                        // Read IsWeightOnWheels (ground state) from LandingGear
+                        isWeightOnWheels = ReadIsWeightOnWheels(_cachedUniAircraft);
                     }
                     catch (Exception ex)
                     {
@@ -986,7 +1046,9 @@ namespace TCAMultiplayer.Patches
                 state.IsFiring = isFiring;
                 state.IsFlareFiring = isFlareFiring;
                 state.IsChaffFiring = isChaffFiring;
-
+                state.IsNavMode = isNavMode;  // Sync NavMode (gun safety)
+                state.IsWeightOnWheels = isWeightOnWheels;  // Sync ground state
+                
                 if (LogHelper.IsEnabled(LogCategory.Patches) &&
                     LogHelper.ShouldSample("FlightGamePatches.SendLocalPlayerState", LogHelper.HighFreqSampleRate))
                 {
@@ -994,7 +1056,7 @@ namespace TCAMultiplayer.Patches
                         $"[FlightGamePatches] State pos={absolutePos} vel={vel} throttle={throttle:F2} " +
                         $"pitch={pitch:F2} roll={roll:F2} yaw={yaw:F2} " +
                         $"ab={afterburner} gear={gearDown} flaps={flapsDown} fire={isFiring}" +
-                        $" flare={isFlareFiring} chaff={isChaffFiring}");
+                        $" flare={isFlareFiring} chaff={isChaffFiring} nav={isNavMode} wow={isWeightOnWheels}");
                 }
 
                 Plugin.Instance.Network.SendAircraftState(state);
@@ -1286,6 +1348,64 @@ namespace TCAMultiplayer.Patches
             }
             catch { }
             return false;
+        }
+
+        /// <summary>
+        /// Read IsNavMode (gun safety) from FireControl
+        /// Returns true if NavMode is ON (gun safety engaged, should not fire)
+        /// </summary>
+        private static bool ReadIsNavMode(Component aircraft)
+        {
+            try
+            {
+                if (aircraft == null) return true; // Default to safe
+
+                // FireControl is a FIELD, not a property - use GetField instead
+                var fcField = aircraft.GetType().GetField("FireControl", BindingFlags.Public | BindingFlags.Instance);
+                if (fcField == null) return true;
+
+                var fc = fcField.GetValue(aircraft);
+                if (fc == null) return true;
+
+                // IsNavMode is a public property on FireControl
+                var isNavModeProp = fc.GetType().GetProperty("IsNavMode", BindingFlags.Public | BindingFlags.Instance);
+                if (isNavModeProp == null) return true;
+
+                return Convert.ToBoolean(isNavModeProp.GetValue(fc));
+            }
+            catch
+            {
+                return true; // Default to safe on error
+            }
+        }
+
+        /// <summary>
+        /// Read IsWeightOnWheels from LandingGear - returns true if plane is on ground
+        /// When true, gun should not fire (same as game's FireControl logic)
+        /// </summary>
+        private static bool ReadIsWeightOnWheels(Component aircraft)
+        {
+            try
+            {
+                if (aircraft == null) return true; // Default to on ground
+
+                // LandingGear is a field on UniAircraft
+                var lgField = aircraft.GetType().GetField("LandingGear", BindingFlags.Public | BindingFlags.Instance);
+                if (lgField == null) return true;
+
+                var lg = lgField.GetValue(aircraft);
+                if (lg == null) return true;
+
+                // IsWeightOnWheels is a property on LandingGear
+                var wowProp = lg.GetType().GetProperty("IsWeightOnWheels", BindingFlags.Public | BindingFlags.Instance);
+                if (wowProp == null) return true;
+
+                return Convert.ToBoolean(wowProp.GetValue(lg));
+            }
+            catch
+            {
+                return true; // Default to on ground on error
+            }
         }
 
         private static void InitializeGunReflection(Component aircraft)

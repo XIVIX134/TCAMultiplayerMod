@@ -285,6 +285,24 @@ namespace TCAMultiplayer.Networking
             get => (Flags & 0x20) != 0;
             set => Flags = (byte)(value ? Flags | 0x20 : Flags & ~0x20);
         }
+        
+        /// <summary>
+        /// NavMode (gun safety) - when true, gun should not fire
+        /// </summary>
+        public bool IsNavMode
+        {
+            get => (Flags & 0x40) != 0;
+            set => Flags = (byte)(value ? Flags | 0x40 : Flags & ~0x40);
+        }
+        
+        /// <summary>
+        /// Weight on wheels - when true, plane is on ground and gun should not fire
+        /// </summary>
+        public bool IsWeightOnWheels
+        {
+            get => (Flags & 0x80) != 0;
+            set => Flags = (byte)(value ? Flags | 0x80 : Flags & ~0x80);
+        }
     }
 
     /// <summary>

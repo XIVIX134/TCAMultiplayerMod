@@ -306,17 +306,30 @@ namespace TCAMultiplayer.UI
             else
             {
                 int buttonsCreated = 0;
+                string selectedAirfield = lobby?.LocalSelectedAirfield;
+                
                 foreach (var name in names)
                 {
                     var btn = UIFactory.CreateNativeButton(name, afGroup.transform, 40);
                     if (btn != null)
                     {
                         buttonsCreated++;
-                        if (lobby?.LocalSelectedAirfield == name)
+                        
+                        // Highlight the selected airfield
+                        bool isSelected = (name == selectedAirfield);
+                        var img = btn.GetComponent<Image>();
+                        if (img != null)
                         {
-                            var img = btn.GetComponent<Image>();
-                            if (img != null) img.color = Color.cyan;
+                            if (isSelected)
+                            {
+                                img.color = Color.cyan; // Bright cyan for selected
+                            }
+                            else
+                            {
+                                img.color = new Color(0.2f, 0.2f, 0.2f, 1f); // Dark gray for unselected
+                            }
                         }
+                        
                         btn.onClick.AddListener(() => {
                             lobby?.SetLocalAirfield(name);
                             Plugin.Instance.Lobby?.SendAirfieldSelect(name);
@@ -329,6 +342,64 @@ namespace TCAMultiplayer.UI
                     }
                 }
                 Plugin.Log?.LogInfo($"[MultiplayerMenu] Created {buttonsCreated} airfield buttons.");
+            }
+
+            // Spawn Type Selection
+            UIFactory.CreateNativeText("Spawn Type:", _contentRoot.transform, 18, TextAlignmentOptions.Left);
+            
+            var stRow = new GameObject("SpawnTypeRow", typeof(RectTransform));
+            stRow.transform.SetParent(_contentRoot.transform, false);
+            var stLayout = stRow.AddComponent<HorizontalLayoutGroup>();
+            stLayout.childControlHeight = true;
+            stLayout.childControlWidth = true;
+            stLayout.childForceExpandHeight = true;
+            stLayout.childForceExpandWidth = true;
+            stLayout.spacing = 8;
+            var stLE = stRow.AddComponent<LayoutElement>();
+            stLE.preferredHeight = 45;
+
+            var spawnTypeNames = new[] { "Air (300m)", "Runway", "Ramp" };
+            var currentSpawnType = lobby?.SpawnType ?? LobbySpawnType.Runway;
+            
+            for (int i = 0; i < spawnTypeNames.Length; i++)
+            {
+                var spawnType = (LobbySpawnType)i;
+                var btn = UIFactory.CreateNativeButton(spawnTypeNames[i], stRow.transform, 42);
+                if (btn != null)
+                {
+                    // Highlight the currently selected spawn type
+                    if (spawnType == currentSpawnType)
+                    {
+                        var img = btn.GetComponent<Image>();
+                        if (img != null) img.color = Color.cyan;
+                    }
+                    
+                    if (isHost)
+                    {
+                        // Only host can change spawn type
+                        int idx = i; // Capture for closure
+                        btn.onClick.AddListener(() => {
+                            lobby?.SetSpawnSettings((LobbySpawnType)idx);
+                            RefreshUI();
+                        });
+                    }
+                    else
+                    {
+                        // Client sees read-only buttons (no interaction)
+                        btn.interactable = false;
+                        // Keep the highlight color for the selected one
+                        if (spawnType == currentSpawnType)
+                        {
+                            var img = btn.GetComponent<Image>();
+                            if (img != null) img.color = new Color(0.0f, 0.7f, 0.8f, 1f); // Slightly different cyan for read-only
+                        }
+                        else
+                        {
+                            var img = btn.GetComponent<Image>();
+                            if (img != null) img.color = new Color(0.3f, 0.3f, 0.3f, 1f); // Darker gray for unselected read-only
+                        }
+                    }
+                }
             }
 
             var spacer = new GameObject("Spacer", typeof(RectTransform), typeof(LayoutElement));

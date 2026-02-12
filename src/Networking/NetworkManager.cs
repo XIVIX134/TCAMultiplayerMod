@@ -550,7 +550,11 @@ namespace TCAMultiplayer.Networking
             if (payload == null) return;
             var packet = PacketSerializer.DeserializeLobbyRespawnRequest(payload);
             Plugin.Log?.LogInfo($"[NetworkManager] Respawn request from {packet.PeerId}");
-            // Host can validate and allow respawn
+            
+            // Call HandleRespawn to reset the NeedsRespawn flag and allow aircraft recreation
+            // AircraftType will be set from the next state packet
+            var respawnPacket = new AircraftChangedPacket { AircraftType = "" };
+            _remoteAircraft.HandleRespawn(packet.PeerId, respawnPacket);
         }
 
         #endregion

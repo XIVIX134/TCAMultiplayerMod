@@ -64,76 +64,126 @@ namespace TCAMultiplayer.Player
             {
                 var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
 
-                // Radar
-                _radarType = Type.GetType("Falcon.Targeting.Radar, Assembly-CSharp");
+                // Radar - use robust reflection helper
+                _radarType = ReflectionHelper.GetGameType("Falcon.Targeting.Radar");
                 if (_radarType != null)
                 {
                     _radarActiveRadarsField = _radarType.GetField("ActiveRadars", flags);
-                    _radarLockedTargetField = _radarType.GetField("<LockedTarget>k__BackingField", flags);
+                    _radarLockedTargetField = ReflectionHelper.GetBackingField(_radarType, "LockedTarget", flags);
                     _radarLockTargetMethod = _radarType.GetMethod("LockTarget", flags);
                     _radarUnlockMethod = _radarType.GetMethod("UnlockTarget", flags);
                     _radarActivateMethod = _radarType.GetMethod("ActivateRadar", flags);
                     _radarIsActiveProp = _radarType.GetProperty("IsActive", flags);
-                    Plugin.Log?.LogInfo($"[RealCombatSync] Radar type found, ActiveRadars={_radarActiveRadarsField != null}, LockTarget={_radarLockTargetMethod != null}");
+                    
+                    // Log reflection status for debugging
+                    Plugin.Log?.LogInfo($"[RealCombatSync] Radar type found: " +
+                        $"ActiveRadars={_radarActiveRadarsField != null}, " +
+                        $"LockedTarget={_radarLockedTargetField != null}, " +
+                        $"LockTarget={_radarLockTargetMethod != null}");
+                    
+                    if (_radarLockedTargetField == null)
+                    {
+                        Plugin.Log?.LogWarning("[RealCombatSync] Could not find LockedTarget backing field - radar lock sync may not work");
+                    }
+                }
+                else
+                {
+                    Plugin.Log?.LogWarning("[RealCombatSync] Radar type not found");
                 }
 
-                // Munition
-                _munitionType = Type.GetType("Falcon.Stores.Munition, Assembly-CSharp");
+                // Munition - use robust reflection helper
+                _munitionType = ReflectionHelper.GetGameType("Falcon.Stores.Munition");
                 if (_munitionType != null)
                 {
                     _launchedMissilesField = _munitionType.GetField("LaunchedMissiles", flags);
                     _munitionTargetField = _munitionType.GetField("Target", flags);
-                    _munitionHasExplodedField = _munitionType.GetField("<HasExploded>k__BackingField", flags);
+                    _munitionHasExplodedField = ReflectionHelper.GetBackingField(_munitionType, "HasExploded", flags);
                     _munitionSeekerField = _munitionType.GetField("seeker", flags);
                     _munitionSeekerSignatureProp = _munitionType.GetProperty("SeekerSignature", flags);
-                    Plugin.Log?.LogInfo($"[RealCombatSync] Munition type found, LaunchedMissiles={_launchedMissilesField != null}");
+                    
+                    Plugin.Log?.LogInfo($"[RealCombatSync] Munition type found: " +
+                        $"LaunchedMissiles={_launchedMissilesField != null}, " +
+                        $"HasExploded={_munitionHasExplodedField != null}");
+                    
+                    if (_munitionHasExplodedField == null)
+                    {
+                        Plugin.Log?.LogWarning("[RealCombatSync] Could not find HasExploded backing field");
+                    }
+                }
+                else
+                {
+                    Plugin.Log?.LogWarning("[RealCombatSync] Munition type not found");
                 }
 
-                // Seeker
-                _seekerType = Type.GetType("Falcon.Stores.Seeker, Assembly-CSharp");
+                // Seeker - use robust reflection helper
+                _seekerType = ReflectionHelper.GetGameType("Falcon.Stores.Seeker");
                 if (_seekerType != null)
                 {
-                    _seekerIsTrackingField = _seekerType.GetField("<IsTracking>k__BackingField", flags);
-                    _seekerIsSpoofedField = _seekerType.GetField("<IsSpoofed>k__BackingField", flags);
-                    _seekerTargetField = _seekerType.GetField("<Target>k__BackingField", flags);
-                    Plugin.Log?.LogInfo($"[RealCombatSync] Seeker type found, IsTracking={_seekerIsTrackingField != null}");
+                    _seekerIsTrackingField = ReflectionHelper.GetBackingField(_seekerType, "IsTracking", flags);
+                    _seekerIsSpoofedField = ReflectionHelper.GetBackingField(_seekerType, "IsSpoofed", flags);
+                    _seekerTargetField = ReflectionHelper.GetBackingField(_seekerType, "Target", flags);
+                    
+                    Plugin.Log?.LogInfo($"[RealCombatSync] Seeker type found: " +
+                        $"IsTracking={_seekerIsTrackingField != null}, " +
+                        $"IsSpoofed={_seekerIsSpoofedField != null}, " +
+                        $"Target={_seekerTargetField != null}");
+                    
+                    // Critical for threat warning - warn if any are missing
+                    if (_seekerIsTrackingField == null || _seekerIsSpoofedField == null || _seekerTargetField == null)
+                    {
+                        Plugin.Log?.LogWarning("[RealCombatSync] Seeker reflection incomplete - missile threat warnings may not work!");
+                    }
+                }
+                else
+                {
+                    Plugin.Log?.LogWarning("[RealCombatSync] Seeker type not found");
                 }
 
                 // Bullet2Manager
-                _bullet2ManagerType = Type.GetType("Falcon.Weapons.Bullet2Manager, Assembly-CSharp");
+                _bullet2ManagerType = ReflectionHelper.GetGameType("Falcon.Weapons.Bullet2Manager");
                 if (_bullet2ManagerType != null)
                 {
                     _bullet2ManagerInstanceProp = _bullet2ManagerType.GetProperty("Instance", flags);
                     _bullet2ManagerInstanceField = _bullet2ManagerType.GetField("Instance", flags);
                     _bullet2ManagerFireBulletMethod = _bullet2ManagerType.GetMethod("FireBullet", flags);
-                    Plugin.Log?.LogInfo($"[RealCombatSync] Bullet2Manager type found, InstanceProp={_bullet2ManagerInstanceProp != null}, InstanceField={_bullet2ManagerInstanceField != null}");
+                    Plugin.Log?.LogInfo($"[RealCombatSync] Bullet2Manager type found: " +
+                        $"InstanceProp={_bullet2ManagerInstanceProp != null}, " +
+                        $"InstanceField={_bullet2ManagerInstanceField != null}");
                 }
 
                 // BulletData
-                _bulletDataType = Type.GetType("Falcon.Weapons.BulletData, Assembly-CSharp");
+                _bulletDataType = ReflectionHelper.GetGameType("Falcon.Weapons.BulletData");
 
                 // Target
-                _targetType = Type.GetType("Falcon.Targeting.Target, Assembly-CSharp");
+                _targetType = ReflectionHelper.GetGameType("Falcon.Targeting.Target");
 
                 _initialized = true;
                 Plugin.Log?.LogInfo("[RealCombatSync] Initialization complete");
             }
             catch (Exception ex)
             {
-                Plugin.Log?.LogError($"[RealCombatSync] Initialize error: {ex.Message}");
+                Plugin.Log?.LogError($"[RealCombatSync] Initialize error: {ex.Message}\n{ex.StackTrace}");
                 _initialized = true; // Don't retry
             }
         }
 
         #region Radar Lock Sync
 
+        // Radar OwnTarget property for setting the radar's owner
+        private static PropertyInfo _radarOwnTargetProp;
+
         /// <summary>
-        /// Set up the remote aircraft's radar for threat detection
+        /// Set up the remote aircraft's radar for threat detection.
+        /// This ensures the radar is in Radar.ActiveRadars and has proper OwnTarget/Transform references.
         /// </summary>
         public static void SetupRemoteRadar(GameObject remoteAircraft, ulong playerId)
         {
             Initialize();
-            if (_radarType == null) return;
+            if (_radarType == null)
+            {
+                Plugin.Log?.LogWarning("[RealCombatSync] SetupRemoteRadar: Radar type not found");
+                return;
+            }
 
             try
             {
@@ -145,11 +195,75 @@ namespace TCAMultiplayer.Player
                     return;
                 }
 
+                // Cache OwnTarget property if not already cached
+                if (_radarOwnTargetProp == null)
+                {
+                    var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                    _radarOwnTargetProp = _radarType.GetProperty("OwnTarget", flags);
+                }
+
+                // Verify radar has valid OwnTarget (the remote aircraft's Target)
+                // This is critical for ThreatWarning.IsHostileThreat() to work
+                var ownTarget = _radarOwnTargetProp?.GetValue(radar);
+                if (ownTarget == null)
+                {
+                    // Try to find Target component on remote aircraft and assign it
+                    var targetType = ReflectionHelper.GetGameType("Falcon.Targeting.Target");
+                    if (targetType != null)
+                    {
+                        var targetComp = remoteAircraft.GetComponent(targetType);
+                        if (targetComp != null)
+                        {
+                            _radarOwnTargetProp?.SetValue(radar, targetComp);
+                            Plugin.Log?.LogInfo($"[RealCombatSync] Set radar OwnTarget from aircraft Target component");
+                        }
+                        else
+                        {
+                            Plugin.Log?.LogWarning("[RealCombatSync] Remote aircraft has no Target component - RWR may not detect as hostile");
+                        }
+                    }
+                }
+                else
+                {
+                    Plugin.Log?.LogInfo($"[RealCombatSync] Radar already has OwnTarget: {ownTarget.GetType().Name}");
+                }
+
+                // Verify radar has valid Transform
+                var transformProp = _radarType.GetProperty("Transform", BindingFlags.Public | BindingFlags.Instance);
+                var radarTransform = transformProp?.GetValue(radar);
+                if (radarTransform == null)
+                {
+                    Plugin.Log?.LogWarning("[RealCombatSync] Radar has no Transform - IsRadarVisible will fail!");
+                }
+
                 // Activate the radar and add to ActiveRadars
+                // This is critical for ThreatWarning.Refresh() to detect the radar
                 if (_radarActivateMethod != null)
                 {
                     _radarActivateMethod.Invoke(radar, null);
                     Plugin.Log?.LogInfo($"[RealCombatSync] Activated remote radar for player {playerId}");
+                }
+                else
+                {
+                    Plugin.Log?.LogWarning("[RealCombatSync] ActivateRadar method not found - trying direct ActiveRadars add");
+                    // Fallback: manually add to ActiveRadars
+                    if (_radarActiveRadarsField != null)
+                    {
+                        var activeRadars = _radarActiveRadarsField.GetValue(null) as System.Collections.IList;
+                        if (activeRadars != null && !activeRadars.Contains(radar))
+                        {
+                            activeRadars.Add(radar);
+                            Plugin.Log?.LogInfo($"[RealCombatSync] Manually added radar to ActiveRadars");
+                        }
+                    }
+                }
+
+                // Verify radar is now in ActiveRadars
+                if (_radarActiveRadarsField != null)
+                {
+                    var activeRadars = _radarActiveRadarsField.GetValue(null) as System.Collections.IList;
+                    bool isInList = activeRadars?.Contains(radar) ?? false;
+                    Plugin.Log?.LogInfo($"[RealCombatSync] Radar in ActiveRadars: {isInList} (total: {activeRadars?.Count ?? 0})");
                 }
 
                 // Store for later lock updates
@@ -162,13 +276,21 @@ namespace TCAMultiplayer.Player
         }
 
         /// <summary>
-        /// Update radar lock state when we receive a RadarLock packet
-        /// This makes the local player's RWR detect the lock
+        /// Update radar lock state when we receive a RadarLock packet.
+        /// This makes the local player's RWR detect the lock.
+        /// 
+        /// From ThreatWarning.cs:
+        /// - GetLockedThreats() checks radar.LockedTarget == ownRadar.OwnTarget
+        /// - GetNumberOfLockedThreats() counts radars where LockedTarget == ownTarget
         /// </summary>
         public static void SetRemoteRadarLock(ulong attackerId, bool isLocked)
         {
             Initialize();
-            if (_radarType == null) return;
+            if (_radarType == null)
+            {
+                Plugin.Log?.LogWarning("[RealCombatSync] SetRemoteRadarLock: Radar type not found");
+                return;
+            }
 
             try
             {
@@ -189,11 +311,38 @@ namespace TCAMultiplayer.Player
                         return;
                     }
 
+                    // Verify radar is active before locking
+                    var isActive = _radarIsActiveProp?.GetValue(radar);
+                    if (isActive is bool active && !active)
+                    {
+                        Plugin.Log?.LogWarning("[RealCombatSync] Radar is not active - activating before lock");
+                        _radarActivateMethod?.Invoke(radar, null);
+                    }
+
                     // Lock onto local player
+                    // The second parameter 'false' skips radar constraint checks (range, FOV, etc.)
+                    // This is important because the remote aircraft may be far away
                     if (_radarLockTargetMethod != null)
                     {
-                        _radarLockTargetMethod.Invoke(radar, new object[] { localTarget, false }); // false = don't check radar constraints
+                        _radarLockTargetMethod.Invoke(radar, new object[] { localTarget, false });
                         Plugin.Log?.LogInfo($"[RealCombatSync] Remote radar {attackerId} locked onto local player - RWR should detect!");
+
+                        // Verify lock was set
+                        var lockedTarget = _radarLockedTargetField?.GetValue(radar);
+                        Plugin.Log?.LogInfo($"[RealCombatSync] Verification: LockedTarget is {(lockedTarget != null ? "set" : "null")}");
+                    }
+                    else
+                    {
+                        // Fallback: set LockedTarget directly via backing field
+                        if (_radarLockedTargetField != null)
+                        {
+                            _radarLockedTargetField.SetValue(radar, localTarget);
+                            Plugin.Log?.LogInfo($"[RealCombatSync] Set LockedTarget directly via backing field");
+                        }
+                        else
+                        {
+                            Plugin.Log?.LogError("[RealCombatSync] No way to set radar lock - LockTarget method and LockedTarget field both unavailable");
+                        }
                     }
                 }
                 else
@@ -204,11 +353,17 @@ namespace TCAMultiplayer.Player
                         _radarUnlockMethod.Invoke(radar, null);
                         Plugin.Log?.LogInfo($"[RealCombatSync] Remote radar {attackerId} unlocked");
                     }
+                    else if (_radarLockedTargetField != null)
+                    {
+                        // Fallback: set LockedTarget to null
+                        _radarLockedTargetField.SetValue(radar, null);
+                        Plugin.Log?.LogInfo($"[RealCombatSync] Cleared LockedTarget via backing field");
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Plugin.Log?.LogError($"[RealCombatSync] SetRemoteRadarLock error: {ex.Message}");
+                Plugin.Log?.LogError($"[RealCombatSync] SetRemoteRadarLock error: {ex.Message}\n{ex.StackTrace}");
             }
         }
 

@@ -192,7 +192,7 @@ namespace TCAMultiplayer.Patches
             try
             {
                 var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
-                _munitionTypeForPolling = Type.GetType("Falcon.Stores.Munition, Assembly-CSharp");
+                _munitionTypeForPolling = ReflectionHelper.GetGameType("Falcon.Stores.Munition");
                 if (_munitionTypeForPolling == null)
                 {
                     Plugin.Log?.LogWarning("[WeaponPatches] POLL: Munition type not found for polling");
@@ -208,7 +208,8 @@ namespace TCAMultiplayer.Patches
                 {
                     _launchedMissilesList = _launchedMissilesField.GetValue(null) as System.Collections.IList;
                     _lastKnownMissileCount = _launchedMissilesList?.Count ?? 0;
-                    Plugin.Log?.LogInfo($"[WeaponPatches] POLL: Initialized. LaunchedMissiles has {_lastKnownMissileCount} entries. Ownship={_munitionOwnshipField != null}");
+                    Plugin.Log?.LogInfo($"[WeaponPatches] POLL: Initialized. LaunchedMissiles has {_lastKnownMissileCount} entries. " +
+                        $"Ownship={_munitionOwnshipField != null}, SeekerSig={_munitionSeekerSigProp != null}");
                 }
                 else
                 {
@@ -217,7 +218,7 @@ namespace TCAMultiplayer.Patches
             }
             catch (Exception ex)
             {
-                Plugin.Log?.LogError($"[WeaponPatches] POLL init error: {ex.Message}");
+                Plugin.Log?.LogError($"[WeaponPatches] POLL init error: {ex.Message}\n{ex.StackTrace}");
             }
         }
 

@@ -85,10 +85,12 @@ namespace TCAMultiplayer.Networking
             _players.Clear();
 
             // Add host as first player
+            // NOTE: PlayerName should be LocalPlayerName (the host's player name),
+            // NOT HostName (the server name). These are separate concepts.
             var hostPlayer = new LobbyPlayerInfo
             {
                 PeerId = hostPeerId,
-                PlayerName = HostName,
+                PlayerName = LocalPlayerName,  // Fixed: Use player name, not server name
                 SelectedAirfield = LocalSelectedAirfield,
                 SelectedAircraft = LocalSelectedAircraft,
                 IsReady = false,
@@ -97,7 +99,7 @@ namespace TCAMultiplayer.Networking
             };
             _players[hostPeerId] = hostPlayer;
 
-            Plugin.Log?.LogInfo($"[LobbyManager] Created lobby as host: {HostName}");
+            Plugin.Log?.LogInfo($"[LobbyManager] Created lobby as host: ServerName={HostName}, PlayerName={LocalPlayerName}");
             OnLobbyStateChanged?.Invoke();
         }
 

@@ -434,7 +434,7 @@ namespace TCAMultiplayer.Networking
                     state.Aircraft = clone;
                     state.Aircraft.transform.position = savedPos;
                     state.Aircraft.transform.rotation = savedRot;
-                    state.Aircraft.AddComponent<ScreenSpaceMarker>();
+                    // ScreenSpaceMarker removed - no red dot needed
 
                     state.Controller = clone.GetComponent<RemoteAircraftController>();
                     if (state.Controller != null)
@@ -645,6 +645,8 @@ namespace TCAMultiplayer.Networking
                 state.Buffer.Clear();
                 state.NeedsRespawn = false;
                 state.DestroyedTime = 0f;
+                state.ClockOffsetInitialized = false;  // Reset clock offset for new aircraft
+                state.LastSequenceNumber = 0;  // Reset sequence number for new aircraft
 
                 Plugin.Log.LogInfo($"[RemoteAircraftManager] Peer {peerId} ready for new aircraft on next state packet");
             }
@@ -800,11 +802,7 @@ namespace TCAMultiplayer.Networking
 
                 state.Aircraft.transform.position = state.DisplayPosition;
 
-                // Only add marker if not already present
-                if (state.Aircraft.GetComponent<ScreenSpaceMarker>() == null)
-                {
-                    state.Aircraft.AddComponent<ScreenSpaceMarker>();
-                }
+                // ScreenSpaceMarker removed - no red dot needed on remote aircraft
 
                 Plugin.Log.LogInfo($"[RemoteAircraftManager] Peer {peerId} created at {state.DisplayPosition}");
             }

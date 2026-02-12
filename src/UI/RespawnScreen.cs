@@ -20,13 +20,10 @@ namespace TCAMultiplayer.UI
 
         // Selection state
         private int _selectedAirfieldIndex = 0;
-        private int _selectedSpawnType = 1; // 0=Air, 1=Runway, 2=Ramp
         private string[] _airfieldNames = new string[0];
-        private readonly string[] _spawnTypeNames = { "Air (300m)", "Runway", "Ramp" };
 
         // Airfield button tracking for highlight
         private Button[] _airfieldButtons;
-        private Button[] _spawnTypeButtons;
 
         // Events
         public event Action<string, LobbySpawnType> OnRespawnRequested;
@@ -53,7 +50,22 @@ namespace TCAMultiplayer.UI
             // Refresh airfield list
             _airfieldNames = AirfieldHelper.GetAirfieldNames();
             if (_airfieldNames == null) _airfieldNames = new string[0];
+            
+            // Initialize to the player's currently selected airfield from lobby
+            var lobby = Plugin.Instance?.Lobby;
+            string currentAirfield = lobby?.LocalSelectedAirfield;
             _selectedAirfieldIndex = 0;
+            if (!string.IsNullOrEmpty(currentAirfield) && _airfieldNames != null)
+            {
+                for (int i = 0; i < _airfieldNames.Length; i++)
+                {
+                    if (_airfieldNames[i] == currentAirfield)
+                    {
+                        _selectedAirfieldIndex = i;
+                        break;
+                    }
+                }
+            }
 
             BuildUI();
         }
@@ -69,7 +81,6 @@ namespace TCAMultiplayer.UI
                 _canvas = null;
                 _contentRoot = null;
                 _airfieldButtons = null;
-                _spawnTypeButtons = null;
 
                 // Re-lock cursor for flight mode
                 Cursor.lockState = CursorLockMode.Locked;
@@ -218,10 +229,9 @@ namespace TCAMultiplayer.UI
             // Spacer
             CreateSpacer(_contentRoot.transform, 10);
 
-            // Spawn type header
-            UIFactory.CreateNativeText("SPAWN TYPE:", _contentRoot.transform, 18, TextAlignmentOptions.Left);
-
-            // Spawn type buttons (horizontal row)
+            // Spawn type - read-only buttons showing host's selection
+            UIFactory.CreateNativeText("Spawn Type (Host Selection):", _contentRoot.transform, 18, TextAlignmentOptions.Left);
+            
             var stRow = new GameObject("SpawnTypeRow", typeof(RectTransform));
             stRow.transform.SetParent(_contentRoot.transform, false);
             var stLayout = stRow.AddComponent<HorizontalLayoutGroup>();
@@ -231,22 +241,32 @@ namespace TCAMultiplayer.UI
             stLayout.childForceExpandWidth = true;
             stLayout.spacing = 8;
             var stLE = stRow.AddComponent<LayoutElement>();
-            stLE.preferredHeight = 45;
+            stLE.preferredHeight = 42;
 
-            _spawnTypeButtons = new Button[_spawnTypeNames.Length];
-            for (int i = 0; i < _spawnTypeNames.Length; i++)
+            var currentSpawnType = Plugin.Instance?.Lobby?.SpawnType ?? LobbySpawnType.Runway;
+            var spawnTypeNames = new[] { "Air (300m)", "Runway", "Ramp" };
+            
+            for (int i = 0; i < spawnTypeNames.Length; i++)
             {
-                int idx = i;
-                var btn = UIFactory.CreateNativeButton(_spawnTypeNames[i], stRow.transform, 42);
+                var spawnType = (LobbySpawnType)i;
+                var btn = UIFactory.CreateNativeButton(spawnTypeNames[i], stRow.transform, 40);
                 if (btn != null)
                 {
-                    _spawnTypeButtons[i] = btn;
-                    btn.onClick.AddListener(() => SelectSpawnType(idx));
-
-                    if (i == _selectedSpawnType)
+                    btn.interactable = false; // Read-only
+                    
+                    var img = btn.GetComponent<Image>();
+                    if (img != null)
                     {
-                        var img = btn.GetComponent<Image>();
-                        if (img != null) img.color = Color.cyan;
+                        if (spawnType == currentSpawnType)
+                        {
+                            // Highlight the host's selection
+                            img.color = new Color(0.0f, 0.7f, 0.8f, 1f); // Cyan for selected
+                        }
+                        else
+                        {
+                            // Darker gray for unselected
+                            img.color = new Color(0.3f, 0.3f, 0.3f, 1f);
+                        }
                     }
                 }
             }
@@ -289,25 +309,6 @@ namespace TCAMultiplayer.UI
             }
         }
 
-        private void SelectSpawnType(int index)
-        {
-            _selectedSpawnType = index;
-
-            // Update button highlights
-            if (_spawnTypeButtons != null)
-            {
-                for (int i = 0; i < _spawnTypeButtons.Length; i++)
-                {
-                    if (_spawnTypeButtons[i] == null) continue;
-                    var img = _spawnTypeButtons[i].GetComponent<Image>();
-                    if (img != null)
-                    {
-                        img.color = (i == index) ? Color.cyan : new Color(0.2f, 0.2f, 0.2f, 1f);
-                    }
-                }
-            }
-        }
-
         private void DoRespawn()
         {
             string airfield = (_airfieldNames.Length > _selectedAirfieldIndex)
@@ -321,7 +322,8 @@ namespace TCAMultiplayer.UI
                 if (names != null && names.Length > 0) airfield = names[0];
             }
 
-            var spawnType = (LobbySpawnType)_selectedSpawnType;
+            // Use the spawn type set by the host
+            var spawnType = Plugin.Instance?.Lobby?.SpawnType ?? LobbySpawnType.Runway;
 
             Plugin.Log?.LogInfo($"[RespawnScreen] Respawn requested: airfield={airfield} spawnType={spawnType}");
 

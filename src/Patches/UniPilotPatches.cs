@@ -192,7 +192,13 @@ namespace TCAMultiplayer.Patches
             {
                 // Get firing state from RemoteAircraftController
                 var controller = root.GetComponent<RemoteAircraftController>();
-                bool shouldFire = controller != null && controller.IsFiring;
+                
+                // Check NavMode (gun safety) and WeightOnWheels (on ground) - if either true, should NOT fire
+                // This matches the game's FireControl.Update() logic which checks:
+                // if (this.IsNavMode || this.OwnShip.LandingGear.IsWeightOnWheels || this.OwnShip.ArePilotsEjected)
+                bool isNavMode = controller != null && controller.IsNavMode;
+                bool isOnGround = controller != null && controller.IsWeightOnWheels;
+                bool shouldFire = controller != null && controller.IsFiring && !isNavMode && !isOnGround;
                 
                 // Try to initialize Gun if it's null
                 if (__instance.Gun == null)

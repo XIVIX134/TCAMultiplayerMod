@@ -37,6 +37,8 @@ namespace TCAMultiplayer.Player
         private bool _isFiring = false;
         private bool _isFlareFiring = false;
         private bool _isChaffFiring = false;
+        private bool _isNavMode = true;  // NavMode (gun safety) - default to safe
+        private bool _isWeightOnWheels = true;  // On ground - default to on ground
         
         /// <summary>
         /// Whether the remote player is firing their gun (read by FireControlPatches)
@@ -44,6 +46,18 @@ namespace TCAMultiplayer.Player
         public bool IsFiring => _isFiring;
         public bool IsFlareFiring => _isFlareFiring;
         public bool IsChaffFiring => _isChaffFiring;
+        
+        /// <summary>
+        /// Whether the remote player has NavMode (gun safety) enabled.
+        /// When true, the remote aircraft should NOT fire even if IsFiring is true.
+        /// </summary>
+        public bool IsNavMode => _isNavMode;
+        
+        /// <summary>
+        /// Whether the remote player is on the ground (weight on wheels).
+        /// When true, the remote aircraft should NOT fire (same as game logic).
+        /// </summary>
+        public bool IsWeightOnWheels => _isWeightOnWheels;
         private float _throttle = 0f;
         private float _pitch = 0f;
         private float _roll = 0f;
@@ -89,6 +103,18 @@ namespace TCAMultiplayer.Player
         private static FieldInfo _engineFXTargetAfterburnField;
         private static FieldInfo _engineFXJetThrottleField;
         
+        // Native game animation components
+        private static Type _uniAnimatedPartType;
+        private static MethodInfo _uniAnimatedPartUpdateManuallyMethod;
+        private static FieldInfo _uniAnimatedPartNameField;
+        private static FieldInfo _uniAnimatedPartIsUpdatedAutomaticallyField;
+        private List<object> _animatedParts = new List<object>();
+        
+        // Landing gear native component
+        private Component _landingGearComponent;
+        private MethodInfo _landingGearSetGearLoweredMethod;
+        private MethodInfo _landingGearForceGearLoweredMethod;
+        
         private bool _reflectionInitialized = false;
 
         /// <summary>
@@ -111,6 +137,10 @@ namespace TCAMultiplayer.Player
                 {
                     Plugin.Log.LogInfo($"[RemoteAircraftController] Found Animator: {_animator.gameObject.name}");
                     
+                    // IMPORTANT: Set animator to manual mode so it doesn't override our gear control
+                    // The game normally controls gear via animation states, but we need manual control
+                    _animator.updateMode = AnimatorUpdateMode.UnscaledTime;
+                    
                     // Log animator parameters
                     foreach (var param in _animator.parameters)
                     {
@@ -129,6 +159,9 @@ namespace TCAMultiplayer.Player
                 
                 // Find control surface transforms - only target the actual animated bones
                 FindControlSurfaces();
+                
+                // Find native game animation components
+                FindNativeAnimationComponents();
                 
                 // Initialize gear state based on what we expect
                 // Don't force a state - let the first packet determine it
@@ -160,11 +193,137 @@ namespace TCAMultiplayer.Player
                     Plugin.Log.LogInfo($"[RemoteAircraftController] EngineFX type found");
                 }
                 
+                // Get UniAnimatedPart type for native control surface animation
+                _uniAnimatedPartType = Type.GetType("Falcon.UniversalAircraft.UniAnimatedPart, Assembly-CSharp");
+                if (_uniAnimatedPartType != null)
+                {
+                    _uniAnimatedPartUpdateManuallyMethod = _uniAnimatedPartType.GetMethod("UpdateManually", flags);
+                    _uniAnimatedPartNameField = _uniAnimatedPartType.GetField("Name", flags);
+                    _uniAnimatedPartIsUpdatedAutomaticallyField = _uniAnimatedPartType.GetField("IsUpdatedAutomatically", flags);
+                    Plugin.Log.LogInfo($"[RemoteAircraftController] UniAnimatedPart type found");
+                }
+                
                 _reflectionInitialized = true;
             }
             catch (Exception ex)
             {
                 Plugin.Log.LogError($"[RemoteAircraftController] Reflection init error: {ex.Message}");
+            }
+        }
+        
+        /// <summary>
+        /// Find native game animation components (UniAnimatedPart, LandingGear)
+        /// </summary>
+        private void FindNativeAnimationComponents()
+        {
+            try
+            {
+                // Find LandingGear component on the aircraft
+                var landingGearType = Type.GetType("Falcon.Vehicles.LandingGear, Assembly-CSharp");
+                if (landingGearType != null)
+                {
+                    _landingGearComponent = GetComponentInParent(landingGearType);
+                    if (_landingGearComponent != null)
+                    {
+                        _landingGearSetGearLoweredMethod = landingGearType.GetMethod("SetGearLowered", BindingFlags.Public | BindingFlags.Instance);
+                        _landingGearForceGearLoweredMethod = landingGearType.GetMethod("ForceGearLowered", BindingFlags.Public | BindingFlags.Instance);
+                        Plugin.Log.LogInfo($"[RemoteAircraftController] Found LandingGear component");
+                    }
+                }
+                
+                // Find UniAnimatedPart objects - we need to create them from UniAircraftData since
+                // the UniAircraft component is disabled before Start() populates AnimatedParts
+                if (_uniAnimatedPartType != null)
+                {
+                    var uniAircraftType = Type.GetType("Falcon.UniversalAircraft.UniAircraft, Assembly-CSharp");
+                    var uniAircraftDataType = Type.GetType("Falcon.UniversalAircraft.UniAircraftData, Assembly-CSharp");
+                    var animatedPartPropertiesType = Type.GetType("Falcon.UniversalAircraft.AnimatedPartProperties, Assembly-CSharp");
+                    
+                    if (uniAircraftType != null && uniAircraftDataType != null)
+                    {
+                        var dataField = uniAircraftType.GetField("Data", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                        var animatedPartsDataField = uniAircraftDataType?.GetField("AnimatedParts", BindingFlags.Public | BindingFlags.Instance);
+                        var partField = animatedPartPropertiesType?.GetField("Part", BindingFlags.Public | BindingFlags.Instance);
+                        var nameField = animatedPartPropertiesType?.GetField("Name", BindingFlags.Public | BindingFlags.Instance);
+                        
+                        var parentAircraft = GetComponentInParent(uniAircraftType);
+                        if (parentAircraft != null)
+                        {
+                            var data = dataField?.GetValue(parentAircraft);
+                            if (data != null)
+                            {
+                                var animatedPartsData = animatedPartsDataField?.GetValue(data) as System.Collections.IList;
+                                if (animatedPartsData != null)
+                                {
+                                    Plugin.Log.LogInfo($"[RemoteAircraftController] Found {animatedPartsData.Count} AnimatedPartProperties in Data");
+                                    
+                                    foreach (var partData in animatedPartsData)
+                                    {
+                                        if (partData == null) continue;
+                                        
+                                        string partName = nameField?.GetValue(partData)?.ToString() ?? "unknown";
+                                        string partTransformName = partField?.GetValue(partData)?.ToString() ?? "";
+                                        
+                                        // Find the transform for this part
+                                        Transform partTransform = null;
+                                        var allTransforms = GetComponentsInChildren<Transform>(true);
+                                        foreach (var t in allTransforms)
+                                        {
+                                            if (t.name == partTransformName)
+                                            {
+                                                partTransform = t;
+                                                break;
+                                            }
+                                        }
+                                        
+                                        if (partTransform != null)
+                                        {
+                                            // Create a control surface for this animated part
+                                            // Determine type from name
+                                            ControlType type = ControlType.Aileron;
+                                            if (partName.IndexOf("Aileron", StringComparison.OrdinalIgnoreCase) >= 0)
+                                                type = ControlType.Aileron;
+                                            else if (partName.IndexOf("Elevator", StringComparison.OrdinalIgnoreCase) >= 0)
+                                                type = ControlType.Elevator;
+                                            else if (partName.IndexOf("Rudder", StringComparison.OrdinalIgnoreCase) >= 0)
+                                                type = ControlType.Rudder;
+                                            else if (partName.IndexOf("Flap", StringComparison.OrdinalIgnoreCase) >= 0)
+                                                type = ControlType.Flap;
+                                            else if (partName.IndexOf("Nozzle", StringComparison.OrdinalIgnoreCase) >= 0)
+                                                type = ControlType.Nozzle;
+                                            else if (partName.IndexOf("Brake", StringComparison.OrdinalIgnoreCase) >= 0)
+                                                type = ControlType.SpeedBrake;
+                                            
+                                            bool isLeft = partName.IndexOf("L", StringComparison.OrdinalIgnoreCase) >= 0;
+                                            
+                                            // Get rotation axis from the part (default to Y for control surfaces, X for nozzles)
+                                            Vector3 axis = (type == ControlType.Nozzle || type == ControlType.SpeedBrake) ? Vector3.right : Vector3.up;
+                                            
+                                            var surface = new ControlSurface
+                                            {
+                                                Name = partName,
+                                                Transform = partTransform,
+                                                StartRotation = partTransform.localRotation,
+                                                LocalAxis = axis,
+                                                CurrentAngle = 0f,
+                                                Type = type,
+                                                IsLeftSide = isLeft
+                                            };
+                                            _controlSurfaces.Add(surface);
+                                            Plugin.Log.LogInfo($"[RemoteAircraftController] Added animated part from Data: {partName} (transform={partTransformName}, type={type})");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                Plugin.Log.LogInfo($"[RemoteAircraftController] Found {_controlSurfaces.Count} control surfaces, LandingGear={_landingGearComponent != null}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning($"[RemoteAircraftController] FindNativeAnimationComponents error: {ex.Message}");
             }
         }
         
@@ -345,6 +504,8 @@ namespace TCAMultiplayer.Player
             }
             
             _isFiring = state.IsFiring;
+            _isNavMode = state.IsNavMode;  // Sync NavMode (gun safety)
+            _isWeightOnWheels = state.IsWeightOnWheels;  // Sync ground state
             
             // Update countermeasure state
             bool prevFlare = _isFlareFiring;
@@ -425,6 +586,23 @@ namespace TCAMultiplayer.Player
         
         private void UpdateGearAnimation()
         {
+            // Use native LandingGear component if available
+            // Use SetGearLowered - it works when IsWeightOnWheels=false (in the air)
+            if (_landingGearComponent != null && _landingGearSetGearLoweredMethod != null)
+            {
+                try
+                {
+                    // SetGearLowered works when in the air (IsWeightOnWheels=false)
+                    _landingGearSetGearLoweredMethod.Invoke(_landingGearComponent, new object[] { _gearDown });
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log.LogWarning($"[RemoteAircraftController] SetGearLowered failed: {ex.Message}");
+                }
+            }
+            
+            // Fallback to manual animation if native not available
             // Smoothly animate gear state
             if (Mathf.Abs(_gearAnimState - _targetGearState) > 0.001f)
             {
@@ -446,6 +624,16 @@ namespace TCAMultiplayer.Player
         }
         
         private void UpdateControlSurfaces()
+        {
+            // Always use manual transform rotation - we populate _controlSurfaces from UniAircraftData
+            // This works even when UniAircraft is disabled before Start() populates AnimatedParts
+            UpdateControlSurfacesManual();
+        }
+        
+        /// <summary>
+        /// Manual transform rotation for control surfaces
+        /// </summary>
+        private void UpdateControlSurfacesManual()
         {
             // Flap angle: 25° normal flight, could be 62° for VTOL mode
             // We'll use 25° for now since we don't track VTOL mode separately
@@ -494,7 +682,8 @@ namespace TCAMultiplayer.Player
                     case ControlType.Nozzle:
                         // From AV8B.json: VTOLNozzleMax: 100, driven by NozzleAnalog
                         // NozzleAngle from packet is in degrees (0-100)
-                        targetAngle = _nozzleAngle;
+                        // Game uses NEGATIVE angle for down rotation (see UniAircraft.cs line 243)
+                        targetAngle = -_nozzleAngle;
                         break;
                         
                     case ControlType.SpeedBrake:
