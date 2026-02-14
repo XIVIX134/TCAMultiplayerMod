@@ -5,3 +5,4 @@ bin/
 BepInEx/
 *.log
 *.tmp
+plans/AIRCRAFT_COLLISION_PLAN.md
