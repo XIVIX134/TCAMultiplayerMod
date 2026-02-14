@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
@@ -21,9 +22,12 @@ namespace TCAMultiplayer.UI
         // Selection state
         private int _selectedAirfieldIndex = 0;
         private string[] _airfieldNames = new string[0];
+        private int _selectedLoadoutIndex = 0;
+        private string[] _loadoutNames = new string[0];
 
-        // Airfield button tracking for highlight
-        private Button[] _airfieldButtons;
+        // Dropdowns
+        private TMP_Dropdown _loadoutDropdown;
+        private TMP_Dropdown _airfieldDropdown;
 
         // Events
         public event Action<string, LobbySpawnType> OnRespawnRequested;
@@ -80,7 +84,8 @@ namespace TCAMultiplayer.UI
                 Destroy(_canvas);
                 _canvas = null;
                 _contentRoot = null;
-                _airfieldButtons = null;
+                _loadoutDropdown = null;
+                _airfieldDropdown = null;
 
                 // Re-lock cursor for flight mode
                 Cursor.lockState = CursorLockMode.Locked;
@@ -182,93 +187,84 @@ namespace TCAMultiplayer.UI
             // Spacer
             CreateSpacer(_contentRoot.transform, 10);
 
-            // Airfield selection header
-            UIFactory.CreateNativeText("SELECT AIRFIELD:", _contentRoot.transform, 18, TextAlignmentOptions.Left);
-
-            // Airfield list (scrollable area with grid)
-            var afContainer = new GameObject("AirfieldContainer", typeof(RectTransform));
-            afContainer.transform.SetParent(_contentRoot.transform, false);
-
-            var afLayout = afContainer.AddComponent<VerticalLayoutGroup>();
-            afLayout.childControlHeight = false;
-            afLayout.childControlWidth = true;
-            afLayout.childForceExpandHeight = false;
-            afLayout.childForceExpandWidth = true;
-            afLayout.spacing = 5;
-
-            var afLE = afContainer.AddComponent<LayoutElement>();
-            afLE.preferredHeight = 200;
-            afLE.flexibleHeight = 1;
-
-            if (_airfieldNames.Length > 0)
+            // Current Aircraft (read-only - no aircraft selection mid-match)
+            var currentAircraft = Plugin.Instance?.Lobby?.LocalSelectedAircraft ?? "AV8B";
+            var aircraftDisplayName = LoadoutHelper.GetAircraftDisplayName(currentAircraft);
+            UIFactory.CreateNativeText($"Aircraft: {aircraftDisplayName}", _contentRoot.transform, 20, TextAlignmentOptions.Left);
+            
+            // Get loadouts for current aircraft
+            var loadoutList = LoadoutHelper.GetLoadoutNamesForAircraft(currentAircraft);
+            _loadoutNames = loadoutList?.ToArray() ?? new string[0];
+            
+            // Initialize to current selection
+            string currentLoadout = Plugin.Instance?.Lobby?.LocalSelectedLoadout ?? "Clean";
+            _selectedLoadoutIndex = 0;
+            for (int i = 0; i < _loadoutNames.Length; i++)
             {
-                _airfieldButtons = new Button[_airfieldNames.Length];
-                for (int i = 0; i < _airfieldNames.Length; i++)
+                if (_loadoutNames[i] == currentLoadout)
                 {
-                    int idx = i; // Capture for closure
-                    var btn = UIFactory.CreateNativeButton(_airfieldNames[i], afContainer.transform, 38);
-                    if (btn != null)
-                    {
-                        _airfieldButtons[i] = btn;
-                        btn.onClick.AddListener(() => SelectAirfield(idx));
-
-                        // Highlight default selection
-                        if (i == _selectedAirfieldIndex)
+                    _selectedLoadoutIndex = i;
+                    break;
+                }
+            }
+            
+            // Loadout dropdown
+            if (_loadoutNames.Length > 0)
+            {
+                var loadoutOptions = new List<string>(_loadoutNames);
+                _loadoutDropdown = UIFactory.CreateLabeledDropdown("Loadout:", loadoutOptions, _selectedLoadoutIndex, _contentRoot.transform);
+                if (_loadoutDropdown != null)
+                {
+                    _loadoutDropdown.onValueChanged.AddListener((index) => {
+                        _selectedLoadoutIndex = index;
+                        if (_loadoutNames.Length > index)
                         {
-                            var img = btn.GetComponent<Image>();
-                            if (img != null) img.color = Color.cyan;
+                            Plugin.Instance?.Lobby?.SetLocalLoadout(_loadoutNames[index]);
                         }
-                    }
+                    });
                 }
             }
             else
             {
-                UIFactory.CreateNativeText("No airfields found", afContainer.transform, 16);
+                UIFactory.CreateNativeText("No loadouts found", _contentRoot.transform, 16);
             }
 
             // Spacer
             CreateSpacer(_contentRoot.transform, 10);
 
-            // Spawn type - read-only buttons showing host's selection
-            UIFactory.CreateNativeText("Spawn Type (Host Selection):", _contentRoot.transform, 18, TextAlignmentOptions.Left);
-            
-            var stRow = new GameObject("SpawnTypeRow", typeof(RectTransform));
-            stRow.transform.SetParent(_contentRoot.transform, false);
-            var stLayout = stRow.AddComponent<HorizontalLayoutGroup>();
-            stLayout.childControlHeight = true;
-            stLayout.childControlWidth = true;
-            stLayout.childForceExpandHeight = true;
-            stLayout.childForceExpandWidth = true;
-            stLayout.spacing = 8;
-            var stLE = stRow.AddComponent<LayoutElement>();
-            stLE.preferredHeight = 42;
-
-            var currentSpawnType = Plugin.Instance?.Lobby?.SpawnType ?? LobbySpawnType.Runway;
-            var spawnTypeNames = new[] { "Air (300m)", "Runway", "Ramp" };
-            
-            for (int i = 0; i < spawnTypeNames.Length; i++)
+            // Airfield dropdown
+            if (_airfieldNames.Length > 0)
             {
-                var spawnType = (LobbySpawnType)i;
-                var btn = UIFactory.CreateNativeButton(spawnTypeNames[i], stRow.transform, 40);
-                if (btn != null)
+                var airfieldOptions = new List<string>(_airfieldNames);
+                _airfieldDropdown = UIFactory.CreateLabeledDropdown("Airfield:", airfieldOptions, _selectedAirfieldIndex, _contentRoot.transform);
+                if (_airfieldDropdown != null)
                 {
-                    btn.interactable = false; // Read-only
-                    
-                    var img = btn.GetComponent<Image>();
-                    if (img != null)
-                    {
-                        if (spawnType == currentSpawnType)
+                    _airfieldDropdown.onValueChanged.AddListener((index) => {
+                        _selectedAirfieldIndex = index;
+                        if (_airfieldNames.Length > index)
                         {
-                            // Highlight the host's selection
-                            img.color = new Color(0.0f, 0.7f, 0.8f, 1f); // Cyan for selected
+                            Plugin.Instance?.Lobby?.SetLocalAirfield(_airfieldNames[index]);
                         }
-                        else
-                        {
-                            // Darker gray for unselected
-                            img.color = new Color(0.3f, 0.3f, 0.3f, 1f);
-                        }
-                    }
+                    });
                 }
+            }
+            else
+            {
+                UIFactory.CreateNativeText("No airfields found", _contentRoot.transform, 16);
+            }
+
+            // Spacer
+            CreateSpacer(_contentRoot.transform, 10);
+
+            // Spawn type - read-only dropdown showing host's selection
+            var currentSpawnType = Plugin.Instance?.Lobby?.SpawnType ?? LobbySpawnType.Runway;
+            var spawnTypeNames = new List<string> { "Air (300m)", "Runway", "Ramp" };
+            int spawnTypeIndex = (int)currentSpawnType;
+            
+            var spawnTypeDropdown = UIFactory.CreateLabeledDropdown("Spawn Type:", spawnTypeNames, spawnTypeIndex, _contentRoot.transform);
+            if (spawnTypeDropdown != null)
+            {
+                spawnTypeDropdown.interactable = false; // Read-only
             }
 
             // Spacer
@@ -281,31 +277,6 @@ namespace TCAMultiplayer.UI
                 var img = respawnBtn.GetComponent<Image>();
                 if (img != null) img.color = new Color(0.2f, 0.7f, 0.2f, 1f);
                 respawnBtn.onClick.AddListener(DoRespawn);
-            }
-        }
-
-        private void SelectAirfield(int index)
-        {
-            _selectedAirfieldIndex = index;
-
-            // Update button highlights
-            if (_airfieldButtons != null)
-            {
-                for (int i = 0; i < _airfieldButtons.Length; i++)
-                {
-                    if (_airfieldButtons[i] == null) continue;
-                    var img = _airfieldButtons[i].GetComponent<Image>();
-                    if (img != null)
-                    {
-                        img.color = (i == index) ? Color.cyan : new Color(0.2f, 0.2f, 0.2f, 1f);
-                    }
-                }
-            }
-
-            // Also set in lobby manager so the network knows
-            if (_airfieldNames.Length > index)
-            {
-                Plugin.Instance?.Lobby?.SetLocalAirfield(_airfieldNames[index]);
             }
         }
 

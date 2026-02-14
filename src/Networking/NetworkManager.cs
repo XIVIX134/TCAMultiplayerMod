@@ -58,6 +58,7 @@ namespace TCAMultiplayer.Networking
         public Vector3 RemoteVelocity => _remoteAircraft.RemoteVelocity;
         public float ExtrapolationTime => _remoteAircraft.ExtrapolationTime;
         public Player.RemoteAircraftController RemoteController => _remoteAircraft.Controller;
+        public RemoteAircraftManager RemoteAircraftManager => _remoteAircraft;
 
         public NetworkManager()
         {
@@ -77,10 +78,14 @@ namespace TCAMultiplayer.Networking
             // Combat
             _router.RegisterHandler(PacketType.DamageDealt, HandleDamageDealt);
             _router.RegisterHandler(PacketType.MissileLaunch, HandleMissileLaunch);
+            _router.RegisterHandler(PacketType.BombDrop, HandleBombDrop);
+            _router.RegisterHandler(PacketType.CraterSpawn, HandleCraterSpawn);
+            _router.RegisterHandler(PacketType.BuildingDestroy, HandleBuildingDestroy);
             _router.RegisterHandler(PacketType.RadarLock, HandleRadarLock);
             _router.RegisterHandler(PacketType.RadarLockLost, HandleRadarLock);
             _router.RegisterHandler(PacketType.ProjectileImpact, HandleProjectileImpact);
             _router.RegisterHandler(PacketType.KillConfirm, HandleKillConfirm);
+            _router.RegisterHandler(PacketType.AircraftCollision, HandleAircraftCollision);
 
             // Lobby packets - routed to LobbyManager
             _router.RegisterHandler(PacketType.LobbyState, HandleLobbyState);
@@ -89,6 +94,8 @@ namespace TCAMultiplayer.Networking
             _router.RegisterHandler(PacketType.LobbyPlayerLeft, HandleLobbyPlayerLeft);
             _router.RegisterHandler(PacketType.LobbyPlayerReady, HandleLobbyPlayerReady);
             _router.RegisterHandler(PacketType.LobbyAirfieldSelect, HandleLobbyAirfieldSelect);
+            _router.RegisterHandler(PacketType.AircraftSelect, HandleLobbyAircraftSelect);
+            _router.RegisterHandler(PacketType.LoadoutSelect, HandleLobbyLoadoutSelect);
             _router.RegisterHandler(PacketType.LobbySpawnSettings, HandleLobbySpawnSettings);
             _router.RegisterHandler(PacketType.LobbyStartGame, HandleLobbyStartGame);
             _router.RegisterHandler(PacketType.LobbyLoadingComplete, HandleLobbyLoadingComplete);
@@ -370,6 +377,30 @@ namespace TCAMultiplayer.Networking
             Patches.WeaponPatches.HandleMissileLaunch(packet);
         }
 
+        private void HandleBombDrop(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeBombDrop(payload);
+            Plugin.Log.LogInfo($"[NetworkManager] Received bomb drop: {packet.BombType}");
+            Patches.WeaponPatches.HandleBombDrop(packet);
+        }
+
+        private void HandleCraterSpawn(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeCraterSpawn(payload);
+            Plugin.Log.LogInfo($"[NetworkManager] Received crater spawn at ({packet.PosX:F1}, {packet.PosY:F1}, {packet.PosZ:F1})");
+            Patches.WorldDestructionPatches.HandleCraterSpawn(packet);
+        }
+
+        private void HandleBuildingDestroy(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeBuildingDestroy(payload);
+            Plugin.Log.LogInfo($"[NetworkManager] Received building destroy at ({packet.PosX:F1}, {packet.PosY:F1}, {packet.PosZ:F1})");
+            Patches.WorldDestructionPatches.HandleBuildingDestroy(packet);
+        }
+
         private void HandleRadarLock(ulong peerId, byte[] payload)
         {
             if (payload == null) return;
@@ -394,6 +425,14 @@ namespace TCAMultiplayer.Networking
             var packet = PacketSerializer.DeserializeProjectileImpact(payload);
             Plugin.Log.LogInfo($"[NetworkManager] Received impact: {packet.WeaponName} at ({packet.ImpactPosX:F1},{packet.ImpactPosY:F1},{packet.ImpactPosZ:F1})");
             Patches.DamagePatches.HandleReceivedImpact(packet);
+        }
+
+        private void HandleAircraftCollision(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeAircraftCollision(payload);
+            Plugin.Log.LogInfo($"[NetworkManager] Received aircraft collision: {packet.PlayerA} vs {packet.PlayerB} damage=({packet.DamageA},{packet.DamageB})");
+            Player.AircraftCollisionManager.Instance?.HandleCollisionPacket(packet);
         }
 
         #endregion
@@ -476,6 +515,11 @@ namespace TCAMultiplayer.Networking
                 SendPacket(PacketType.LobbyPlayerJoined, PacketSerializer.SerializeLobbyPlayerJoined(joinPacket), true);
                 SendPacket(PacketType.LobbyAirfieldSelect, PacketSerializer.SerializeLobbyAirfieldSelect(
                     new LobbyAirfieldSelectPacket { PeerId = LocalPeerId, AirfieldName = lobby.LocalSelectedAirfield }), true);
+                // Also send aircraft and loadout selection to host
+                SendPacket(PacketType.AircraftSelect, PacketSerializer.SerializeLobbyAircraftSelect(
+                    new LobbyAircraftSelectPacket { PeerId = LocalPeerId, AircraftName = lobby.LocalSelectedAircraft }), true);
+                SendPacket(PacketType.LoadoutSelect, PacketSerializer.SerializeLobbyLoadoutSelect(
+                    new LobbyLoadoutSelectPacket { PeerId = LocalPeerId, LoadoutName = lobby.LocalSelectedLoadout }), true);
             }
         }
 
@@ -515,6 +559,22 @@ namespace TCAMultiplayer.Networking
             if (payload == null) return;
             var packet = PacketSerializer.DeserializeLobbyAirfieldSelect(payload);
             Plugin.Instance?.Lobby?.HandlePlayerAirfieldSelect(packet.PeerId, packet.AirfieldName);
+        }
+
+        private void HandleLobbyAircraftSelect(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeLobbyAircraftSelect(payload);
+            Plugin.Log?.LogInfo($"[NetworkManager] Aircraft select from {packet.PeerId}: {packet.AircraftName}");
+            Plugin.Instance?.Lobby?.HandlePlayerAircraftSelect(packet.PeerId, packet.AircraftName);
+        }
+
+        private void HandleLobbyLoadoutSelect(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeLobbyLoadoutSelect(payload);
+            Plugin.Log?.LogInfo($"[NetworkManager] Loadout select from {packet.PeerId}: {packet.LoadoutName}");
+            Plugin.Instance?.Lobby?.HandlePlayerLoadoutSelect(packet.PeerId, packet.LoadoutName);
         }
 
         private void HandleLobbySpawnSettings(ulong peerId, byte[] payload)

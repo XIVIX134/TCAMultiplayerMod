@@ -269,7 +269,7 @@ namespace TCAMultiplayer.Game
         /// <summary>
         /// Spawn player at an airfield.
         /// </summary>
-        public bool SpawnPlayerAtAirfield(string airfieldName, string aircraftName, LobbySpawnType spawnType)
+        public bool SpawnPlayerAtAirfield(string airfieldName, string aircraftName, LobbySpawnType spawnType, string loadoutName = null)
         {
             Initialize();
             DestroyExistingPlayer();
@@ -285,13 +285,13 @@ namespace TCAMultiplayer.Game
             }
 
             SpawnedAirfield = airfieldName;
-            return SpawnPlayerAtPosition(position, rotation, aircraftName ?? "AV8B", spawnType);
+            return SpawnPlayerAtPosition(position, rotation, aircraftName ?? "AV8B", spawnType, loadoutName);
         }
 
         /// <summary>
         /// Spawn player at a specific position.
         /// </summary>
-        public bool SpawnPlayerAtPosition(Vector3 position, Quaternion rotation, string aircraftName, LobbySpawnType spawnType)
+        public bool SpawnPlayerAtPosition(Vector3 position, Quaternion rotation, string aircraftName, LobbySpawnType spawnType, string loadoutName = null)
         {
             Initialize();
 
@@ -300,6 +300,12 @@ namespace TCAMultiplayer.Game
                 Plugin.Log?.LogError("[SpawnManager] SpawnPlayerAtPosition method not available");
                 OnSpawnFailed?.Invoke();
                 return false;
+            }
+
+            // Get loadout from lobby if not specified
+            if (string.IsNullOrEmpty(loadoutName))
+            {
+                loadoutName = Plugin.Instance?.Lobby?.LocalSelectedLoadout ?? "Clean";
             }
 
             try
@@ -321,14 +327,14 @@ namespace TCAMultiplayer.Game
 
                 bool isGrounded = spawnType != LobbySpawnType.Air;
 
-                Plugin.Log?.LogInfo($"[SpawnManager] Spawning {aircraftName} at ({position.x:F0}, {position.y:F0}, {position.z:F0})");
+                Plugin.Log?.LogInfo($"[SpawnManager] Spawning {aircraftName} at ({position.x:F0}, {position.y:F0}, {position.z:F0}) with loadout: {loadoutName}");
 
                 _spawnPlayerAtPositionMethod.Invoke(flightGame, new object[]
                 {
                     aircraftName,
                     position,
                     rotation,
-                    "Clean",    // Loadout
+                    loadoutName, // Use selected loadout
                     "Mixed",    // Ammo belt
                     isGrounded,
                     faction,

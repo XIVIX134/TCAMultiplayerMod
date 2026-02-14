@@ -43,6 +43,15 @@ namespace TCAMultiplayer.Patches
         private static PropertyInfo _munitionSeekerSigProp = null;
         private static PropertyInfo _munitionDataProp = null;
 
+        // ===== BOMB DROP POLLING =====
+        // Bombs don't have seekers, so they're only added to LaunchedMunitions, not LaunchedMissiles
+        private static FieldInfo _launchedMunitionsField = null;
+        private static System.Collections.IList _launchedMunitionsList = null;
+        private static int _lastKnownMunitionCount = 0;
+        private static readonly HashSet<int> _processedMunitionIds = new HashSet<int>();
+        private static PropertyInfo _munitionHasSeekerProp = null;
+        private static FieldInfo _munitionVelocityField = null;
+
         /// <summary>
         /// Get the local player's peer ID
         /// </summary>
@@ -199,10 +208,16 @@ namespace TCAMultiplayer.Patches
                     return;
                 }
 
+                // Missile polling (LaunchedMissiles - guided only)
                 _launchedMissilesField = _munitionTypeForPolling.GetField("LaunchedMissiles", flags);
                 _munitionOwnshipField = _munitionTypeForPolling.GetField("Ownship", flags);
                 _munitionSeekerSigProp = _munitionTypeForPolling.GetProperty("SeekerSignature", flags);
                 _munitionDataProp = _munitionTypeForPolling.GetProperty("Data", flags);
+
+                // Bomb polling (LaunchedMunitions - all munitions including bombs)
+                _launchedMunitionsField = _munitionTypeForPolling.GetField("LaunchedMunitions", flags);
+                _munitionHasSeekerProp = _munitionTypeForPolling.GetProperty("HasSeeker", flags);
+                _munitionVelocityField = _munitionTypeForPolling.GetField("velocity", flags);
 
                 if (_launchedMissilesField != null)
                 {
@@ -214,6 +229,18 @@ namespace TCAMultiplayer.Patches
                 else
                 {
                     Plugin.Log?.LogWarning("[WeaponPatches] POLL: LaunchedMissiles field not found!");
+                }
+
+                if (_launchedMunitionsField != null)
+                {
+                    _launchedMunitionsList = _launchedMunitionsField.GetValue(null) as System.Collections.IList;
+                    _lastKnownMunitionCount = _launchedMunitionsList?.Count ?? 0;
+                    Plugin.Log?.LogInfo($"[WeaponPatches] POLL: LaunchedMunitions has {_lastKnownMunitionCount} entries. " +
+                        $"HasSeeker={_munitionHasSeekerProp != null}, Velocity={_munitionVelocityField != null}");
+                }
+                else
+                {
+                    Plugin.Log?.LogWarning("[WeaponPatches] POLL: LaunchedMunitions field not found!");
                 }
             }
             catch (Exception ex)
@@ -318,8 +345,35 @@ namespace TCAMultiplayer.Patches
                     }
                 }
 
-                // Get target — assume remote player for 2-player games
-                ulong targetId = GetRemotePlayerId();
+                // Check if missile has a target (locked or not)
+                // IMPORTANT: Always send target if available - missiles like AIM-120 can acquire lock after launch
+                ulong targetId = 0; // 0 = no target
+                bool isTracking = false;
+                
+                // Get the Target field from Munition to check if there's an actual target
+                var targetField = munition.GetType().GetField("Target", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                
+                if (targetField != null)
+                {
+                    var target = targetField.GetValue(missile);
+                    if (target != null)
+                    {
+                        // Always set target ID if missile has a target
+                        targetId = GetRemotePlayerId();
+                        
+                        // IMPORTANT: If missile has a target, set IsTracking=true
+                        // At launch moment, the seeker's IsTracking may be false because it hasn't activated yet,
+                        // but the missile WILL track once the seeker activates. For RWR to show the threat,
+                        // we need to indicate that the missile is tracking.
+                        isTracking = true;
+                        
+                        Plugin.Log?.LogInfo($"[WeaponPatches] POLL: Missile has target - TargetId={targetId}, IsTracking={isTracking}");
+                    }
+                    else
+                    {
+                        Plugin.Log?.LogInfo($"[WeaponPatches] POLL: Missile has no target - flying unguided");
+                    }
+                }
 
                 // Get launch position and direction
                 Vector3 launchPos = munition.transform.position;
@@ -330,6 +384,7 @@ namespace TCAMultiplayer.Patches
                 {
                     ShooterId = GetLocalPlayerId(),
                     TargetId = targetId,
+                    IsTracking = isTracking,
                     MissileType = missileName,
                     SeekerType = seekerType,
                     LaunchPosX = absoluteLaunchPos.x,
@@ -348,6 +403,199 @@ namespace TCAMultiplayer.Patches
             catch (Exception ex)
             {
                 Plugin.Log?.LogError($"[WeaponPatches] POLL SendMissileLaunch error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Called from FlightGamePatches.Update every frame to detect new bomb drops.
+        /// Polls Munition.LaunchedMunitions static list for unguided munitions (bombs).
+        /// </summary>
+        public static void PollBombDrops()
+        {
+            try
+            {
+                if (Plugin.Instance == null || Plugin.Instance.Network == null) return;
+                if (!Plugin.Instance.Network.IsConnected) return;
+
+                // Initialize polling reflection once
+                if (!_pollingInitialized)
+                {
+                    InitializeMissilePolling();
+                }
+
+                if (_launchedMunitionsList == null)
+                {
+                    // Re-read the list field each time in case it was re-assigned
+                    if (_launchedMunitionsField != null)
+                    {
+                        _launchedMunitionsList = _launchedMunitionsField.GetValue(null) as System.Collections.IList;
+                    }
+                    if (_launchedMunitionsList == null) return;
+                }
+
+                int currentCount = _launchedMunitionsList.Count;
+
+                // Fast path: no new munitions
+                if (currentCount <= _lastKnownMunitionCount && currentCount > 0)
+                {
+                    _lastKnownMunitionCount = currentCount;
+                    return;
+                }
+
+                // Check for new munitions (scan from end since new ones are appended)
+                for (int i = 0; i < currentCount; i++)
+                {
+                    var munition = _launchedMunitionsList[i];
+                    if (munition == null) continue;
+
+                    int instanceId = (munition as UnityEngine.Object)?.GetInstanceID() ?? munition.GetHashCode();
+
+                    // Already processed this munition
+                    if (_processedMunitionIds.Contains(instanceId)) continue;
+
+                    _processedMunitionIds.Add(instanceId);
+
+                    // Check if this is a BOMB (no seeker) from the LOCAL player
+                    if (!IsLocalPlayerBomb(munition)) continue;
+
+                    // NEW LOCAL BOMB DETECTED — send bomb drop packet
+                    Plugin.Log?.LogInfo($"[WeaponPatches] BOMB POLL: New local bomb detected! InstanceId={instanceId}");
+                    SendBombDropFromPolling(munition);
+                }
+
+                _lastKnownMunitionCount = currentCount;
+            }
+            catch (Exception ex)
+            {
+                if (LogHelper.ShouldLogInterval("WeaponPatches.PollBombs.Error", 5f))
+                    Plugin.Log?.LogError($"[WeaponPatches] PollBombDrops error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Check if a munition is a bomb (no seeker) launched by the local player.
+        /// </summary>
+        private static bool IsLocalPlayerBomb(object munition)
+        {
+            try
+            {
+                var comp = munition as Component;
+                if (comp == null) return false;
+
+                // Skip network munitions we created
+                if (comp.gameObject.name.StartsWith("MP_")) return false;
+
+                // Check if it has a seeker - if yes, it's a missile, not a bomb
+                if (_munitionHasSeekerProp != null)
+                {
+                    var hasSeeker = (bool)_munitionHasSeekerProp.GetValue(munition);
+                    if (hasSeeker)
+                    {
+                        return false; // It's a missile, not a bomb
+                    }
+                }
+
+                // Check Ownship — if null, skip
+                if (_munitionOwnshipField != null)
+                {
+                    var ownship = _munitionOwnshipField.GetValue(munition);
+                    if (ownship != null)
+                    {
+                        var ownshipComp = ownship as Component;
+                        if (ownshipComp != null)
+                        {
+                            // If the ownship aircraft has RemoteAircraftController, it's NOT our bomb
+                            var remoteCtrl = ownshipComp.GetComponentInParent<RemoteAircraftController>();
+                            if (remoteCtrl != null)
+                            {
+                                return false; // Remote player's bomb
+                            }
+                        }
+                    }
+                    else
+                    {
+                        return false; // No ownship, skip
+                    }
+                }
+                else
+                {
+                    // Can't check ownership — use fallback
+                    var parentRemote = comp.GetComponentInParent<RemoteAircraftController>();
+                    if (parentRemote != null) return false;
+                }
+
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Build and send a BombDropPacket from a detected bomb object.
+        /// </summary>
+        private static void SendBombDropFromPolling(object bomb)
+        {
+            try
+            {
+                var munition = bomb as MonoBehaviour;
+                if (munition == null) return;
+
+                var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+                // Get bomb name
+                string bombName = munition.gameObject.name;
+                if (_munitionDataProp != null)
+                {
+                    var data = _munitionDataProp.GetValue(bomb);
+                    if (data != null)
+                    {
+                        var displayNameProp = data.GetType().GetProperty("DisplayName", flags)
+                            ?? data.GetType().GetProperty("Name", flags);
+                        if (displayNameProp != null)
+                        {
+                            bombName = displayNameProp.GetValue(data) as string ?? bombName;
+                        }
+                    }
+                }
+
+                // Get launch position
+                Vector3 launchPos = munition.transform.position;
+                Vector3d absoluteLaunchPos = FloatingOriginHelper.LocalToAbsolute(launchPos);
+
+                // Get velocity (includes aircraft velocity at release)
+                Vector3 velocity = Vector3.zero;
+                if (_munitionVelocityField != null)
+                {
+                    var vel = _munitionVelocityField.GetValue(bomb);
+                    if (vel is Vector3 v3)
+                    {
+                        velocity = v3;
+                    }
+                }
+
+                var packet = new BombDropPacket
+                {
+                    ShooterId = GetLocalPlayerId(),
+                    BombType = bombName,
+                    LaunchPosX = absoluteLaunchPos.x,
+                    LaunchPosY = absoluteLaunchPos.y,
+                    LaunchPosZ = absoluteLaunchPos.z,
+                    VelX = velocity.x,
+                    VelY = velocity.y,
+                    VelZ = velocity.z,
+                    Timestamp = Time.time
+                };
+
+                byte[] data2 = PacketSerializer.SerializeBombDrop(packet);
+                Plugin.Instance.Network.SendPacket(PacketType.BombDrop, data2, reliable: true);
+
+                Plugin.Log?.LogInfo($"[WeaponPatches] BOMB POLL: Sent bomb drop: {bombName} pos=({absoluteLaunchPos.x:F1},{absoluteLaunchPos.y:F1},{absoluteLaunchPos.z:F1}) vel=({velocity.x:F1},{velocity.y:F1},{velocity.z:F1})");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[WeaponPatches] BOMB POLL SendBombDrop error: {ex.Message}");
             }
         }
 
@@ -522,10 +770,18 @@ namespace TCAMultiplayer.Patches
             {
                 ulong localPlayerId = GetLocalPlayerId();
 
-                // Only process if we're the target
-                if (packet.TargetId != localPlayerId) return;
+                // Process missile if:
+                // 1. We're the target (TargetId == localPlayerId) - missile is tracking us
+                // 2. TargetId == 0 - missile has no lock, fly unguided (still spawn for visibility)
+                // Skip if missile is tracking someone else
+                if (packet.TargetId != 0 && packet.TargetId != localPlayerId)
+                {
+                    Plugin.Log?.LogInfo($"[WeaponPatches] Missile {packet.MissileType} tracking player {packet.TargetId}, not us ({localPlayerId}) - skipping");
+                    return;
+                }
 
-                Plugin.Log?.LogInfo($"[WeaponPatches] INCOMING MISSILE! {packet.MissileType} (seeker: {packet.SeekerType})");
+                bool isTrackingUs = (packet.TargetId == localPlayerId);
+                Plugin.Log?.LogInfo($"[WeaponPatches] INCOMING MISSILE! {packet.MissileType} (seeker: {packet.SeekerType}, tracking: {isTrackingUs})");
                 if (LogHelper.IsEnabled(LogCategory.Weapon))
                 {
                     LogHelper.Info(LogCategory.Weapon,
@@ -545,6 +801,29 @@ namespace TCAMultiplayer.Patches
             catch (Exception ex)
             {
                 Plugin.Log?.LogError($"[WeaponPatches] HandleMissileLaunch error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Handle received bomb drop - spawn network bomb for visual/damage sync
+        /// </summary>
+        public static void HandleBombDrop(BombDropPacket packet)
+        {
+            try
+            {
+                Plugin.Log?.LogInfo($"[WeaponPatches] INCOMING BOMB! {packet.BombType}");
+
+                // Convert position to local coordinates
+                var absoluteLaunchPos = new Vector3d(packet.LaunchPosX, packet.LaunchPosY, packet.LaunchPosZ);
+                Vector3 localLaunchPos = FloatingOriginHelper.AbsoluteToLocal(absoluteLaunchPos);
+                Vector3 velocity = new Vector3(packet.VelX, packet.VelY, packet.VelZ);
+
+                // Spawn the network bomb
+                Player.RealCombatSync.SpawnNetworkBomb(packet, localLaunchPos, velocity);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[WeaponPatches] HandleBombDrop error: {ex.Message}");
             }
         }
 

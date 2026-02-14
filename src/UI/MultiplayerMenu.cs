@@ -278,26 +278,81 @@ namespace TCAMultiplayer.UI
                 }
             }
 
-            UIFactory.CreateNativeText("Select Airfield:", _contentRoot.transform, 18, TextAlignmentOptions.Left);
-            var afGroup = new GameObject("AFGrid", typeof(RectTransform));
-            afGroup.transform.SetParent(_contentRoot.transform, false);
+            // Aircraft Selection (Lobby only - not available mid-match)
+            var aircraftNames = LoadoutHelper.GetAircraftNames();
+            string selectedAircraft = lobby?.LocalSelectedAircraft;
             
-            var grid = afGroup.AddComponent<GridLayoutGroup>();
-            grid.cellSize = new Vector2(340, 45);
-            grid.spacing = new Vector2(10, 10);
-            grid.constraint = GridLayoutGroup.Constraint.FixedColumnCount;
-            grid.constraintCount = 2;
+            if (aircraftNames == null || aircraftNames.Count == 0)
+            {
+                UIFactory.CreateNativeText("<color=red>No aircraft found! (Enter Arena Map first)</color>", _contentRoot.transform, 16);
+            }
+            else
+            {
+                // Build display names list
+                var aircraftDisplayNames = new List<string>();
+                int selectedAircraftIndex = 0;
+                for (int i = 0; i < aircraftNames.Count; i++)
+                {
+                    string displayName = LoadoutHelper.GetAircraftDisplayName(aircraftNames[i]);
+                    aircraftDisplayNames.Add(displayName);
+                    if (aircraftNames[i] == selectedAircraft)
+                    {
+                        selectedAircraftIndex = i;
+                    }
+                }
+                
+                var aircraftDropdown = UIFactory.CreateLabeledDropdown("Aircraft:", aircraftDisplayNames, selectedAircraftIndex, _contentRoot.transform);
+                if (aircraftDropdown != null)
+                {
+                    aircraftDropdown.onValueChanged.AddListener((index) => {
+                        lobby?.SetLocalAircraft(aircraftNames[index]);
+                        // Send aircraft selection to other players
+                        Plugin.Instance.Lobby?.SendAircraftSelect(aircraftNames[index]);
+                        // Also update loadout to default for new aircraft
+                        var defaultLoadout = LoadoutHelper.GetDefaultLoadoutForAircraft(aircraftNames[index]);
+                        lobby?.SetLocalLoadout(defaultLoadout);
+                        // Send loadout selection to other players
+                        Plugin.Instance.Lobby?.SendLoadoutSelect(defaultLoadout);
+                        RefreshUI();
+                    });
+                }
+            }
 
-            // Add LayoutElement to ensure the VerticalLayoutGroup sees the height
-            var le = afGroup.AddComponent<LayoutElement>();
+            // Loadout Selection
+            var loadoutNames = LoadoutHelper.GetLoadoutNamesForAircraft(selectedAircraft);
+            string selectedLoadout = lobby?.LocalSelectedLoadout;
             
-            // Add ContentSizeFitter to calculate the size
-            var fitter = afGroup.AddComponent<ContentSizeFitter>();
-            fitter.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-            fitter.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
+            if (loadoutNames == null || loadoutNames.Count == 0)
+            {
+                UIFactory.CreateNativeText("<color=yellow>No loadouts found for " + selectedAircraft + "</color>", _contentRoot.transform, 16);
+            }
+            else
+            {
+                int selectedLoadoutIndex = 0;
+                for (int i = 0; i < loadoutNames.Count; i++)
+                {
+                    if (loadoutNames[i] == selectedLoadout)
+                    {
+                        selectedLoadoutIndex = i;
+                        break;
+                    }
+                }
+                
+                var loadoutDropdown = UIFactory.CreateLabeledDropdown("Loadout:", loadoutNames, selectedLoadoutIndex, _contentRoot.transform);
+                if (loadoutDropdown != null)
+                {
+                    loadoutDropdown.onValueChanged.AddListener((index) => {
+                        lobby?.SetLocalLoadout(loadoutNames[index]);
+                        // Send loadout selection to other players
+                        Plugin.Instance.Lobby?.SendLoadoutSelect(loadoutNames[index]);
+                        RefreshUI();
+                    });
+                }
+            }
 
+            // Airfield Selection
             var names = AirfieldHelper.GetAirfieldNames();
-            Plugin.Log?.LogInfo($"[MultiplayerMenu] Drawing lobby airfield grid. Name count: {names?.Length ?? 0}");
+            Plugin.Log?.LogInfo($"[MultiplayerMenu] Drawing lobby airfield dropdown. Name count: {names?.Length ?? 0}");
 
             if (names == null || names.Length == 0)
             {
@@ -305,100 +360,48 @@ namespace TCAMultiplayer.UI
             }
             else
             {
-                int buttonsCreated = 0;
                 string selectedAirfield = lobby?.LocalSelectedAirfield;
-                
-                foreach (var name in names)
+                int selectedAirfieldIndex = 0;
+                var airfieldList = new List<string>(names);
+                for (int i = 0; i < airfieldList.Count; i++)
                 {
-                    var btn = UIFactory.CreateNativeButton(name, afGroup.transform, 40);
-                    if (btn != null)
+                    if (airfieldList[i] == selectedAirfield)
                     {
-                        buttonsCreated++;
-                        
-                        // Highlight the selected airfield
-                        bool isSelected = (name == selectedAirfield);
-                        var img = btn.GetComponent<Image>();
-                        if (img != null)
-                        {
-                            if (isSelected)
-                            {
-                                img.color = Color.cyan; // Bright cyan for selected
-                            }
-                            else
-                            {
-                                img.color = new Color(0.2f, 0.2f, 0.2f, 1f); // Dark gray for unselected
-                            }
-                        }
-                        
-                        btn.onClick.AddListener(() => {
-                            lobby?.SetLocalAirfield(name);
-                            Plugin.Instance.Lobby?.SendAirfieldSelect(name);
-                            RefreshUI();
-                        });
-                    }
-                    else
-                    {
-                        Plugin.Log?.LogWarning($"[MultiplayerMenu] Failed to create button for airfield: {name} (UIFactory returned null)");
+                        selectedAirfieldIndex = i;
+                        break;
                     }
                 }
-                Plugin.Log?.LogInfo($"[MultiplayerMenu] Created {buttonsCreated} airfield buttons.");
+                
+                var airfieldDropdown = UIFactory.CreateLabeledDropdown("Airfield:", airfieldList, selectedAirfieldIndex, _contentRoot.transform);
+                if (airfieldDropdown != null)
+                {
+                    airfieldDropdown.onValueChanged.AddListener((index) => {
+                        lobby?.SetLocalAirfield(airfieldList[index]);
+                        Plugin.Instance.Lobby?.SendAirfieldSelect(airfieldList[index]);
+                        RefreshUI();
+                    });
+                }
             }
 
             // Spawn Type Selection
-            UIFactory.CreateNativeText("Spawn Type:", _contentRoot.transform, 18, TextAlignmentOptions.Left);
-            
-            var stRow = new GameObject("SpawnTypeRow", typeof(RectTransform));
-            stRow.transform.SetParent(_contentRoot.transform, false);
-            var stLayout = stRow.AddComponent<HorizontalLayoutGroup>();
-            stLayout.childControlHeight = true;
-            stLayout.childControlWidth = true;
-            stLayout.childForceExpandHeight = true;
-            stLayout.childForceExpandWidth = true;
-            stLayout.spacing = 8;
-            var stLE = stRow.AddComponent<LayoutElement>();
-            stLE.preferredHeight = 45;
-
-            var spawnTypeNames = new[] { "Air (300m)", "Runway", "Ramp" };
+            var spawnTypeNames = new List<string> { "Air (300m)", "Runway", "Ramp" };
             var currentSpawnType = lobby?.SpawnType ?? LobbySpawnType.Runway;
+            int spawnTypeIndex = (int)currentSpawnType;
             
-            for (int i = 0; i < spawnTypeNames.Length; i++)
+            var spawnTypeDropdown = UIFactory.CreateLabeledDropdown("Spawn Type:", spawnTypeNames, spawnTypeIndex, _contentRoot.transform);
+            if (spawnTypeDropdown != null)
             {
-                var spawnType = (LobbySpawnType)i;
-                var btn = UIFactory.CreateNativeButton(spawnTypeNames[i], stRow.transform, 42);
-                if (btn != null)
+                if (isHost)
                 {
-                    // Highlight the currently selected spawn type
-                    if (spawnType == currentSpawnType)
-                    {
-                        var img = btn.GetComponent<Image>();
-                        if (img != null) img.color = Color.cyan;
-                    }
-                    
-                    if (isHost)
-                    {
-                        // Only host can change spawn type
-                        int idx = i; // Capture for closure
-                        btn.onClick.AddListener(() => {
-                            lobby?.SetSpawnSettings((LobbySpawnType)idx);
-                            RefreshUI();
-                        });
-                    }
-                    else
-                    {
-                        // Client sees read-only buttons (no interaction)
-                        btn.interactable = false;
-                        // Keep the highlight color for the selected one
-                        if (spawnType == currentSpawnType)
-                        {
-                            var img = btn.GetComponent<Image>();
-                            if (img != null) img.color = new Color(0.0f, 0.7f, 0.8f, 1f); // Slightly different cyan for read-only
-                        }
-                        else
-                        {
-                            var img = btn.GetComponent<Image>();
-                            if (img != null) img.color = new Color(0.3f, 0.3f, 0.3f, 1f); // Darker gray for unselected read-only
-                        }
-                    }
+                    spawnTypeDropdown.onValueChanged.AddListener((index) => {
+                        lobby?.SetSpawnSettings((LobbySpawnType)index);
+                        RefreshUI();
+                    });
+                }
+                else
+                {
+                    // Client sees read-only dropdown
+                    spawnTypeDropdown.interactable = false;
                 }
             }
 

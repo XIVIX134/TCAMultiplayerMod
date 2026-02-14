@@ -275,22 +275,10 @@ namespace TCAMultiplayer.Patches
             {
                 Plugin.Log?.LogInfo($"[DamagePatches] Received damage: {packet.Damage} type={packet.DamageType} from player {packet.AttackerId}, weapon: {packet.WeaponName}");
 
-                // === MISSILE DOUBLE-DAMAGE PREVENTION (Fix #7) ===
-                // When a missile is synced via RealCombatSync, it becomes a REAL missile on the victim's machine.
-                // The game's own Explosion.Trigger() already applies damage locally when it hits.
-                // If we also apply the damage packet from the shooter, damage is doubled.
-                // Solution: Skip explosive/missile damage packets — the local missile handles it.
-                if (packet.DamageType == DAMAGE_TYPE_EXPLOSIVE)
-                {
-                    Plugin.Log?.LogInfo($"[DamagePatches] Skipping explosive damage packet (missile damage handled locally by game engine). " +
-                        $"Attacker={packet.AttackerId}, weapon={packet.WeaponName}, damage={packet.Damage}");
-                    
-                    // Still track the attacker for kill credit
-                    LastAttackerId = packet.AttackerId;
-                    LastAttackerWeapon = packet.WeaponName;
-                    LastDamageTime = Time.time;
-                    return;
-                }
+                // === MISSILE DAMAGE HANDLING ===
+                // Network missiles use damage packets because Munition.Explode() may not apply damage correctly
+                // (the Munition component was disabled for network control, which can break its internal state)
+                // We apply explosive damage directly from the packet instead of relying on the game engine.
 
                 // === HIT VALIDATION ===
                 // Validate the damage packet to prevent cheating

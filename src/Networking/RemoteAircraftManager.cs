@@ -905,7 +905,9 @@ namespace TCAMultiplayer.Networking
                 var go = component.gameObject;
                 go.name = $"MP_Remote_{peerId}";
 
-                ConfigureSpawnedAircraft(component, "Clean", "Mixed");
+                // Get the remote player's selected loadout
+                string loadoutName = GetRemoteSelectedLoadout(peerId) ?? "Clean";
+                ConfigureSpawnedAircraft(component, loadoutName, "Mixed");
                 ConfigureRemoteAircraft(go);
 
                 LogHelper.Info(LogCategory.Reflection,
@@ -1223,6 +1225,19 @@ namespace TCAMultiplayer.Networking
             if (lobby.Players != null && lobby.Players.TryGetValue(peerId, out var info))
             {
                 if (!string.IsNullOrEmpty(info?.SelectedAircraft)) return info.SelectedAircraft;
+            }
+
+            return null;
+        }
+
+        private static string GetRemoteSelectedLoadout(ulong peerId)
+        {
+            var lobby = Plugin.Instance?.Lobby;
+            if (lobby == null) return null;
+
+            if (lobby.Players != null && lobby.Players.TryGetValue(peerId, out var info))
+            {
+                if (!string.IsNullOrEmpty(info?.SelectedLoadout)) return info.SelectedLoadout;
             }
 
             return null;

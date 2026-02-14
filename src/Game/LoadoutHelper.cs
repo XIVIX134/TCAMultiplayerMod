@@ -24,9 +24,9 @@ namespace TCAMultiplayer.Game
         private static MethodInfo _getAircraftNamesMethod;
         private static MethodInfo _getAircraftDataMethod;
         
-        // Aircraft data fields
-        private static PropertyInfo _aircraftDisplayNameProp;
-        private PropertyInfo _aircraftNameProp;
+        // Aircraft data fields (DisplayName and Name are public fields, not properties)
+        private static FieldInfo _aircraftDisplayNameField;
+        private static FieldInfo _aircraftNameField;
         
         public static bool IsInitialized => _initialized;
         
@@ -67,18 +67,20 @@ namespace TCAMultiplayer.Game
                     BindingFlags.Public | BindingFlags.Static);
                 
                 // Cache GameDataAircraft methods
-                _getAircraftNamesMethod = _gameDataAircraftType.GetMethod("GetAircraftNames", 
+                // NOTE: The method is "GetListOfAllAircraft", not "GetAircraftNames"
+                _getAircraftNamesMethod = _gameDataAircraftType.GetMethod("GetListOfAllAircraft", 
                     BindingFlags.Public | BindingFlags.Static);
                 _getAircraftDataMethod = _gameDataAircraftType.GetMethod("GetByName", 
                     BindingFlags.Public | BindingFlags.Static);
                 
                 if (_getAircraftDataMethod != null)
                 {
-                    // Get the return type (UniAircraftData) and cache its DisplayName property
+                    // Get the return type (UniAircraftData) and cache its DisplayName and Name fields
+                    // NOTE: DisplayName and Name are public FIELDS, not properties
                     var returnType = _getAircraftDataMethod.ReturnType;
-                    _aircraftDisplayNameProp = returnType.GetProperty("DisplayName", 
+                    _aircraftDisplayNameField = returnType.GetField("DisplayName", 
                         BindingFlags.Public | BindingFlags.Instance);
-                    _aircraftNameProp = returnType.GetProperty("Name", 
+                    _aircraftNameField = returnType.GetField("Name", 
                         BindingFlags.Public | BindingFlags.Instance);
                 }
                 
@@ -117,7 +119,7 @@ namespace TCAMultiplayer.Game
         public static string GetAircraftDisplayName(string aircraftName)
         {
             if (!_initialized) Initialize();
-            if (_getAircraftDataMethod == null || _aircraftDisplayNameProp == null) 
+            if (_getAircraftDataMethod == null || _aircraftDisplayNameField == null) 
                 return aircraftName;
             
             try
@@ -125,7 +127,8 @@ namespace TCAMultiplayer.Game
                 var aircraftData = _getAircraftDataMethod.Invoke(null, new object[] { aircraftName });
                 if (aircraftData != null)
                 {
-                    var displayName = _aircraftDisplayNameProp.GetValue(aircraftData);
+                    // DisplayName is a field, not a property
+                    var displayName = _aircraftDisplayNameField.GetValue(aircraftData);
                     return displayName as string ?? aircraftName;
                 }
             }

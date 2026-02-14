@@ -52,6 +52,10 @@ namespace TCAMultiplayer
         {
             Instance = this;
             Log = Logger;
+            
+            // Initialize instance logger FIRST before any other logging
+            InstanceLogger.Initialize();
+            
             BindLoggingConfig();
 
             Log.LogInfo("===========================================");
@@ -84,6 +88,9 @@ namespace TCAMultiplayer
                 {
                     _harmony.PatchAll();
                     Log.LogInfo("Harmony patches applied successfully");
+                    
+                    // Apply manual patches for WorldDestruction (needs type resolution from Assembly-CSharp)
+                    Patches.WorldDestructionPatches.ApplyPatches(_harmony);
                 }
                 catch (Exception ex)
                 {
@@ -98,6 +105,11 @@ namespace TCAMultiplayer
 
                 // Initialize combat sync
                 Player.RealCombatSync.Initialize();
+
+                // Initialize aircraft collision manager
+                var collisionManager = _runnerObject.AddComponent<Player.AircraftCollisionManager>();
+                collisionManager.SetRemoteAircraftManager(Network.RemoteAircraftManager);
+                Log.LogInfo("Aircraft collision manager initialized");
 
                 // Create native respawn screen (attached to persistent runner)
                 RespawnUI = _runnerObject.AddComponent<RespawnScreen>();
@@ -145,6 +157,7 @@ namespace TCAMultiplayer
         {
             try
             {
+                InstanceLogger.Shutdown();
                 _harmony?.UnpatchSelf();
                 Network?.Shutdown();
                 Discovery?.Dispose();

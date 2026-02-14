@@ -32,6 +32,7 @@ namespace TCAMultiplayer.Networking
         public string LocalPlayerName { get; private set; } = "Player";
         public string LocalSelectedAirfield { get; private set; } = "";
         public string LocalSelectedAircraft { get; private set; } = "AV8B";
+        public string LocalSelectedLoadout { get; private set; } = "Clean";
         public bool LocalIsReady { get; private set; }
         public bool LocalIsLoaded { get; private set; }
 
@@ -346,6 +347,48 @@ namespace TCAMultiplayer.Networking
         }
 
         /// <summary>
+        /// Set local loadout selection
+        /// </summary>
+        public void SetLocalLoadout(string loadoutName)
+        {
+            LocalSelectedLoadout = loadoutName;
+
+            if (_players.ContainsKey(LocalPeerId))
+            {
+                _players[LocalPeerId].SelectedLoadout = loadoutName;
+            }
+
+            Plugin.Log?.LogInfo($"[LobbyManager] Local loadout: {loadoutName}");
+            OnLobbyStateChanged?.Invoke();
+        }
+
+        /// <summary>
+        /// Handle remote player loadout selection
+        /// </summary>
+        public void HandlePlayerLoadoutSelect(ulong peerId, string loadoutName)
+        {
+            if (_players.ContainsKey(peerId))
+            {
+                _players[peerId].SelectedLoadout = loadoutName;
+                Plugin.Log?.LogInfo($"[LobbyManager] Player {_players[peerId].PlayerName} selected loadout: {loadoutName}");
+                OnLobbyStateChanged?.Invoke();
+            }
+        }
+
+        /// <summary>
+        /// Handle remote player aircraft selection
+        /// </summary>
+        public void HandlePlayerAircraftSelect(ulong peerId, string aircraftName)
+        {
+            if (_players.ContainsKey(peerId))
+            {
+                _players[peerId].SelectedAircraft = aircraftName;
+                Plugin.Log?.LogInfo($"[LobbyManager] Player {_players[peerId].PlayerName} selected aircraft: {aircraftName}");
+                OnLobbyStateChanged?.Invoke();
+            }
+        }
+
+        /// <summary>
         /// Set spawn settings (host only)
         /// </summary>
         public void SetSpawnSettings(LobbySpawnType spawnType, string mapName = null)
@@ -589,6 +632,42 @@ namespace TCAMultiplayer.Networking
             catch (Exception ex)
             {
                 Plugin.Log?.LogError($"[LobbyManager] SendAirfieldSelect error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Send aircraft selection
+        /// </summary>
+        public void SendAircraftSelect(string aircraftName)
+        {
+            try
+            {
+                var packet = new LobbyAircraftSelectPacket { PeerId = LocalPeerId, AircraftName = aircraftName };
+                var data = PacketSerializer.SerializeLobbyAircraftSelect(packet);
+                Network?.SendPacket(PacketType.AircraftSelect, data, reliable: true);
+                Plugin.Log?.LogInfo($"[LobbyManager] Sent aircraft select: {aircraftName}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[LobbyManager] SendAircraftSelect error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Send loadout selection
+        /// </summary>
+        public void SendLoadoutSelect(string loadoutName)
+        {
+            try
+            {
+                var packet = new LobbyLoadoutSelectPacket { PeerId = LocalPeerId, LoadoutName = loadoutName };
+                var data = PacketSerializer.SerializeLobbyLoadoutSelect(packet);
+                Network?.SendPacket(PacketType.LoadoutSelect, data, reliable: true);
+                Plugin.Log?.LogInfo($"[LobbyManager] Sent loadout select: {loadoutName}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[LobbyManager] SendLoadoutSelect error: {ex.Message}");
             }
         }
 

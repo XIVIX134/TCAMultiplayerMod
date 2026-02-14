@@ -191,6 +191,9 @@ namespace TCAMultiplayer.Networking
             if (!string.IsNullOrEmpty(playerName))
                 LocalPlayerName = playerName;
 
+            // Set instance type for logging
+            InstanceLogger.SetInstanceType(true);
+
             Plugin.Log?.LogInfo($"[GameStateMachine] Started hosting on port {port} as {LocalPlayerName}");
             return true;
         }
@@ -214,6 +217,9 @@ namespace TCAMultiplayer.Networking
             HostPort = port;
             if (!string.IsNullOrEmpty(playerName))
                 LocalPlayerName = playerName;
+
+            // Set instance type for logging (client)
+            InstanceLogger.SetInstanceType(false);
 
             Plugin.Log?.LogInfo($"[GameStateMachine] Connecting to {address}:{port} as {LocalPlayerName}");
             return true;

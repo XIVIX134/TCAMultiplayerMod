@@ -53,6 +53,10 @@ namespace TCAMultiplayer.Player
         // Tracked network missiles (for cleanup)
         private static List<object> _networkMissiles = new List<object>();
 
+        // Tracked network bombs (for cleanup)
+        private static List<object> _networkBombs = new List<object>();
+        private static FieldInfo _launchedMunitionsField;
+
         // Remote aircraft radar (for lock sync)
         private static Dictionary<ulong, object> _remoteRadars = new Dictionary<ulong, object>();
 
@@ -424,11 +428,24 @@ namespace TCAMultiplayer.Player
 
             try
             {
-                // Find local target (may be null if player died - that's OK, we still show the missile)
-                var localTarget = FindLocalPlayerTarget();
-                if (localTarget == null)
+                // Check if missile has a lock (TargetId != 0)
+                // If TargetId == 0, missile flies unguided (no lock)
+                // If TargetId == local player ID, missile is tracking us
+                bool hasLock = (packet.TargetId != 0);
+                
+                // Find local target only if missile has a lock
+                object localTarget = null;
+                if (hasLock)
                 {
-                    Plugin.Log?.LogInfo("[RealCombatSync] No local target - missile will fly straight (unguided)");
+                    localTarget = FindLocalPlayerTarget();
+                    if (localTarget == null)
+                    {
+                        Plugin.Log?.LogInfo("[RealCombatSync] No local target - missile will fly straight (unguided)");
+                    }
+                }
+                else
+                {
+                    Plugin.Log?.LogInfo("[RealCombatSync] Missile has no lock (TargetId=0) - flying unguided");
                 }
 
                 // Get the LaunchedMissiles list
@@ -476,6 +493,17 @@ namespace TCAMultiplayer.Player
                     rendererCount++;
                 }
 
+                // CRITICAL: Enable all colliders for native collision detection!
+                // The missile needs to detect collisions with the local player's aircraft
+                int colliderCount = 0;
+                foreach (var col in missileObj.GetComponentsInChildren<Collider>(true))
+                {
+                    // Just enable - don't change trigger state, let the game handle that
+                    col.enabled = true;
+                    colliderCount++;
+                }
+                Plugin.Log?.LogInfo($"[RealCombatSync] Enabled {colliderCount} colliders on missile");
+
                 // Enable all particle systems (smoke trails, flames)
                 int particleCount = 0;
                 foreach (var ps in missileObj.GetComponentsInChildren<ParticleSystem>(true))
@@ -515,9 +543,13 @@ namespace TCAMultiplayer.Player
 
                 // Create and configure seeker ONLY for guided missiles AND if we have a target
                 // SeekerType: 0 = IR, 1 = Radar, 2 = Unguided
+                // IMPORTANT: Always set IsTracking=true if we have a target - the game's ThreatWarning
+                // needs this to show the missile on RWR. The packet.IsTracking from sender should now
+                // always be true when there's a target, but we enforce it here as a safety measure.
+                bool shouldTrack = (packet.TargetId != 0 && localTarget != null);
                 if ((packet.SeekerType == 0 || packet.SeekerType == 1) && localTarget != null)
                 {
-                    ConfigureOrCreateMissileSeeker(munition, localTarget, packet.SeekerType);
+                    ConfigureOrCreateMissileSeeker(munition, localTarget, packet.SeekerType, shouldTrack);
                 }
                 else
                 {
@@ -554,18 +586,17 @@ namespace TCAMultiplayer.Player
 
                 _networkMissiles.Add(munition);
 
-                // Disable the Munition component so it doesn't move on its own
-                // We'll control movement via NetworkMissileController instead
-                var munitionBehaviour = munition as Behaviour;
-                if (munitionBehaviour != null)
-                {
-                    munitionBehaviour.enabled = false;
-                    Plugin.Log?.LogInfo("[RealCombatSync] Disabled Munition component - NetworkMissileController will handle movement");
-                }
+                // CRITICAL: DO NOT DISABLE THE MUNITION COMPONENT!
+                // We keep it ENABLED so native physics, tracking, and collision work.
+                // This is the key difference from the old approach - we trust the game's
+                // native systems to handle movement, not a custom NetworkMissileController.
+                // The missile will:
+                // 1. Fly using native Munition physics
+                // 2. Track the target using native Seeker
+                // 3. Detect collision using native Unity physics
+                // 4. Apply damage using native Damageable system
 
-                // Add a controller to handle movement and cleanup
-                var controller = missileObj.AddComponent<NetworkMissileController>();
-                controller.Initialize(localTarget as Component, packet);
+                // NO NetworkMissileController - let native systems handle everything!
 
                 Plugin.Log?.LogInfo($"[RealCombatSync] Created missile at {localLaunchPos}, heading {launchDir}, renderers={rendererCount}");
                 Plugin.Log?.LogInfo($"[RealCombatSync] Missile launched with motor effects - ThreatWarning should detect!");
@@ -819,7 +850,7 @@ namespace TCAMultiplayer.Player
         /// <summary>
         /// Configure existing seeker or create a new one if needed
         /// </summary>
-        private static void ConfigureOrCreateMissileSeeker(object munition, object target, byte seekerType)
+        private static void ConfigureOrCreateMissileSeeker(object munition, object target, byte seekerType, bool isTracking)
         {
             try
             {
@@ -855,7 +886,7 @@ namespace TCAMultiplayer.Player
 
                 if (_seekerIsTrackingField != null)
                 {
-                    _seekerIsTrackingField.SetValue(seeker, true);
+                    _seekerIsTrackingField.SetValue(seeker, isTracking);
                 }
 
                 if (_seekerIsSpoofedField != null)
@@ -863,7 +894,7 @@ namespace TCAMultiplayer.Player
                     _seekerIsSpoofedField.SetValue(seeker, false);
                 }
 
-                Plugin.Log?.LogInfo("[RealCombatSync] Configured missile seeker: IsTracking=true, IsSpoofed=false");
+                Plugin.Log?.LogInfo($"[RealCombatSync] Configured missile seeker: IsTracking={isTracking}, IsSpoofed=false");
             }
             catch (Exception ex)
             {
@@ -962,6 +993,36 @@ namespace TCAMultiplayer.Player
             catch (Exception ex)
             {
                 Plugin.Log?.LogWarning($"[RealCombatSync] RemoveNetworkMissile error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Remove a network bomb (when it explodes or times out)
+        /// </summary>
+        public static void RemoveNetworkBomb(object munition)
+        {
+            try
+            {
+                // Initialize LaunchedMunitions field if needed
+                if (_launchedMunitionsField == null && _munitionType != null)
+                {
+                    _launchedMunitionsField = _munitionType.GetField("LaunchedMunitions",
+                        BindingFlags.Public | BindingFlags.Static);
+                }
+
+                if (_launchedMunitionsField == null) return;
+
+                var launchedMunitions = _launchedMunitionsField.GetValue(null) as System.Collections.IList;
+                if (launchedMunitions != null && launchedMunitions.Contains(munition))
+                {
+                    launchedMunitions.Remove(munition);
+                    _networkBombs.Remove(munition);
+                    Plugin.Log?.LogInfo("[RealCombatSync] Removed network bomb from LaunchedMunitions");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[RealCombatSync] RemoveNetworkBomb error: {ex.Message}");
             }
         }
 
@@ -1846,6 +1907,237 @@ namespace TCAMultiplayer.Player
             return null;
         }
 
+        #endregion
+
+        #region Bomb Sync
+
+        /// <summary>
+        /// Spawn a network bomb from a BombDropPacket.
+        /// Creates a visual bomb that follows ballistic physics.
+        /// </summary>
+        public static void SpawnNetworkBomb(BombDropPacket packet, Vector3 localLaunchPos, Vector3 velocity)
+        {
+            Initialize();
+
+            try
+            {
+                Plugin.Log?.LogInfo($"[RealCombatSync] Spawning network bomb: {packet.BombType}");
+                Plugin.Log?.LogInfo($"[RealCombatSync] DIAGNOSTIC: Spawn params - localLaunchPos={localLaunchPos}, velocity={velocity}");
+
+                // Try to spawn from GameDataStores first
+                GameObject bombObj = SpawnBombFromGameData(packet.BombType);
+
+                if (bombObj == null)
+                {
+                    // Fallback: clone from scene
+                    bombObj = CloneBombFromScene(packet.BombType);
+                }
+
+                if (bombObj == null)
+                {
+                    // Last resort: create a simple visual
+                    bombObj = CreateSimpleBombVisual(packet.BombType);
+                }
+
+                if (bombObj != null)
+                {
+                    // DIAGNOSTIC: Check what components the bomb has
+                    var components = bombObj.GetComponents<Component>();
+                    Plugin.Log?.LogInfo($"[RealCombatSync] DIAGNOSTIC: Bomb has {components.Length} components:");
+                    foreach (var comp in components)
+                    {
+                        Plugin.Log?.LogInfo($"[RealCombatSync] DIAGNOSTIC:   - {comp.GetType().FullName}");
+                    }
+
+                    // Check for Munition component specifically
+                    var existingMunition = bombObj.GetComponent("Munition");
+                    if (existingMunition != null)
+                    {
+                        Plugin.Log?.LogWarning($"[RealCombatSync] DIAGNOSTIC: Bomb already has Munition component - may cause physics conflicts!");
+                        
+                        // Disable the Munition's own physics to prevent double-processing
+                        var isLaunchedProp = existingMunition.GetType().GetProperty("IsLaunched",
+                            BindingFlags.Public | BindingFlags.Instance);
+                        if (isLaunchedProp != null)
+                        {
+                            bool isLaunched = (bool)isLaunchedProp.GetValue(existingMunition);
+                            Plugin.Log?.LogWarning($"[RealCombatSync] DIAGNOSTIC: Existing Munition.IsLaunched = {isLaunched}");
+                        }
+                    }
+
+                    // Position and configure the bomb
+                    bombObj.name = $"MP_Bomb_{packet.ShooterId}";
+                    bombObj.transform.position = localLaunchPos;
+                    bombObj.transform.SetParent(null);
+
+                    // Add to LaunchedMunitions for game tracking
+                    AddToLaunchedMunitions(bombObj);
+
+                    // CRITICAL: DO NOT ADD NetworkBombController!
+                    // We keep the Munition component ENABLED so native physics works.
+                    // The bomb will:
+                    // 1. Fall using native Munition ballistic physics
+                    // 2. Detect collision using native Unity physics
+                    // 3. Apply damage using native Damageable system
+
+                    Plugin.Log?.LogInfo($"[RealCombatSync] Native bomb spawned at {localLaunchPos}");
+                }
+                else
+                {
+                    Plugin.Log?.LogWarning($"[RealCombatSync] Failed to spawn bomb: {packet.BombType}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[RealCombatSync] SpawnNetworkBomb error: {ex.Message}");
+            }
+        }
+
+        private static GameObject SpawnBombFromGameData(string bombType)
+        {
+            try
+            {
+                if (_gameDataStoresType == null)
+                {
+                    _gameDataStoresType = Type.GetType("Falcon.GameDataStores, Assembly-CSharp");
+                }
+                if (_spawnStoreMethod == null && _gameDataStoresType != null)
+                {
+                    _spawnStoreMethod = _gameDataStoresType.GetMethod("SpawnStore",
+                        BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null);
+                }
+                if (_hasStoreMethod == null && _gameDataStoresType != null)
+                {
+                    _hasStoreMethod = _gameDataStoresType.GetMethod("HasStore",
+                        BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null);
+                }
+
+                if (_hasStoreMethod == null || _spawnStoreMethod == null) return null;
+
+                // Common bomb names in game
+                var namesToTry = new List<string>
+                {
+                    bombType,
+                    "Mk82", "Mk82SnakeEye", "Mk84",  // US dumb bombs
+                    "GBU10", "GBU12", "GBU16",       // Paveway LGBs
+                    "M117", "M118",                   // US older bombs
+                    "BDU33",                          // Practice bomb
+                    "MK20", "Rockeye",                // Cluster bombs
+                    "BU50",                           // Large bomb
+                };
+
+                foreach (var name in namesToTry)
+                {
+                    try
+                    {
+                        bool hasStore = (bool)_hasStoreMethod.Invoke(null, new object[] { name });
+                        if (hasStore)
+                        {
+                            var store = _spawnStoreMethod.Invoke(null, new object[] { name });
+                            if (store is Component comp)
+                            {
+                                Plugin.Log?.LogInfo($"[RealCombatSync] Spawned bomb from GameDataStores: {name}");
+                                return comp.gameObject;
+                            }
+                        }
+                    }
+                    catch { /* Continue trying */ }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[RealCombatSync] SpawnBombFromGameData error: {ex.Message}");
+            }
+
+            return null;
+        }
+
+        private static GameObject CloneBombFromScene(string bombType)
+        {
+            if (_munitionType == null) return null;
+
+            try
+            {
+                // Look for existing bombs in scene
+                var munitions = Resources.FindObjectsOfTypeAll(_munitionType);
+                foreach (var obj in munitions)
+                {
+                    var comp = obj as Component;
+                    if (comp == null) continue;
+                    if (comp.gameObject.name.StartsWith("MP_")) continue;
+
+                    string name = comp.gameObject.name.ToLowerInvariant();
+                    if (name.Contains("mk82") || name.Contains("mk84") || name.Contains("gbu") ||
+                        name.Contains("bomb") || name.Contains("mk20") || name.Contains("rockeye"))
+                    {
+                        var instance = UnityEngine.Object.Instantiate(comp.gameObject);
+                        Plugin.Log?.LogInfo($"[RealCombatSync] Cloned bomb from scene: {comp.gameObject.name}");
+                        return instance;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[RealCombatSync] CloneBombFromScene error: {ex.Message}");
+            }
+
+            return null;
+        }
+
+        private static GameObject CreateSimpleBombVisual(string bombType)
+        {
+            try
+            {
+                // Create a simple sphere as bomb visual
+                var bombObj = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                bombObj.transform.localScale = new Vector3(0.3f, 0.3f, 0.8f); // Bomb-like shape
+                bombObj.name = $"MP_Bomb_{bombType}";
+
+                // Set dark color
+                var renderer = bombObj.GetComponent<Renderer>();
+                if (renderer != null)
+                {
+                    renderer.material.color = new Color(0.2f, 0.2f, 0.2f, 1f);
+                }
+
+                Plugin.Log?.LogInfo($"[RealCombatSync] Created simple bomb visual for: {bombType}");
+                return bombObj;
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[RealCombatSync] CreateSimpleBombVisual error: {ex.Message}");
+                return null;
+            }
+        }
+
+        private static void AddToLaunchedMunitions(GameObject bombObj)
+        {
+            try
+            {
+                if (_launchedMunitionsField == null && _munitionType != null)
+                {
+                    _launchedMunitionsField = _munitionType.GetField("LaunchedMunitions",
+                        BindingFlags.Public | BindingFlags.Static);
+                }
+
+                if (_launchedMunitionsField != null)
+                {
+                    var list = _launchedMunitionsField.GetValue(null) as System.Collections.IList;
+                    var munition = bombObj.GetComponent(_munitionType);
+                    if (munition != null && list != null)
+                    {
+                        list.Add(munition);
+                        _networkBombs.Add(munition);
+                        Plugin.Log?.LogInfo("[RealCombatSync] Added bomb to LaunchedMunitions");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[RealCombatSync] AddToLaunchedMunitions error: {ex.Message}");
+            }
+        }
+
         /// <summary>
         /// Clean up all network combat objects
         /// </summary>
@@ -1869,7 +2161,24 @@ namespace TCAMultiplayer.Player
                     }
                 }
 
+                // Remove all network bombs from LaunchedMunitions
+                if (_launchedMunitionsField != null)
+                {
+                    var launchedMunitions = _launchedMunitionsField.GetValue(null) as System.Collections.IList;
+                    if (launchedMunitions != null)
+                    {
+                        foreach (var bomb in _networkBombs)
+                        {
+                            if (launchedMunitions.Contains(bomb))
+                            {
+                                launchedMunitions.Remove(bomb);
+                            }
+                        }
+                    }
+                }
+
                 _networkMissiles.Clear();
+                _networkBombs.Clear();
                 _remoteRadars.Clear();
                 _cachedRemoteTargets.Clear();
                 _cachedRemoteFirePoints.Clear();
@@ -2032,12 +2341,71 @@ namespace TCAMultiplayer.Player
                 RealCombatSync.RemoveNetworkMissile(munition);
             }
 
-            // Spawn explosion effect at current position
-            CombatVfxManager.SpawnExplosion(transform.position, 15f, 150);
+            Vector3 impactPoint = transform.position;
+
+            // CRITICAL: Re-enable the Munition component before calling Explode()
+            // The component was disabled to prevent it from controlling movement, but it must be
+            // enabled for Explode() to properly apply damage and effects
+            var munitionBehaviour = munition as Behaviour;
+            if (munitionBehaviour != null && !munitionBehaviour.enabled)
+            {
+                munitionBehaviour.enabled = true;
+                Plugin.Log?.LogInfo("[NetworkMissileController] Re-enabled Munition component for explosion");
+            }
+
+            // Use the game's Munition.Explode() method for proper damage and effects
+            bool explodedViaMunition = TryExplodeViaMunition(munition, impactPoint);
+
+            if (!explodedViaMunition)
+            {
+                // Fallback: spawn visual effect only if Munition.Explode() didn't work
+                Plugin.Log?.LogWarning("[NetworkMissileController] Munition.Explode() failed, using fallback visual effect");
+                CombatVfxManager.SpawnExplosion(impactPoint, 15f, 150);
+            }
 
             Plugin.Log?.LogInfo("[NetworkMissileController] Missile exploded");
 
             Destroy(gameObject);
+        }
+
+        /// <summary>
+        /// Try to call the Munition's Explode method for proper damage and effects
+        /// </summary>
+        private bool TryExplodeViaMunition(object munition, Vector3 impactPoint)
+        {
+            if (munition == null)
+            {
+                Plugin.Log?.LogWarning("[NetworkMissileController] No Munition component found");
+                return false;
+            }
+
+            var munitionType = munition.GetType();
+
+            // Set HasExploded to false first to allow Explode() to run
+            var hasExplodedProp = munitionType.GetProperty("HasExploded", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            if (hasExplodedProp != null && (bool)hasExplodedProp.GetValue(munition))
+            {
+                Plugin.Log?.LogInfo("[NetworkMissileController] Resetting HasExploded flag");
+                hasExplodedProp.SetValue(munition, false);
+            }
+
+            // Try the public Explode method (missiles use regular Explode, not airburst)
+            var explodeMethod = munitionType.GetMethod("Explode", new[] { typeof(Vector3), typeof(bool), typeof(bool) });
+            if (explodeMethod != null)
+            {
+                try
+                {
+                    explodeMethod.Invoke(munition, new object[] { impactPoint, true, false }); // inflictDamage=true, isAirburst=false
+                    Plugin.Log?.LogInfo("[NetworkMissileController] Called Munition.Explode() successfully");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log?.LogWarning($"[NetworkMissileController] Explode failed: {ex.Message}");
+                }
+            }
+
+            return false;
         }
 
         private void OnDestroy()
@@ -2047,6 +2415,256 @@ namespace TCAMultiplayer.Player
             if (munition != null)
             {
                 RealCombatSync.RemoveNetworkMissile(munition);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Controller for network bombs - handles ballistic physics and ground collision
+    /// Bombs follow a ballistic trajectory with gravity and drag
+    /// Uses ABSOLUTE coordinates internally to survive floating origin shifts
+    /// </summary>
+    public class NetworkBombController : MonoBehaviour
+    {
+        private float _spawnTime;
+        private Vector3d _absolutePosition;  // Track in absolute coordinates
+        private Vector3 _velocity;
+
+        private const float GRAVITY = 9.81f;           // m/s^2
+        private const float DRAG_COEFFICIENT = 0.05f;  // Air resistance
+        private const float LIFETIME = 60f;            // Max lifetime for bombs
+        private const float GROUND_LEVEL = 0f;         // Sea level
+        private const float HIT_DISTANCE = 5f;         // Proximity for ground hit
+
+        private bool _hasHit = false;
+
+        /// <summary>
+        /// Initialize the bomb with local position and velocity
+        /// </summary>
+        public void Initialize(Vector3 localPosition, Vector3 velocity)
+        {
+            _spawnTime = Time.time;
+
+            // Convert local position to absolute for tracking
+            _absolutePosition = FloatingOriginHelper.LocalToAbsolute(localPosition);
+            _velocity = velocity;
+
+            // Set initial transform position
+            transform.position = localPosition;
+
+            // Orient bomb in direction of travel
+            if (_velocity.sqrMagnitude > 0.1f)
+            {
+                transform.rotation = Quaternion.LookRotation(_velocity.normalized, Vector3.up);
+            }
+
+            // DIAGNOSTIC: Check for Munition component that might cause premature explosion
+            var munitionComponent = GetComponent("Munition");
+            if (munitionComponent != null)
+            {
+                Plugin.Log?.LogWarning($"[NetworkBombController] DIAGNOSTIC: Bomb has Munition component! This may cause premature explosion via Munition.FixedUpdate");
+                
+                // Check IsLaunched state via reflection
+                var isLaunchedProp = munitionComponent.GetType().GetProperty("IsLaunched", 
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                if (isLaunchedProp != null)
+                {
+                    bool isLaunched = (bool)isLaunchedProp.GetValue(munitionComponent);
+                    Plugin.Log?.LogWarning($"[NetworkBombController] DIAGNOSTIC: Munition.IsLaunched = {isLaunched}");
+                }
+            }
+
+            // DIAGNOSTIC: Log spawn position details
+            Plugin.Log?.LogInfo($"[NetworkBombController] DIAGNOSTIC: Spawn Y={localPosition.y:F1}, Ground check threshold={GROUND_LEVEL + HIT_DISTANCE}");
+
+            Plugin.Log?.LogInfo($"[NetworkBombController] Bomb spawned at {localPosition} (absolute: {_absolutePosition}), velocity {velocity}");
+        }
+
+        private void Update()
+        {
+            if (_hasHit) return;
+
+            float flightTime = Time.time - _spawnTime;
+
+            // DIAGNOSTIC: Log early explosion detection
+            if (flightTime < 0.5f)
+            {
+                Plugin.Log?.LogInfo($"[NetworkBombController] DIAGNOSTIC: Update called at flightTime={flightTime:F3}s");
+            }
+
+            // Check timeout
+            if (flightTime > LIFETIME)
+            {
+                Plugin.Log?.LogInfo("[NetworkBombController] Bomb timed out");
+                Explode();
+                return;
+            }
+
+            // Apply gravity
+            _velocity.y -= GRAVITY * Time.deltaTime;
+
+            // Apply drag (simplified)
+            _velocity *= (1f - DRAG_COEFFICIENT * Time.deltaTime);
+
+            // Update absolute position
+            _absolutePosition.x += _velocity.x * Time.deltaTime;
+            _absolutePosition.y += _velocity.y * Time.deltaTime;
+            _absolutePosition.z += _velocity.z * Time.deltaTime;
+
+            // Convert to local position for rendering (handles floating origin shifts)
+            Vector3 localPos = FloatingOriginHelper.AbsoluteToLocal(_absolutePosition);
+            transform.position = localPos;
+
+            // Orient bomb to face velocity direction (bomb rotates as it falls)
+            if (_velocity.sqrMagnitude > 0.1f)
+            {
+                transform.rotation = Quaternion.LookRotation(_velocity.normalized, Vector3.up);
+            }
+
+            // Check ground collision (use ABSOLUTE Y coordinate - local Y can be negative due to FloatingOrigin shifts)
+            // DIAGNOSTIC: Log ground check details
+            if (flightTime < 0.5f && _absolutePosition.y <= GROUND_LEVEL + HIT_DISTANCE + 50f)
+            {
+                Plugin.Log?.LogWarning($"[NetworkBombController] DIAGNOSTIC: Ground check - absoluteY={_absolutePosition.y:F1}, localY={localPos.y:F1}, threshold={GROUND_LEVEL + HIT_DISTANCE}, willExplode={_absolutePosition.y <= GROUND_LEVEL + HIT_DISTANCE}");
+            }
+
+            if (_absolutePosition.y <= GROUND_LEVEL + HIT_DISTANCE)
+            {
+                Plugin.Log?.LogInfo($"[NetworkBombController] Bomb hit ground at absolute Y={_absolutePosition.y:F1} (local: {localPos}) after {flightTime:F2}s");
+                Explode();
+                return;
+            }
+
+            // Log position periodically for debugging
+            if (flightTime > 1f && LogHelper.ShouldLogInterval("NetworkBomb.Position", 2f))
+            {
+                Plugin.Log?.LogInfo($"[NetworkBombController] Bomb pos={localPos}, vel={_velocity.magnitude:F0}m/s");
+            }
+        }
+
+        private void Explode()
+        {
+            if (_hasHit) return; // Prevent double-explode
+            _hasHit = true;
+
+            float flightTime = Time.time - _spawnTime;
+            Vector3 impactPoint = transform.position;
+
+            Plugin.Log?.LogInfo($"[NetworkBombController] Bomb exploding at {impactPoint} after {flightTime:F2}s");
+
+            // Remove from LaunchedMunitions list first
+            var munition = GetComponent("Munition");
+            if (munition != null)
+            {
+                RealCombatSync.RemoveNetworkBomb(munition);
+            }
+
+            // Use the game's Munition.Explode() method for proper damage, effects, and cluster bomblets
+            bool explodedViaMunition = TryExplodeViaMunition(munition, impactPoint);
+
+            if (!explodedViaMunition)
+            {
+                // Fallback: spawn visual effect only if Munition.Explode() didn't work
+                Plugin.Log?.LogWarning("[NetworkBombController] Munition.Explode() failed, using fallback visual effect");
+                CombatVfxManager.SpawnExplosion(impactPoint, 20f, 200);
+            }
+
+            Plugin.Log?.LogInfo("[NetworkBombController] Bomb exploded");
+
+            // Destroy the bomb GameObject
+            Destroy(gameObject);
+        }
+
+        /// <summary>
+        /// Try to call the Munition's Explode method for proper damage, effects, and cluster bomblets
+        /// </summary>
+        private bool TryExplodeViaMunition(object munition, Vector3 impactPoint)
+        {
+            if (munition == null)
+            {
+                Plugin.Log?.LogWarning("[NetworkBombController] No Munition component found");
+                return false;
+            }
+
+            var munitionType = munition.GetType();
+
+            // Check if it's a cluster munition
+            var dataProp = munitionType.GetProperty("Data", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            if (dataProp != null)
+            {
+                var storeData = dataProp.GetValue(munition);
+                if (storeData != null)
+                {
+                    var warheadProp = storeData.GetType().GetProperty("Warhead");
+                    if (warheadProp != null)
+                    {
+                        var warhead = warheadProp.GetValue(storeData);
+                        if (warhead != null)
+                        {
+                            var isClusterProp = warhead.GetType().GetField("IsClusterMunition");
+                            if (isClusterProp != null)
+                            {
+                                bool isCluster = (bool)isClusterProp.GetValue(warhead);
+                                if (isCluster)
+                                {
+                                    Plugin.Log?.LogInfo("[NetworkBombController] Cluster munition detected - will spawn bomblets");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Set HasExploded to false first to allow Explode() to run
+            var hasExplodedProp = munitionType.GetProperty("HasExploded", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            if (hasExplodedProp != null && (bool)hasExplodedProp.GetValue(munition))
+            {
+                Plugin.Log?.LogInfo("[NetworkBombController] Resetting HasExploded flag");
+                hasExplodedProp.SetValue(munition, false);
+            }
+
+            // Try to find and call ExplodeAsAirburst (handles cluster munitions properly)
+            var explodeAirburstMethod = munitionType.GetMethod("ExplodeAsAirburst", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            if (explodeAirburstMethod != null)
+            {
+                try
+                {
+                    explodeAirburstMethod.Invoke(munition, new object[] { impactPoint });
+                    Plugin.Log?.LogInfo("[NetworkBombController] Called Munition.ExplodeAsAirburst() successfully");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log?.LogWarning($"[NetworkBombController] ExplodeAsAirburst failed: {ex.Message}");
+                }
+            }
+
+            // Fallback: Try the public Explode method
+            var explodeMethod = munitionType.GetMethod("Explode", new[] { typeof(Vector3), typeof(bool), typeof(bool) });
+            if (explodeMethod != null)
+            {
+                try
+                {
+                    explodeMethod.Invoke(munition, new object[] { impactPoint, true, false }); // inflictDamage=true, isAirburst=false
+                    Plugin.Log?.LogInfo("[NetworkBombController] Called Munition.Explode() successfully");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log?.LogWarning($"[NetworkBombController] Explode failed: {ex.Message}");
+                }
+            }
+
+            return false;
+        }
+
+        private void OnDestroy()
+        {
+            // Ensure removal from LaunchedMunitions list
+            var munition = GetComponent("Munition");
+            if (munition != null)
+            {
+                RealCombatSync.RemoveNetworkBomb(munition);
             }
         }
     }

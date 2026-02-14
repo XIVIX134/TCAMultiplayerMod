@@ -84,24 +84,119 @@ namespace TCAMultiplayer
             return (count % sampleRate) == 0;
         }
         
+        /// <summary>
+        /// Get a short category tag for log messages
+        /// </summary>
+        private static string GetCategoryTag(LogCategory category)
+        {
+            return category switch
+            {
+                LogCategory.Network => "NET",
+                LogCategory.Transport => "TRANS",
+                LogCategory.Packets => "PKT",
+                LogCategory.Patches => "PATCH",
+                LogCategory.Player => "PLAYER",
+                LogCategory.Damage => "DMG",
+                LogCategory.Weapon => "WPN",
+                LogCategory.Interpolation => "INTERP",
+                LogCategory.Reflection => "REFL",
+                _ => "GEN"
+            };
+        }
+        
+        /// <summary>
+        /// Format a message with instance prefix for BepInEx
+        /// </summary>
+        private static string FormatForBepInEx(LogCategory category, string message)
+        {
+            string instancePrefix = InstanceLogger.GetPrefix();
+            string categoryTag = GetCategoryTag(category);
+            return $"{instancePrefix}[{categoryTag}] {message}";
+        }
+        
+        /// <summary>
+        /// Format a message for the instance log file (cleaner format)
+        /// </summary>
+        private static string FormatForFile(LogCategory category, string message)
+        {
+            string categoryTag = GetCategoryTag(category);
+            return $"[{categoryTag}] {message}";
+        }
+        
         public static void Info(LogCategory category, string message)
         {
             if (!IsEnabled(category)) return;
-            Plugin.Log?.LogInfo(message);
+            
+            // Write to instance log file (clean format)
+            InstanceLogger.LogInfo(FormatForFile(category, message));
+            
+            // Also log to BepInEx with prefix
+            Plugin.Log?.LogInfo(FormatForBepInEx(category, message));
         }
         
         public static void InfoInterval(LogCategory category, string message, string key, float intervalSeconds)
         {
             if (!IsEnabled(category)) return;
             if (!ShouldLogInterval(key, intervalSeconds)) return;
-            Plugin.Log?.LogInfo(message);
+            
+            InstanceLogger.LogInfo(FormatForFile(category, message));
+            Plugin.Log?.LogInfo(FormatForBepInEx(category, message));
         }
         
         public static void InfoSample(LogCategory category, string message, string key, int sampleRate)
         {
             if (!IsEnabled(category)) return;
             if (!ShouldSample(key, sampleRate)) return;
-            Plugin.Log?.LogInfo(message);
+            
+            InstanceLogger.LogInfo(FormatForFile(category, message));
+            Plugin.Log?.LogInfo(FormatForBepInEx(category, message));
+        }
+        
+        /// <summary>
+        /// Log a warning message
+        /// </summary>
+        public static void Warning(LogCategory category, string message)
+        {
+            if (!IsEnabled(category)) return;
+            
+            InstanceLogger.LogWarning(FormatForFile(category, message));
+            Plugin.Log?.LogWarning(FormatForBepInEx(category, message));
+        }
+        
+        /// <summary>
+        /// Log an error message (always logged regardless of category settings)
+        /// </summary>
+        public static void Error(LogCategory category, string message)
+        {
+            InstanceLogger.LogError(FormatForFile(category, message));
+            Plugin.Log?.LogError(FormatForBepInEx(category, message));
+        }
+        
+        /// <summary>
+        /// Log a network send event with special formatting
+        /// </summary>
+        public static void NetworkSend(string details)
+        {
+            if (!IsEnabled(LogCategory.Network)) return;
+            InstanceLogger.LogNetwork("SEND", details);
+        }
+        
+        /// <summary>
+        /// Log a network receive event with special formatting
+        /// </summary>
+        public static void NetworkRecv(string details)
+        {
+            if (!IsEnabled(LogCategory.Network)) return;
+            InstanceLogger.LogNetwork("RECV", details);
+        }
+        
+        /// <summary>
+        /// Log a state transition with visual emphasis
+        /// </summary>
+        public static void StateChange(string fromState, string toState)
+        {
+            InstanceLogger.LogStateChange(fromState, toState);
+            Plugin.Log?.LogInfo($"{InstanceLogger.GetPrefix()}STATE: {fromState} -> {toState}");
         }
     }
 }

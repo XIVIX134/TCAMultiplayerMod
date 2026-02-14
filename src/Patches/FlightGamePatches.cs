@@ -143,6 +143,9 @@ namespace TCAMultiplayer.Patches
                 // Poll for new missile launches (replaces broken Harmony Postfix)
                 WeaponPatches.PollMissileLaunches();
 
+                // Poll for new bomb drops (unguided munitions)
+                WeaponPatches.PollBombDrops();
+
                 // Check radar lock state for RWR sync
                 if (_cachedUniAircraft != null)
                 {
@@ -1060,6 +1063,9 @@ namespace TCAMultiplayer.Patches
                 }
 
                 Plugin.Instance.Network.SendAircraftState(state);
+
+                // Update collision manager with local player info
+                AircraftCollisionManager.Instance?.UpdateLocalPlayerInfo(localAircraft, vel, GetLocalPlayerId());
             }
             catch (Exception ex)
             {

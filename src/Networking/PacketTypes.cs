@@ -32,11 +32,17 @@ namespace TCAMultiplayer.Networking
         RadarLock = 33,         // Sent when locking onto enemy (for RWR)
         RadarLockLost = 34,     // Sent when lock is broken
         CountermeasureDeploy = 35, // Flares/chaff deployed
+        BombDrop = 36,          // Bomb/unguided munition released
+        
+        // World destruction sync (reliable)
+        CraterSpawn = 37,       // Crater spawned at location
+        BuildingDestroy = 38,   // Building destroyed
         
         // Damage (reliable)
         DamageDealt = 40,
         AircraftDestroyed = 41,
         ProjectileImpact = 42,  // Sent when projectile impacts for FX sync
+        AircraftCollision = 43, // Aircraft-to-aircraft collision (host authority)
         
         // Game State
         RequestRespawn = 50,
@@ -44,6 +50,8 @@ namespace TCAMultiplayer.Networking
         AircraftChanged = 52,   // Sent when local player changes aircraft (respawn, new plane)
         Victory = 53,
         KillConfirm = 54,       // Sent by victim to confirm a kill (for scoreboard sync)
+        LoadoutSelect = 55,     // Player selected loadout
+        AircraftSelect = 56,    // Player selected aircraft (lobby only)
         
         // Utility
         Ping = 100,
@@ -96,6 +104,7 @@ namespace TCAMultiplayer.Networking
         public string PlayerName;
         public string SelectedAirfield;
         public string SelectedAircraft;
+        public string SelectedLoadout = "Clean";  // Default loadout
         public bool IsReady;
         public bool IsLoaded;
         public bool IsHost;
@@ -143,6 +152,15 @@ namespace TCAMultiplayer.Networking
     {
         public ulong PeerId;
         public string AircraftName;
+    }
+    
+    /// <summary>
+    /// Loadout selection packet
+    /// </summary>
+    public struct LobbyLoadoutSelectPacket
+    {
+        public ulong PeerId;
+        public string LoadoutName;
     }
     
     /// <summary>
@@ -341,6 +359,7 @@ namespace TCAMultiplayer.Networking
     {
         public ulong ShooterId;     // Player who launched
         public ulong TargetId;      // Target player (if locked)
+        public bool IsTracking;     // Whether missile is actively tracking target
         public string MissileType;  // e.g. "AIM-9L", "AIM-120"
         public byte SeekerType;     // 0 = IR, 1 = Radar, 2 = Unguided
         public double LaunchPosX;   // Launch position (ABSOLUTE coordinates)
@@ -349,6 +368,45 @@ namespace TCAMultiplayer.Networking
         public float LaunchDirX;    // Launch direction
         public float LaunchDirY;
         public float LaunchDirZ;
+    }
+
+    /// <summary>
+    /// Bomb drop packet - sent when an unguided munition is released
+    /// Uses absolute (double-precision) coordinates for floating-origin sync
+    /// </summary>
+    public struct BombDropPacket
+    {
+        public ulong ShooterId;     // Player who dropped the bomb
+        public string BombType;     // Display name from StoreData (e.g. "Mk-82", "GBU-12")
+        public double LaunchPosX;   // Launch position (ABSOLUTE coordinates)
+        public double LaunchPosY;
+        public double LaunchPosZ;
+        public float VelX;          // Initial velocity (includes aircraft velocity)
+        public float VelY;
+        public float VelZ;
+        public float Timestamp;     // Time of release for sync
+    }
+
+    /// <summary>
+    /// Crater spawn packet - syncs crater creation between clients
+    /// </summary>
+    public struct CraterSpawnPacket
+    {
+        public double PosX;         // Absolute world position
+        public double PosY;
+        public double PosZ;
+        public byte CraterSize;     // 0=Small, 1=Medium, 2=Large, 3=Huge, 4=Aircraft
+    }
+
+    /// <summary>
+    /// Building destroy packet - syncs building destruction between clients
+    /// </summary>
+    public struct BuildingDestroyPacket
+    {
+        public int BuildingInstanceId;  // Unity InstanceID of the building
+        public double PosX;             // Absolute position for verification
+        public double PosY;
+        public double PosZ;
     }
 
     /// <summary>
@@ -406,6 +464,30 @@ namespace TCAMultiplayer.Networking
         
         public int Damage;          // For scaling explosion size
         public string WeaponName;   // For effect selection
+    }
+
+    /// <summary>
+    /// Aircraft collision packet - sent by host when two aircraft collide.
+    /// Uses host-authority model for collision detection and damage calculation.
+    /// </summary>
+    public struct AircraftCollisionPacket
+    {
+        public ulong PlayerA;           // First player ID
+        public ulong PlayerB;           // Second player ID
+        
+        // Collision position (absolute coordinates for floating-origin sync)
+        public double PosX;
+        public double PosY;
+        public double PosZ;
+        
+        // Collision normal (direction from A to B)
+        public float NormalX;
+        public float NormalY;
+        public float NormalZ;
+        
+        public int DamageA;             // Damage to player A
+        public int DamageB;             // Damage to player B
+        public float RelativeSpeed;     // Relative speed at impact (for effects)
     }
 
     /// <summary>
@@ -624,6 +706,7 @@ namespace TCAMultiplayer.Networking
             {
                 writer.Write(packet.ShooterId);
                 writer.Write(packet.TargetId);
+                writer.Write(packet.IsTracking);
                 writer.Write(packet.MissileType ?? "Unknown");
                 writer.Write(packet.SeekerType);
                 writer.Write(packet.LaunchPosX);
@@ -645,6 +728,7 @@ namespace TCAMultiplayer.Networking
                 {
                     ShooterId = reader.ReadUInt64(),
                     TargetId = reader.ReadUInt64(),
+                    IsTracking = reader.ReadBoolean(),
                     MissileType = reader.ReadString(),
                     SeekerType = reader.ReadByte(),
                     LaunchPosX = reader.ReadDouble(),
@@ -681,6 +765,100 @@ namespace TCAMultiplayer.Networking
                     TargetId = reader.ReadUInt64(),
                     IsLocked = reader.ReadBoolean(),
                     LockType = reader.ReadByte()
+                };
+            }
+        }
+
+        public static byte[] SerializeBombDrop(BombDropPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
+            {
+                writer.Write(packet.ShooterId);
+                writer.Write(packet.BombType ?? "Unknown");
+                writer.Write(packet.LaunchPosX);
+                writer.Write(packet.LaunchPosY);
+                writer.Write(packet.LaunchPosZ);
+                writer.Write(packet.VelX);
+                writer.Write(packet.VelY);
+                writer.Write(packet.VelZ);
+                writer.Write(packet.Timestamp);
+                return ms.ToArray();
+            }
+        }
+
+        public static BombDropPacket DeserializeBombDrop(byte[] data)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var reader = new BinaryReader(ms))
+            {
+                return new BombDropPacket
+                {
+                    ShooterId = reader.ReadUInt64(),
+                    BombType = reader.ReadString(),
+                    LaunchPosX = reader.ReadDouble(),
+                    LaunchPosY = reader.ReadDouble(),
+                    LaunchPosZ = reader.ReadDouble(),
+                    VelX = reader.ReadSingle(),
+                    VelY = reader.ReadSingle(),
+                    VelZ = reader.ReadSingle(),
+                    Timestamp = reader.ReadSingle()
+                };
+            }
+        }
+
+        public static byte[] SerializeCraterSpawn(CraterSpawnPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
+            {
+                writer.Write(packet.PosX);
+                writer.Write(packet.PosY);
+                writer.Write(packet.PosZ);
+                writer.Write(packet.CraterSize);
+                return ms.ToArray();
+            }
+        }
+
+        public static CraterSpawnPacket DeserializeCraterSpawn(byte[] data)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var reader = new BinaryReader(ms))
+            {
+                return new CraterSpawnPacket
+                {
+                    PosX = reader.ReadDouble(),
+                    PosY = reader.ReadDouble(),
+                    PosZ = reader.ReadDouble(),
+                    CraterSize = reader.ReadByte()
+                };
+            }
+        }
+
+        public static byte[] SerializeBuildingDestroy(BuildingDestroyPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
+            {
+                writer.Write(packet.BuildingInstanceId);
+                writer.Write(packet.PosX);
+                writer.Write(packet.PosY);
+                writer.Write(packet.PosZ);
+                return ms.ToArray();
+            }
+        }
+
+        public static BuildingDestroyPacket DeserializeBuildingDestroy(byte[] data)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var reader = new BinaryReader(ms))
+            {
+                return new BuildingDestroyPacket
+                {
+                    BuildingInstanceId = reader.ReadInt32(),
+                    PosX = reader.ReadDouble(),
+                    PosY = reader.ReadDouble(),
+                    PosZ = reader.ReadDouble()
                 };
             }
         }
@@ -777,6 +955,48 @@ namespace TCAMultiplayer.Networking
                     ImpactDirZ = reader.ReadSingle(),
                     Damage = reader.ReadInt32(),
                     WeaponName = reader.ReadString()
+                };
+            }
+        }
+
+        public static byte[] SerializeAircraftCollision(AircraftCollisionPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
+            {
+                writer.Write(packet.PlayerA);
+                writer.Write(packet.PlayerB);
+                writer.Write(packet.PosX);
+                writer.Write(packet.PosY);
+                writer.Write(packet.PosZ);
+                writer.Write(packet.NormalX);
+                writer.Write(packet.NormalY);
+                writer.Write(packet.NormalZ);
+                writer.Write(packet.DamageA);
+                writer.Write(packet.DamageB);
+                writer.Write(packet.RelativeSpeed);
+                return ms.ToArray();
+            }
+        }
+
+        public static AircraftCollisionPacket DeserializeAircraftCollision(byte[] data)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var reader = new BinaryReader(ms))
+            {
+                return new AircraftCollisionPacket
+                {
+                    PlayerA = reader.ReadUInt64(),
+                    PlayerB = reader.ReadUInt64(),
+                    PosX = reader.ReadDouble(),
+                    PosY = reader.ReadDouble(),
+                    PosZ = reader.ReadDouble(),
+                    NormalX = reader.ReadSingle(),
+                    NormalY = reader.ReadSingle(),
+                    NormalZ = reader.ReadSingle(),
+                    DamageA = reader.ReadInt32(),
+                    DamageB = reader.ReadInt32(),
+                    RelativeSpeed = reader.ReadSingle()
                 };
             }
         }
@@ -940,6 +1160,54 @@ namespace TCAMultiplayer.Networking
                 {
                     PeerId = reader.ReadUInt64(),
                     AirfieldName = reader.ReadString()
+                };
+            }
+        }
+        
+        public static byte[] SerializeLobbyAircraftSelect(LobbyAircraftSelectPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
+            {
+                writer.Write(packet.PeerId);
+                writer.Write(packet.AircraftName ?? "");
+                return ms.ToArray();
+            }
+        }
+        
+        public static LobbyAircraftSelectPacket DeserializeLobbyAircraftSelect(byte[] data)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var reader = new BinaryReader(ms))
+            {
+                return new LobbyAircraftSelectPacket
+                {
+                    PeerId = reader.ReadUInt64(),
+                    AircraftName = reader.ReadString()
+                };
+            }
+        }
+        
+        public static byte[] SerializeLobbyLoadoutSelect(LobbyLoadoutSelectPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
+            {
+                writer.Write(packet.PeerId);
+                writer.Write(packet.LoadoutName ?? "");
+                return ms.ToArray();
+            }
+        }
+        
+        public static LobbyLoadoutSelectPacket DeserializeLobbyLoadoutSelect(byte[] data)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var reader = new BinaryReader(ms))
+            {
+                return new LobbyLoadoutSelectPacket
+                {
+                    PeerId = reader.ReadUInt64(),
+                    LoadoutName = reader.ReadString()
                 };
             }
         }
