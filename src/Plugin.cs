@@ -35,6 +35,12 @@ namespace TCAMultiplayer
         public static ConfigEntry<int> PacketLogSampleRate { get; private set; }
         public static ConfigEntry<int> HighFreqLogSampleRate { get; private set; }
 
+        public static ConfigEntry<string> ConfigUsername { get; private set; }
+        public static ConfigEntry<string> ConfigLastIP { get; private set; }
+        public static ConfigEntry<string> ConfigLastPort { get; private set; }
+        public static ConfigEntry<string> ConfigHostName { get; private set; }
+        public static ConfigEntry<string> ConfigHostPort { get; private set; }
+
         public NetworkManager Network { get; private set; }
         public GameStateMachine GameState { get; private set; }
 
@@ -343,6 +349,12 @@ namespace TCAMultiplayer
 
         private void BindLoggingConfig()
         {
+            ConfigUsername = Config.Bind("Player", "Username", "Player", "Your multiplayer username.");
+            ConfigLastIP = Config.Bind("Network", "LastIP", "127.0.0.1", "Last connected IP address.");
+            ConfigLastPort = Config.Bind("Network", "LastPort", NetworkConfig.DEFAULT_PORT_STRING, "Last connected port.");
+            ConfigHostName = Config.Bind("Host", "ServerName", "TCA Server", "Your server's name.");
+            ConfigHostPort = Config.Bind("Host", "Port", NetworkConfig.DEFAULT_PORT_STRING, "Port to host on.");
+
             VerboseAll = Config.Bind("Logging", "VerboseAll", true, "Enable verbose logs across the mod.");
             VerboseNetworking = Config.Bind("Logging", "VerboseNetworking", true, "Extra logs for network state handling.");
             VerboseTransport = Config.Bind("Logging", "VerboseTransport", true, "Extra logs for transport send/receive.");

@@ -19,11 +19,13 @@ namespace TCAMultiplayer.UI
         private LobbyScreen _currentScreen = LobbyScreen.MainMenu;
         private GameObject _contentRoot;
         private GameObject _backgroundPanel;
-        private string _connectIP = "127.0.0.1";
-        private string _connectPort = NetworkConfig.DEFAULT_PORT_STRING;
-        private string _hostName = "TCA Server";
-        private string _hostPort = NetworkConfig.DEFAULT_PORT_STRING;
-        private string _username = "Player";
+        private string _connectIP;
+        private string _connectPort;
+        private string _hostName;
+        private string _hostPort;
+        private string _username;
+        private bool _isConnecting = false;
+        private string _connectionError = "";
 
         public static async UniTask CreateAndRun()
         {
@@ -118,7 +120,16 @@ namespace TCAMultiplayer.UI
         {
             this.gameObject.SetActive(true);
             _isCloseRequested = false;
-            _username = LobbyManager.Instance?.LocalPlayerName ?? "Player";
+            
+            // Load defaults from config
+            _username = Plugin.ConfigUsername?.Value ?? "Player";
+            _connectIP = Plugin.ConfigLastIP?.Value ?? "127.0.0.1";
+            _connectPort = Plugin.ConfigLastPort?.Value ?? NetworkConfig.DEFAULT_PORT_STRING;
+            _hostName = Plugin.ConfigHostName?.Value ?? "TCA Server";
+            _hostPort = Plugin.ConfigHostPort?.Value ?? NetworkConfig.DEFAULT_PORT_STRING;
+
+            LobbyManager.Instance?.SetLocalPlayerName(_username);
+            
             SetScreen(LobbyScreen.MainMenu);
             await UniTask.WaitUntil(() => _isCloseRequested, PlayerLoopTiming.Update, this.GetCancellationTokenOnDestroy());
             this.gameObject.SetActive(false);
@@ -212,6 +223,7 @@ namespace TCAMultiplayer.UI
             UIFactory.CreateNativeText("MULTIPLAYER", _contentRoot.transform, 48);
             UIFactory.CreateLabelInputRow("Username:", _username, _contentRoot.transform, (val) => {
                 _username = val;
+                if (Plugin.ConfigUsername != null) Plugin.ConfigUsername.Value = val;
                 LobbyManager.Instance?.SetLocalPlayerName(val);
             });
             UIFactory.CreateNativeButton("HOST GAME", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.HostSetup));
@@ -228,8 +240,14 @@ namespace TCAMultiplayer.UI
         private void DrawHostSetup()
         {
             UIFactory.CreateNativeText("HOST SETTINGS", _contentRoot.transform, 36);
-            UIFactory.CreateLabelInputRow("Server Name:", _hostName, _contentRoot.transform, val => _hostName = val);
-            UIFactory.CreateLabelInputRow("Port:", _hostPort, _contentRoot.transform, val => _hostPort = val);
+            UIFactory.CreateLabelInputRow("Server Name:", _hostName, _contentRoot.transform, val => {
+                _hostName = val;
+                if (Plugin.ConfigHostName != null) Plugin.ConfigHostName.Value = val;
+            });
+            UIFactory.CreateLabelInputRow("Port:", _hostPort, _contentRoot.transform, val => {
+                _hostPort = val;
+                if (Plugin.ConfigHostPort != null) Plugin.ConfigHostPort.Value = val;
+            });
 
             UIFactory.CreateNativeButton("START SERVER", _contentRoot.transform).onClick.AddListener(() => {
                 int.TryParse(_hostPort, out int port);
@@ -246,7 +264,7 @@ namespace TCAMultiplayer.UI
         {
             var lobby = LobbyManager.Instance;
             bool isHost = lobby?.IsHost ?? false;
-            UIFactory.CreateNativeText(isHost ? "LOBBY (HOST)" : "LOBBY (CLIENT)", _contentRoot.transform, 36);
+            UIFactory.CreateNativeText("LOBBY", _contentRoot.transform, 36);
 
             var playerGroup = UIFactory.CreateVerticalGroup(_contentRoot.transform, 5, 10);
             playerGroup.AddComponent<Image>().color = new Color(1, 1, 1, 0.05f);
@@ -403,6 +421,15 @@ namespace TCAMultiplayer.UI
                 string selectedAirfield = lobby?.LocalSelectedAirfield;
                 int selectedAirfieldIndex = 0;
                 var airfieldList = new List<string>(names);
+                
+                // Auto-select first airfield if none selected
+                if (string.IsNullOrEmpty(selectedAirfield) && airfieldList.Count > 0)
+                {
+                    selectedAirfield = airfieldList[0];
+                    lobby?.SetLocalAirfield(selectedAirfield);
+                    Plugin.Instance.Lobby?.SendAirfieldSelect(selectedAirfield);
+                }
+
                 for (int i = 0; i < airfieldList.Count; i++)
                 {
                     if (airfieldList[i] == selectedAirfield)
@@ -515,28 +542,76 @@ namespace TCAMultiplayer.UI
         private void DrawDirectConnect()
         {
             UIFactory.CreateNativeText("DIRECT CONNECT", _contentRoot.transform, 36);
-            UIFactory.CreateLabelInputRow("IP:", _connectIP, _contentRoot.transform, v => _connectIP = v);
-            UIFactory.CreateLabelInputRow("Port:", _connectPort, _contentRoot.transform, v => _connectPort = v);
+            UIFactory.CreateLabelInputRow("IP:", _connectIP, _contentRoot.transform, v => {
+                _connectIP = v;
+                if (Plugin.ConfigLastIP != null) Plugin.ConfigLastIP.Value = v;
+            });
+            UIFactory.CreateLabelInputRow("Port:", _connectPort, _contentRoot.transform, v => {
+                _connectPort = v;
+                if (Plugin.ConfigLastPort != null) Plugin.ConfigLastPort.Value = v;
+            });
 
             var spacer = new GameObject("Spacer", typeof(RectTransform), typeof(LayoutElement));
             spacer.transform.SetParent(_contentRoot.transform, false);
             spacer.GetComponent<LayoutElement>().flexibleHeight = 1;
 
-            UIFactory.CreateNativeButton("CONNECT", _contentRoot.transform).onClick.AddListener(() => {
-                int.TryParse(_connectPort, out int p);
+            if (!string.IsNullOrEmpty(_connectionError))
+            {
+                UIFactory.CreateNativeText($"<color=red>{_connectionError}</color>", _contentRoot.transform, 18);
+            }
 
-                // ... logging ...
-                if (Plugin.Instance == null) { /* ... */ return; }
-                /* ... */
+            if (_isConnecting)
+            {
+                var connectBtn = UIFactory.CreateNativeButton("CONNECTING...", _contentRoot.transform);
+                connectBtn.interactable = false;
+            }
+            else
+            {
+                UIFactory.CreateNativeButton("CONNECT", _contentRoot.transform).onClick.AddListener(async () => {
+                    int.TryParse(_connectPort, out int p);
 
-                Plugin.Log?.LogInfo($"[MultiplayerMenu] Direct connect to {_connectIP}:{p}");
-                Plugin.Instance.GameState?.StartConnecting(_connectIP, p);
-                Plugin.Instance.Network.StartClient(_connectIP, p);
-                
-                // Don't transition immediately - wait for OnPeerConnected callback
-                RefreshUI();
+                    if (Plugin.Instance == null) return;
+
+                    Plugin.Log?.LogInfo($"[MultiplayerMenu] Direct connect to {_connectIP}:{p}");
+                    Plugin.Instance.GameState?.StartConnecting(_connectIP, p);
+                    Plugin.Instance.Network.StartClient(_connectIP, p);
+                    
+                    _isConnecting = true;
+                    _connectionError = "";
+                    RefreshUI();
+
+                    // Wait for connection or timeout
+                    float timeout = 5f;
+                    float elapsed = 0f;
+                    while (elapsed < timeout && _isConnecting)
+                    {
+                        if (Plugin.Instance.Network.IsConnected)
+                        {
+                            _isConnecting = false;
+                            // SetScreen(LobbyScreen.Lobby) handled by OnPeerConnected
+                            return; 
+                        }
+                        await UniTask.Delay(100);
+                        elapsed += 0.1f;
+                    }
+
+                    // If we get here, we timed out
+                    if (_isConnecting)
+                    {
+                        Plugin.Log?.LogWarning($"[MultiplayerMenu] Connection to {_connectIP}:{p} timed out.");
+                        Plugin.Instance.Network.Disconnect();
+                        Plugin.Instance.GameState?.Disconnect();
+                        _isConnecting = false;
+                        _connectionError = "Connection timed out";
+                        RefreshUI();
+                    }
+                });
+            }
+            UIFactory.CreateNativeButton("BACK", _contentRoot.transform).onClick.AddListener(() => {
+                _isConnecting = false;
+                _connectionError = "";
+                SetScreen(LobbyScreen.MainMenu);
             });
-            UIFactory.CreateNativeButton("BACK", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.MainMenu));
         }
 
         private void DrawBrowse()
@@ -562,39 +637,61 @@ namespace TCAMultiplayer.UI
                 foreach (var game in games)
                 {
                     var btn = UIFactory.CreateNativeButton($"{game.HostName} ({game.IPAddress})", listContainer.transform, 40);
-                    btn.onClick.AddListener(() => {
+                    btn.onClick.AddListener(async () => {
+                        if (_isConnecting) return; // Prevent multiple clicks
+                        
                         // Defensive logging to trace connection issues
                         if (Plugin.Instance == null)
                         {
                             Plugin.Log?.LogError("[MultiplayerMenu] Plugin.Instance is NULL! Cannot connect.");
                             return;
                         }
-                        if (Plugin.Instance.GameState == null)
-                        {
-                            Plugin.Log?.LogError("[MultiplayerMenu] GameState is NULL! Cannot track connection state.");
-                        }
-                        if (Plugin.Instance.Network == null)
-                        {
-                            Plugin.Log?.LogError("[MultiplayerMenu] Network is NULL! Cannot connect.");
-                            return;
-                        }
-
+                        
                         Plugin.Log?.LogInfo($"[MultiplayerMenu] LAN browse - joining game: {game.IPAddress}:{game.Port}");
-                        Plugin.Log?.LogInfo($"[MultiplayerMenu] GameState before connect: {Plugin.Instance.GameState?.CurrentState}");
-
-                        bool stateStarted = Plugin.Instance.GameState?.StartConnecting(game.IPAddress, game.Port) ?? false;
-                        Plugin.Log?.LogInfo($"[MultiplayerMenu] StartConnecting result: {stateStarted}, state now: {Plugin.Instance.GameState?.CurrentState}");
-
+                        Plugin.Instance.GameState?.StartConnecting(game.IPAddress, game.Port);
                         Plugin.Instance.Network.StartClient(game.IPAddress, game.Port);
                         
-                        // Don't transition immediately - wait for OnPeerConnected callback
-                        // (same fix as DirectConnect screen)
-                        RefreshUI();
+                        _isConnecting = true;
+                        _connectionError = "";
+                        btn.GetComponentInChildren<TextMeshProUGUI>().text = "CONNECTING...";
+                        btn.interactable = false;
+
+                        // Wait for connection or timeout
+                        float timeout = 5f;
+                        float elapsed = 0f;
+                        while (elapsed < timeout && _isConnecting)
+                        {
+                            if (Plugin.Instance.Network.IsConnected)
+                            {
+                                _isConnecting = false;
+                                return; 
+                            }
+                            await UniTask.Delay(100);
+                            elapsed += 0.1f;
+                        }
+
+                        // If we get here, we timed out
+                        if (_isConnecting)
+                        {
+                            Plugin.Log?.LogWarning($"[MultiplayerMenu] LAN Connection to {game.IPAddress}:{game.Port} timed out.");
+                            Plugin.Instance.Network.Disconnect();
+                            Plugin.Instance.GameState?.Disconnect();
+                            _isConnecting = false;
+                            _connectionError = "Connection timed out";
+                            RefreshUI();
+                        }
                     });
                 }
             }
 
+            if (!string.IsNullOrEmpty(_connectionError))
+            {
+                UIFactory.CreateNativeText($"<color=red>{_connectionError}</color>", listContainer.transform, 18);
+            }
+
             UIFactory.CreateNativeButton("BACK", _contentRoot.transform).onClick.AddListener(() => {
+                _isConnecting = false;
+                _connectionError = "";
                 Plugin.Instance?.Discovery?.StopListening();
                 SetScreen(LobbyScreen.MainMenu);
             });
