@@ -81,7 +81,7 @@ namespace TCAMultiplayer.Game
                     _aircraftDisplayNameField = returnType.GetField("DisplayName", 
                         BindingFlags.Public | BindingFlags.Instance);
                     _aircraftNameField = returnType.GetField("Name", 
-                        BindingFlags.Public | BindingFlags.Instance);
+                        BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
                 }
                 
                 _initialized = true;

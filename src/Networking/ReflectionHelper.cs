@@ -273,8 +273,8 @@ namespace TCAMultiplayer.Networking
             var data = dataField.GetValue(uniAircraft);
             if (data == null) return null;
 
-            // Public field Name (UniAircraftData.Name is a field, not a property)
-            var nameField = data.GetType().GetField("Name", BindingFlags.Public | BindingFlags.Instance);
+            // Public field Name (UniAircraftData.Name is inherited from LoadableData, so we need FlattenHierarchy)
+            var nameField = data.GetType().GetField("Name", BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
             var value = nameField?.GetValue(data) as string;
             if (!string.IsNullOrEmpty(value)) return value;
 
