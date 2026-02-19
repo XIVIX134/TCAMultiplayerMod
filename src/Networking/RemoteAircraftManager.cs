@@ -1268,15 +1268,14 @@ namespace TCAMultiplayer.Networking
 
         private string ResolveAircraftType(string desiredType, string lobbySelection, string localSelection)
         {
-            string normalizedDesired = NormalizeAircraftType(desiredType);
-            string normalizedLobby = NormalizeAircraftType(lobbySelection);
-            string normalizedLocal = NormalizeAircraftType(localSelection);
-
             string[] candidates =
             {
-                normalizedDesired,
-                normalizedLobby,
-                normalizedLocal,
+                desiredType,
+                lobbySelection,
+                localSelection,
+                NormalizeAircraftType(desiredType),
+                NormalizeAircraftType(lobbySelection),
+                NormalizeAircraftType(localSelection),
                 "AV8B"
             };
 
