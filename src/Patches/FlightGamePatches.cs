@@ -70,10 +70,21 @@ namespace TCAMultiplayer.Patches
         private static FieldInfo _sarRollField = null;
         private static FieldInfo _sarYawField = null;
 
+        // FlightStats from aircraft
+        private static PropertyInfo _flightStatsProperty = null;
+        private static FieldInfo _flightStatsField = null;
+        private static PropertyInfo _speedKIASProperty = null;
+        private static FieldInfo _speedKIASField = null;
+
+        // BrakeState from aircraft
+        private static PropertyInfo _brakeStateProperty = null;
+        private static FieldInfo _brakeStateField = null;
+
         // Cached objects for reading state
         private static object _cachedFirstEngine = null;
         private static object _cachedFlightInput = null;
         private static object _cachedLandingGear = null;
+        private static object _cachedFlightStats = null;
 
         /// <summary>
         /// Public accessor for the current FlightGame instance
@@ -738,6 +749,30 @@ namespace TCAMultiplayer.Patches
                     Plugin.Log?.LogInfo($"[FlightGamePatches] Gear IsGearLowered property: {_gearIsDownProperty?.Name ?? "NOT FOUND"}");
                 }
 
+                // Try to get FlightStats
+                _flightStatsProperty = aircraftType.GetProperty("FlightStats", flags);
+                _flightStatsField = aircraftType.GetField("FlightStats", flags);
+
+                if (_flightStatsProperty != null)
+                {
+                    _cachedFlightStats = _flightStatsProperty.GetValue(uniAircraft);
+                }
+                else if (_flightStatsField != null)
+                {
+                    _cachedFlightStats = _flightStatsField.GetValue(uniAircraft);
+                }
+
+                if (_cachedFlightStats != null)
+                {
+                    var flightStatsType = _cachedFlightStats.GetType();
+                    _speedKIASProperty = flightStatsType.GetProperty("IndicatedAirspeedKnots", flags);
+                    _speedKIASField = flightStatsType.GetField("IndicatedAirspeedKnots", flags);
+                }
+
+                // Try to get BrakeState
+                _brakeStateProperty = aircraftType.GetProperty("BrakeState", flags);
+                _brakeStateField = aircraftType.GetField("BrakeState", flags);
+
                 // ============================================
                 // Summary
                 // ============================================
@@ -813,6 +848,8 @@ namespace TCAMultiplayer.Patches
                 float roll = 0f;
                 float yaw = 0f;
                 float nozzleAngle = 0f;
+                float speedKIAS = 0f;
+                float brakeState = 0f;
 
                 if (_cachedUniAircraft != null)
                 {
@@ -945,6 +982,21 @@ namespace TCAMultiplayer.Patches
                             gearDown = Convert.ToBoolean(_gearIsDownProperty.GetValue(_cachedLandingGear));
                         }
 
+                        // Read SpeedKIAS
+                        if (_cachedFlightStats != null)
+                        {
+                            if (_speedKIASProperty != null)
+                                speedKIAS = Convert.ToSingle(_speedKIASProperty.GetValue(_cachedFlightStats));
+                            else if (_speedKIASField != null)
+                                speedKIAS = Convert.ToSingle(_speedKIASField.GetValue(_cachedFlightStats));
+                        }
+
+                        // Read BrakeState
+                        if (_brakeStateProperty != null)
+                            brakeState = Convert.ToSingle(_brakeStateProperty.GetValue(_cachedUniAircraft));
+                        else if (_brakeStateField != null)
+                            brakeState = Convert.ToSingle(_brakeStateField.GetValue(_cachedUniAircraft));
+
                         // Try to detect gun firing and countermeasure state
                         isFiring = DetectGunFiring(_cachedUniAircraft);
                         
@@ -1038,6 +1090,8 @@ namespace TCAMultiplayer.Patches
                     Roll = roll,
                     Yaw = yaw,
                     NozzleAngle = nozzleAngle,
+                    SpeedKIAS = speedKIAS,
+                    BrakeState = brakeState,
 
                     Timestamp = Time.time
                 };

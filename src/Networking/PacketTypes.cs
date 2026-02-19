@@ -294,6 +294,10 @@ namespace TCAMultiplayer.Networking
         public float Yaw;          // -1 to 1
         public float NozzleAngle;  // VTOL nozzle angle in degrees
         
+        // Physics and Aerodynamics
+        public float SpeedKIAS;    // Indicated Airspeed in Knots
+        public float BrakeState;   // 0-1 Airbrake/Wheel brake
+        
         // Flags: Afterburner, GearDown, FlapsDown, Firing, etc.
         public byte Flags;
         
@@ -640,6 +644,9 @@ namespace TCAMultiplayer.Networking
                 writer.Write(state.Yaw);
                 writer.Write(state.NozzleAngle);
                 
+                writer.Write(state.SpeedKIAS);
+                writer.Write(state.BrakeState);
+                
                 writer.Write(state.Flags);
                 writer.Write(state.Timestamp);
                 
@@ -681,6 +688,9 @@ namespace TCAMultiplayer.Networking
                     Roll = reader.ReadSingle(),
                     Yaw = reader.ReadSingle(),
                     NozzleAngle = reader.ReadSingle(),
+                    
+                    SpeedKIAS = ms.Position < ms.Length ? reader.ReadSingle() : 0f,
+                    BrakeState = ms.Position < ms.Length ? reader.ReadSingle() : 0f,
                     
                     Flags = reader.ReadByte(),
                     Timestamp = reader.ReadSingle()

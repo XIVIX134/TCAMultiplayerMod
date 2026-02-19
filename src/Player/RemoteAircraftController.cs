@@ -63,6 +63,8 @@ namespace TCAMultiplayer.Player
         private float _roll = 0f;
         private float _yaw = 0f;
         private float _nozzleAngle = 0f;
+        private float _speedKIAS = 0f;
+        private float _brakeState = 0f;
         
         // Gear animation state (0 = down, 1 = up)
         private float _gearAnimState = 0f;
@@ -105,10 +107,26 @@ namespace TCAMultiplayer.Player
         
         // Native game animation components
         private static Type _uniAnimatedPartType;
+        private static MethodInfo _uniAnimatedPartUpdateAutomaticMethod;
         private static MethodInfo _uniAnimatedPartUpdateManuallyMethod;
         private static FieldInfo _uniAnimatedPartNameField;
         private static FieldInfo _uniAnimatedPartIsUpdatedAutomaticallyField;
         private List<object> _animatedParts = new List<object>();
+        
+        // Native SwingWings
+        private static Type _swingWingsType;
+        private static MethodInfo _swingWingsInitMethod;
+        private static MethodInfo _swingWingsUpdateAutoSpeedMethod;
+        private object _swingWingsComponent;
+
+        // Dummy FlightInput
+        private static Type _flightInputType;
+        private object _dummyFlightInput;
+        private static FieldInfo _fiPitchField;
+        private static FieldInfo _fiRollField;
+        private static FieldInfo _fiYawField;
+        private static FieldInfo _fiNozzleAnalogField;
+        private static FieldInfo _fiThrottleField;
         
         // Landing gear native component
         private Component _landingGearComponent;
@@ -197,10 +215,28 @@ namespace TCAMultiplayer.Player
                 _uniAnimatedPartType = Type.GetType("Falcon.UniversalAircraft.UniAnimatedPart, Assembly-CSharp");
                 if (_uniAnimatedPartType != null)
                 {
+                    _uniAnimatedPartUpdateAutomaticMethod = _uniAnimatedPartType.GetMethod("UpdateAutomatic", flags);
                     _uniAnimatedPartUpdateManuallyMethod = _uniAnimatedPartType.GetMethod("UpdateManually", flags);
                     _uniAnimatedPartNameField = _uniAnimatedPartType.GetField("Name", flags);
                     _uniAnimatedPartIsUpdatedAutomaticallyField = _uniAnimatedPartType.GetField("IsUpdatedAutomatically", flags);
                     Plugin.Log.LogInfo($"[RemoteAircraftController] UniAnimatedPart type found");
+                }
+                
+                _swingWingsType = Type.GetType("Falcon.UniversalAircraft.SwingWings, Assembly-CSharp");
+                if (_swingWingsType != null)
+                {
+                    _swingWingsInitMethod = _swingWingsType.GetMethod("InitializeWithData", flags);
+                    _swingWingsUpdateAutoSpeedMethod = _swingWingsType.GetMethod("UpdateAutoSpeed", flags);
+                }
+
+                _flightInputType = Type.GetType("Falcon.Controls.FlightInput, Assembly-CSharp");
+                if (_flightInputType != null)
+                {
+                    _fiPitchField = _flightInputType.GetField("Pitch", flags) ?? _flightInputType.GetField("<Pitch>k__BackingField", flags);
+                    _fiRollField = _flightInputType.GetField("Roll", flags) ?? _flightInputType.GetField("<Roll>k__BackingField", flags);
+                    _fiYawField = _flightInputType.GetField("Yaw", flags) ?? _flightInputType.GetField("<Yaw>k__BackingField", flags);
+                    _fiNozzleAnalogField = _flightInputType.GetField("NozzleAnalog", flags) ?? _flightInputType.GetField("<NozzleAnalog>k__BackingField", flags);
+                    _fiThrottleField = _flightInputType.GetField("Throttle", flags) ?? _flightInputType.GetField("<Throttle>k__BackingField", flags);
                 }
                 
                 _reflectionInitialized = true;
@@ -278,40 +314,42 @@ namespace TCAMultiplayer.Player
                                         
                                         if (partTransform != null)
                                         {
-                                            // Create a control surface for this animated part
-                                            // Determine type from name
-                                            ControlType type = ControlType.Aileron;
-                                            if (partName.IndexOf("Aileron", StringComparison.OrdinalIgnoreCase) >= 0)
-                                                type = ControlType.Aileron;
-                                            else if (partName.IndexOf("Elevator", StringComparison.OrdinalIgnoreCase) >= 0)
-                                                type = ControlType.Elevator;
-                                            else if (partName.IndexOf("Rudder", StringComparison.OrdinalIgnoreCase) >= 0)
-                                                type = ControlType.Rudder;
-                                            else if (partName.IndexOf("Flap", StringComparison.OrdinalIgnoreCase) >= 0)
-                                                type = ControlType.Flap;
-                                            else if (partName.IndexOf("Nozzle", StringComparison.OrdinalIgnoreCase) >= 0)
-                                                type = ControlType.Nozzle;
-                                            else if (partName.IndexOf("Brake", StringComparison.OrdinalIgnoreCase) >= 0)
-                                                type = ControlType.SpeedBrake;
-                                            
-                                            bool isLeft = partName.IndexOf("L", StringComparison.OrdinalIgnoreCase) >= 0;
-                                            
-                                            // Get rotation axis from the part (default to Y for control surfaces, X for nozzles)
-                                            Vector3 axis = (type == ControlType.Nozzle || type == ControlType.SpeedBrake) ? Vector3.right : Vector3.up;
-                                            
-                                            var surface = new ControlSurface
+                                            try
                                             {
-                                                Name = partName,
-                                                Transform = partTransform,
-                                                StartRotation = partTransform.localRotation,
-                                                LocalAxis = axis,
-                                                CurrentAngle = 0f,
-                                                Type = type,
-                                                IsLeftSide = isLeft
-                                            };
-                                            _controlSurfaces.Add(surface);
-                                            Plugin.Log.LogInfo($"[RemoteAircraftController] Added animated part from Data: {partName} (transform={partTransformName}, type={type})");
+                                                var newPart = Activator.CreateInstance(_uniAnimatedPartType, partData, partTransform);
+                                                _animatedParts.Add(newPart);
+                                                Plugin.Log.LogInfo($"[RemoteAircraftController] Created native UniAnimatedPart: {partName}");
+                                            }
+                                            catch (Exception ex)
+                                            {
+                                                Plugin.Log.LogError($"[RemoteAircraftController] Failed to create UniAnimatedPart {partName}: {ex.Message}");
+                                            }
                                         }
+                                    }
+                                }
+                                
+                                // Also initialize SwingWings if present
+                                var swingWingsDataField = uniAircraftDataType.GetField("SwingWings", BindingFlags.Public | BindingFlags.Instance);
+                                var swingWingsData = swingWingsDataField?.GetValue(data);
+                                if (swingWingsData != null)
+                                {
+                                    var hasSwingWingsField = swingWingsData.GetType().GetField("HasSwingWings");
+                                    bool hasSwingWings = hasSwingWingsField != null && (bool)hasSwingWingsField.GetValue(swingWingsData);
+                                    
+                                    if (hasSwingWings && _swingWingsType != null)
+                                    {
+                                        _swingWingsComponent = Activator.CreateInstance(_swingWingsType);
+                                        
+                                        // Build transform dictionary
+                                        var subpartsByName = new Dictionary<string, Transform>();
+                                        foreach (var t in GetComponentsInChildren<Transform>(true))
+                                        {
+                                            if (!subpartsByName.ContainsKey(t.name))
+                                                subpartsByName[t.name] = t;
+                                        }
+                                        
+                                        _swingWingsInitMethod?.Invoke(_swingWingsComponent, new object[] { swingWingsData, subpartsByName });
+                                        Plugin.Log.LogInfo($"[RemoteAircraftController] Initialized native SwingWings");
                                     }
                                 }
                             }
@@ -482,6 +520,8 @@ namespace TCAMultiplayer.Player
             _roll = state.Roll;
             _yaw = state.Yaw;
             _nozzleAngle = state.NozzleAngle;
+            _speedKIAS = state.SpeedKIAS;
+            _brakeState = state.BrakeState;
             
             // Update flags
             if (state.Afterburner != _afterburnerActive)
@@ -594,11 +634,21 @@ namespace TCAMultiplayer.Player
                 {
                     // SetGearLowered works when in the air (IsWeightOnWheels=false)
                     _landingGearSetGearLoweredMethod.Invoke(_landingGearComponent, new object[] { _gearDown });
+
+                    // We could also set SteerInput and BrakeInput using properties if we reflected them
+                    var lgType = _landingGearComponent.GetType();
+                    var steerProp = lgType.GetProperty("SteerInput", BindingFlags.Public | BindingFlags.Instance);
+                    if (steerProp != null) steerProp.SetValue(_landingGearComponent, _yaw);
+
+                    var brakeProp = lgType.GetProperty("BrakeInput", BindingFlags.Public | BindingFlags.Instance);
+                    if (brakeProp != null) brakeProp.SetValue(_landingGearComponent, _brakeState);
+
                     return;
                 }
                 catch (Exception ex)
                 {
-                    Plugin.Log.LogWarning($"[RemoteAircraftController] SetGearLowered failed: {ex.Message}");
+                    if (LogHelper.ShouldLogInterval("RemoteAircraftController.GearError", 5f))
+                        Plugin.Log.LogWarning($"[RemoteAircraftController] SetGearLowered failed: {ex.Message}");
                 }
             }
             
@@ -625,9 +675,69 @@ namespace TCAMultiplayer.Player
         
         private void UpdateControlSurfaces()
         {
-            // Always use manual transform rotation - we populate _controlSurfaces from UniAircraftData
-            // This works even when UniAircraft is disabled before Start() populates AnimatedParts
-            UpdateControlSurfacesManual();
+            // If we have native animated parts, use them instead of the hardcoded manual ones
+            if (_animatedParts.Count > 0 && _uniAnimatedPartUpdateAutomaticMethod != null)
+            {
+                // Create dummy flight input on first run
+                if (_dummyFlightInput == null && _flightInputType != null)
+                {
+                    _dummyFlightInput = Activator.CreateInstance(_flightInputType, new object[] { true });
+                }
+
+                if (_dummyFlightInput != null)
+                {
+                    // Update dummy flight input
+                    _fiPitchField?.SetValue(_dummyFlightInput, _pitch);
+                    _fiRollField?.SetValue(_dummyFlightInput, _roll);
+                    _fiYawField?.SetValue(_dummyFlightInput, _yaw);
+                    _fiNozzleAnalogField?.SetValue(_dummyFlightInput, _nozzleAngle / 90f); // approx back to 0-1
+                    _fiThrottleField?.SetValue(_dummyFlightInput, _throttle);
+
+                    float flapAngle = _flapsDown ? 25f : 0f;
+
+                    // Iterate all native animated parts and feed them the dummy input and received physics state
+                    foreach (var part in _animatedParts)
+                    {
+                        try
+                        {
+                            // UpdateAutomatic(FlightInput flightControls, float flapAngle, float speedKIAS, float brakeState, bool isWeightOnWheels, float deltaTime)
+                            _uniAnimatedPartUpdateAutomaticMethod.Invoke(part, new object[] 
+                            { 
+                                _dummyFlightInput, 
+                                flapAngle, 
+                                _speedKIAS, 
+                                _brakeState, 
+                                _isWeightOnWheels, 
+                                Time.deltaTime 
+                            });
+                        }
+                        catch (Exception ex)
+                        {
+                            if (LogHelper.ShouldLogInterval("RemoteAircraftController.AnimError", 5f))
+                                Plugin.Log.LogWarning($"[RemoteAircraftController] Anim update error: {ex.Message}");
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Fallback to manual rotation if native components not available
+                UpdateControlSurfacesManual();
+            }
+
+            // Update SwingWings if available
+            if (_swingWingsComponent != null && _swingWingsUpdateAutoSpeedMethod != null)
+            {
+                try
+                {
+                    _swingWingsUpdateAutoSpeedMethod.Invoke(_swingWingsComponent, new object[] { Time.deltaTime, _speedKIAS });
+                }
+                catch (Exception ex)
+                {
+                    if (LogHelper.ShouldLogInterval("RemoteAircraftController.SwingWingsError", 5f))
+                        Plugin.Log.LogWarning($"[RemoteAircraftController] SwingWings error: {ex.Message}");
+                }
+            }
         }
         
         /// <summary>
