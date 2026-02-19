@@ -374,6 +374,7 @@ namespace TCAMultiplayer.Networking
         public void SetLocalAircraft(string aircraftName)
         {
             LocalSelectedAircraft = aircraftName;
+            if (Plugin.ConfigLocalAircraft != null) Plugin.ConfigLocalAircraft.Value = aircraftName;
 
             if (_players.ContainsKey(LocalPeerId))
             {
@@ -390,6 +391,7 @@ namespace TCAMultiplayer.Networking
         public void SetLocalLoadout(string loadoutName)
         {
             LocalSelectedLoadout = loadoutName;
+            if (Plugin.ConfigLocalLoadout != null) Plugin.ConfigLocalLoadout.Value = loadoutName;
 
             if (_players.ContainsKey(LocalPeerId))
             {
@@ -434,6 +436,8 @@ namespace TCAMultiplayer.Networking
             if (!IsHost) return;
 
             SpawnType = spawnType;
+            if (Plugin.ConfigHostSpawnType != null) Plugin.ConfigHostSpawnType.Value = (int)spawnType;
+
             if (!string.IsNullOrEmpty(mapName))
             {
                 MapName = mapName;
@@ -452,6 +456,8 @@ namespace TCAMultiplayer.Networking
             if (!IsHost) return;
 
             AircraftCollisionsEnabled = enabled;
+            if (Plugin.ConfigHostAircraftCollisions != null) Plugin.ConfigHostAircraftCollisions.Value = enabled;
+
             Plugin.Log?.LogInfo($"[LobbyManager] Aircraft collisions: {enabled}");
             OnLobbyStateChanged?.Invoke();
         }
@@ -461,6 +467,8 @@ namespace TCAMultiplayer.Networking
             if (!IsHost) return;
 
             SelectedTimeOfDay = timeOfDay;
+            if (Plugin.ConfigHostTimeOfDay != null) Plugin.ConfigHostTimeOfDay.Value = (int)timeOfDay;
+
             Plugin.Log?.LogInfo($"[LobbyManager] Time of day: {timeOfDay}");
             OnLobbyStateChanged?.Invoke();
         }

@@ -318,34 +318,24 @@ namespace TCAMultiplayer.UI
                 }
             }
 
-            // Mod Sync Status (client only — host always compatible with itself)
+            // Mod Sync Status (client only, and ONLY if desynced or checking)
             if (!isHost && lobby != null)
             {
-                string syncText;
-                switch (lobby.ModSyncStatus)
+                if (lobby.ModSyncStatus == LobbyManager.ModSyncState.Checking)
                 {
-                    case LobbyManager.ModSyncState.Checking:
-                        syncText = "<color=yellow>MOD SYNC: Checking compatibility...</color>";
-                        break;
-                    case LobbyManager.ModSyncState.Compatible:
-                        syncText = "<color=green>MOD SYNC: Compatible \u2713</color>";
-                        break;
-                    case LobbyManager.ModSyncState.Incompatible:
-                        syncText = $"<color=red>MOD SYNC: Incompatible \u2717</color>";
-                        break;
-                    default:
-                        syncText = "<color=#888888>MOD SYNC: Not checked</color>";
-                        break;
+                    UIFactory.CreateNativeText("<color=yellow>MOD SYNC: Checking compatibility...</color>", _contentRoot.transform, 16);
                 }
-                UIFactory.CreateNativeText(syncText, _contentRoot.transform, 16);
-
-                // Show detailed error if incompatible
-                if (lobby.ModSyncStatus == LobbyManager.ModSyncState.Incompatible && !string.IsNullOrEmpty(lobby.ModSyncError))
+                else if (lobby.ModSyncStatus == LobbyManager.ModSyncState.Incompatible)
                 {
-                    var errorGroup = UIFactory.CreateVerticalGroup(_contentRoot.transform, 2, 5);
-                    errorGroup.AddComponent<Image>().color = new Color(0.5f, 0, 0, 0.3f);
-                    UIFactory.CreateNativeText($"<color=#FF6666><size=14>{lobby.ModSyncError}</size></color>", errorGroup.transform, 14, TextAlignmentOptions.Left);
+                    UIFactory.CreateNativeText($"<color=red>MOD SYNC: Incompatible \u2717</color>", _contentRoot.transform, 16);
+                    if (!string.IsNullOrEmpty(lobby.ModSyncError))
+                    {
+                        var errorGroup = UIFactory.CreateVerticalGroup(_contentRoot.transform, 2, 5);
+                        errorGroup.AddComponent<Image>().color = new Color(0.5f, 0, 0, 0.3f);
+                        UIFactory.CreateNativeText($"<color=#FF6666><size=14>{lobby.ModSyncError}</size></color>", errorGroup.transform, 14, TextAlignmentOptions.Left);
+                    }
                 }
+                // Don't show anything if compatible
             }
 
             // Aircraft Selection (Lobby only - not available mid-match)
@@ -451,7 +441,7 @@ namespace TCAMultiplayer.UI
             var currentSpawnType = lobby?.SpawnType ?? LobbySpawnType.Runway;
             int spawnTypeIndex = (int)currentSpawnType;
             
-            string spawnLabel = isHost ? "Spawn Type:" : "Spawn Type: <size=70%><color=#888888>[HOST]</color></size>";
+            string spawnLabel = "Spawn Type:";
             var spawnBtn = UIFactory.CreateLabeledSelector(spawnLabel, spawnTypeNames, spawnTypeIndex, _contentRoot.transform,
                 isHost ? (Action<int>)((index) => {
                     lobby?.SetSpawnSettings((LobbySpawnType)index);
@@ -467,7 +457,7 @@ namespace TCAMultiplayer.UI
             var currentTime = lobby?.SelectedTimeOfDay ?? TimeOfDay.Morning;
             int timeIndex = (int)currentTime;
             
-            string timeLabel = isHost ? "Time:" : "Time: <size=70%><color=#888888>[HOST]</color></size>";
+            string timeLabel = "Time:";
             var timeBtn = UIFactory.CreateLabeledSelector(timeLabel, timeNames, timeIndex, _contentRoot.transform,
                 isHost ? (Action<int>)((index) => {
                     lobby?.SetTimeOfDay((TimeOfDay)index);
@@ -493,7 +483,7 @@ namespace TCAMultiplayer.UI
             else
             {
                 // Client sees read-only label
-                UIFactory.CreateNativeText($"<color=#888888>[HOST]</color> Aircraft Collisions: {(lobby.AircraftCollisionsEnabled ? "<color=green>ON</color>" : "<color=red>OFF</color>")}", _contentRoot.transform, 18);
+                UIFactory.CreateNativeText($"Aircraft Collisions: {(lobby.AircraftCollisionsEnabled ? "<color=green>ON</color>" : "<color=red>OFF</color>")}", _contentRoot.transform, 18);
             }
 
             var spacer = new GameObject("Spacer", typeof(RectTransform), typeof(LayoutElement));

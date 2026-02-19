@@ -40,6 +40,14 @@ namespace TCAMultiplayer
         public static ConfigEntry<string> ConfigLastPort { get; private set; }
         public static ConfigEntry<string> ConfigHostName { get; private set; }
         public static ConfigEntry<string> ConfigHostPort { get; private set; }
+        
+        public static ConfigEntry<string> ConfigLocalAircraft { get; private set; }
+        public static ConfigEntry<string> ConfigLocalLoadout { get; private set; }
+        
+        // Host settings
+        public static ConfigEntry<int> ConfigHostSpawnType { get; private set; }
+        public static ConfigEntry<int> ConfigHostTimeOfDay { get; private set; }
+        public static ConfigEntry<bool> ConfigHostAircraftCollisions { get; private set; }
 
         public NetworkManager Network { get; private set; }
         public GameStateMachine GameState { get; private set; }
@@ -354,6 +362,12 @@ namespace TCAMultiplayer
             ConfigLastPort = Config.Bind("Network", "LastPort", NetworkConfig.DEFAULT_PORT_STRING, "Last connected port.");
             ConfigHostName = Config.Bind("Host", "ServerName", "TCA Server", "Your server's name.");
             ConfigHostPort = Config.Bind("Host", "Port", NetworkConfig.DEFAULT_PORT_STRING, "Port to host on.");
+            ConfigHostSpawnType = Config.Bind("Host", "SpawnType", 1, "0=Air, 1=Runway, 2=Ramp");
+            ConfigHostTimeOfDay = Config.Bind("Host", "TimeOfDay", 1, "0=Dawn, 1=Morning, 2=Noon, 3=Afternoon, 4=Evening, 5=Night");
+            ConfigHostAircraftCollisions = Config.Bind("Host", "AircraftCollisions", true, "Enable aircraft collisions");
+            
+            ConfigLocalAircraft = Config.Bind("Player", "LastAircraft", "AV8B", "Last selected aircraft ID");
+            ConfigLocalLoadout = Config.Bind("Player", "LastLoadout", "Clean", "Last selected loadout name");
 
             VerboseAll = Config.Bind("Logging", "VerboseAll", true, "Enable verbose logs across the mod.");
             VerboseNetworking = Config.Bind("Logging", "VerboseNetworking", true, "Extra logs for network state handling.");
