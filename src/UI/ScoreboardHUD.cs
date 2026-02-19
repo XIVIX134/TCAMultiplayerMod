@@ -127,9 +127,10 @@ namespace TCAMultiplayer.UI
             rect.anchoredPosition = new Vector2(10f, -55f); // Below the TCA MP status line
             rect.sizeDelta = new Vector2(140f, 38f);
 
-            // Background
+            // Background (matching native QMB panel style)
             var bgImage = _compactPanel.AddComponent<Image>();
-            bgImage.color = new Color(0f, 0f, 0f, 0.55f);
+            bgImage.color = UIFactory.GetPanelFillColor();
+            UIFactory.AddGreenBorder(_compactPanel, 0.6f);
 
             // Text
             var textGo = new GameObject("KDText", typeof(RectTransform));
@@ -192,9 +193,9 @@ namespace TCAMultiplayer.UI
             var rootRect = root.GetComponent<RectTransform>();
             rootRect.sizeDelta = new Vector2(0f, 24f);
 
-            // Background
+            // Background (dark green tint matching game style)
             var bg = root.AddComponent<Image>();
-            bg.color = new Color(0f, 0f, 0f, 0.45f);
+            bg.color = new Color(0f, 0.04f, 0.02f, 0.7f);
 
             // CanvasGroup for alpha fade
             var cg = root.AddComponent<CanvasGroup>();
@@ -238,9 +239,10 @@ namespace TCAMultiplayer.UI
             rect.anchoredPosition = Vector2.zero;
             rect.sizeDelta = new Vector2(400f, 300f); // Will resize dynamically
 
-            // Background
+            // Background (matching native QMB panel style)
             var bg = _scoreboardPanel.AddComponent<Image>();
-            bg.color = new Color(0f, 0f, 0f, 0.88f);
+            bg.color = UIFactory.GetPanelFillColor();
+            UIFactory.AddGreenBorder(_scoreboardPanel);
 
             // Vertical layout for the whole scoreboard
             var layout = _scoreboardPanel.AddComponent<VerticalLayoutGroup>();
@@ -306,7 +308,7 @@ namespace TCAMultiplayer.UI
             if (isLocal)
             {
                 var rowBg = row.AddComponent<Image>();
-                rowBg.color = new Color(0.2f, 0.4f, 0.2f, 0.5f);
+                rowBg.color = new Color(0f, 0.15f, 0.06f, 0.5f);
             }
 
             var hlg = row.AddComponent<HorizontalLayoutGroup>();
@@ -398,7 +400,7 @@ namespace TCAMultiplayer.UI
 
                     uiEntry.Root.SetActive(true);
                     uiEntry.CanvasGroup.alpha = alpha;
-                    uiEntry.Background.color = new Color(0f, 0f, 0f, 0.45f * alpha);
+                    uiEntry.Background.color = new Color(0f, 0.04f, 0.02f, 0.7f * alpha);
                     uiEntry.Text.text = $"<color=#00FF00>{data.KillerName}</color> [{data.WeaponName}] <color=#FF4444>{data.VictimName}</color>";
                 }
                 else

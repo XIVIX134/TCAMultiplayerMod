@@ -11,6 +11,7 @@ using Cysharp.Threading.Tasks;
 using UnityEngine.SceneManagement;
 using Falcon.Database;
 using Falcon.Game2;
+using Falcon.World;
 
 namespace TCAMultiplayer
 {
@@ -78,6 +79,9 @@ namespace TCAMultiplayer
                 Scores = new ScoreTracker();
                 ScoreboardHUD = new ScoreboardHUD();
 
+                Log.LogInfo("Initializing mod manifest collector...");
+                ModCompatibility.ModManifestCollector.Initialize();
+
                 // Wire up lobby events (native UI handles its own wiring via MultiplayerMenu)
                 SetupLobbyEvents();
 
@@ -91,6 +95,12 @@ namespace TCAMultiplayer
                     
                     // Apply manual patches for WorldDestruction (needs type resolution from Assembly-CSharp)
                     Patches.WorldDestructionPatches.ApplyPatches(_harmony);
+                    
+                    // Apply manual patches for Explosion sync (Munition.Explode postfix)
+                    Patches.ExplosionPatches.ApplyPatches(_harmony);
+                    
+                    // Apply manual patches for Aircraft destruction VFX sync
+                    Patches.AircraftDestructionPatches.ApplyPatches(_harmony);
                 }
                 catch (Exception ex)
                 {
@@ -126,7 +136,7 @@ namespace TCAMultiplayer
                         if (airfields.Length > 0) airfield = airfields[0];
                     }
 
-                    string aircraftName = "AV8B"; // TODO: aircraft selection in respawn UI
+                    string aircraftName = Lobby?.LocalSelectedAircraft ?? "AV8B";
                     Lobby?.SendRespawnRequest();
                     bool success = Spawner?.SpawnPlayerAtAirfield(airfield, aircraftName, spawnType) ?? false;
 
@@ -285,8 +295,30 @@ namespace TCAMultiplayer
                 if (airfields.Length > 0) airfield = airfields[0];
             }
 
-            Log.LogInfo($"[Plugin] Spawning at {airfield} with type {Lobby?.SpawnType}");
-            Spawner?.SpawnPlayerAtAirfield(airfield, "AV8B", Lobby?.SpawnType ?? LobbySpawnType.Runway);
+            string aircraft = Lobby?.LocalSelectedAircraft ?? "AV8B";
+            Log.LogInfo($"[Plugin] Spawning at {airfield} with type {Lobby?.SpawnType} aircraft={aircraft}");
+            Spawner?.SpawnPlayerAtAirfield(airfield, aircraft, Lobby?.SpawnType ?? LobbySpawnType.Runway);
+
+            // Apply Time of Day
+            try
+            {
+                var timeOfDay = Lobby?.SelectedTimeOfDay ?? TimeOfDay.Morning;
+                var env = UnityEngine.Object.FindObjectOfType<Falcon.World.Environment>();
+                if (env != null)
+                {
+                    env.SetTimeOfDayPreset(timeOfDay);
+                    Log.LogInfo($"[Plugin] Set time of day: {timeOfDay}");
+                }
+                else
+                {
+                    Log.LogWarning("[Plugin] Environment singleton not found — cannot set time of day");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.LogWarning($"[Plugin] Failed to set time of day: {ex.Message}");
+            }
+
             GameState?.OnSpawnComplete();
 
             // Ensure ScoreTracker has all players registered with correct names at game start

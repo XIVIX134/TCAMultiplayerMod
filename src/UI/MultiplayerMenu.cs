@@ -5,6 +5,7 @@ using UnityEngine.UI;
 using TMPro;
 using Cysharp.Threading.Tasks;
 using Falcon.Game2;
+using Falcon.World;
 using TCAMultiplayer.Networking;
 using TCAMultiplayer.Game;
 
@@ -18,7 +19,6 @@ namespace TCAMultiplayer.UI
         private LobbyScreen _currentScreen = LobbyScreen.MainMenu;
         private GameObject _contentRoot;
         private GameObject _backgroundPanel;
-
         private string _connectIP = "127.0.0.1";
         private string _connectPort = NetworkConfig.DEFAULT_PORT_STRING;
         private string _hostName = "TCA Server";
@@ -74,7 +74,16 @@ namespace TCAMultiplayer.UI
 
         private void OnPeerDisconnected(ulong peerId)
         {
-            if (_currentScreen == LobbyScreen.Lobby)
+            // If we're the host, a client leaving should NOT kick us out of the lobby.
+            // Only clients should return to MainMenu when they lose connection to the host.
+            bool isHost = Plugin.Instance?.GameState?.IsHost ?? false;
+
+            if (isHost)
+            {
+                // Host stays in lobby, just refresh UI to update player list
+                RefreshUI();
+            }
+            else if (_currentScreen == LobbyScreen.Lobby)
             {
                 SetScreen(LobbyScreen.MainMenu);
             }
@@ -147,6 +156,7 @@ namespace TCAMultiplayer.UI
             scaler.matchWidthOrHeight = 0.5f;
             if (gameObject.GetComponent<GraphicRaycaster>() == null) gameObject.AddComponent<GraphicRaycaster>();
 
+            // Full-screen dim overlay behind the panel
             _backgroundPanel = new GameObject("Background", typeof(RectTransform), typeof(Image));
             _backgroundPanel.transform.SetParent(transform, false);
             var bgImage = _backgroundPanel.GetComponent<Image>();
@@ -156,16 +166,25 @@ namespace TCAMultiplayer.UI
             bgRect.anchorMax = Vector2.one;
             bgRect.sizeDelta = Vector2.zero;
 
+            // Centered native panel using the QMB's green-bordered sprite
+            var panelGo = UIFactory.CreateNativePanel(transform);
+            var panelRect = panelGo.GetComponent<RectTransform>();
+            panelRect.anchorMin = new Vector2(0.5f, 0.5f);
+            panelRect.anchorMax = new Vector2(0.5f, 0.5f);
+            panelRect.pivot = new Vector2(0.5f, 0.5f);
+            panelRect.sizeDelta = new Vector2(800, 800);
+
+            // Content root sits inside the native panel
             _contentRoot = new GameObject("Content", typeof(RectTransform));
-            _contentRoot.transform.SetParent(transform, false);
+            _contentRoot.transform.SetParent(panelGo.transform, false);
             var contentRect = _contentRoot.GetComponent<RectTransform>();
-            contentRect.anchorMin = new Vector2(0.5f, 0.5f);
-            contentRect.anchorMax = new Vector2(0.5f, 0.5f);
-            contentRect.pivot = new Vector2(0.5f, 0.5f);
-            contentRect.sizeDelta = new Vector2(800, 800);
+            contentRect.anchorMin = Vector2.zero;
+            contentRect.anchorMax = Vector2.one;
+            contentRect.offsetMin = Vector2.zero;
+            contentRect.offsetMax = Vector2.zero;
 
             var layout = _contentRoot.AddComponent<VerticalLayoutGroup>();
-            layout.childControlHeight = true; // Control height to prevent overlap
+            layout.childControlHeight = true;
             layout.childControlWidth = true;
             layout.childForceExpandHeight = false;
             layout.childForceExpandWidth = true;
@@ -191,7 +210,10 @@ namespace TCAMultiplayer.UI
         private void DrawMainMenu()
         {
             UIFactory.CreateNativeText("MULTIPLAYER", _contentRoot.transform, 48);
-            UIFactory.CreateLabelInputRow("Username:", _username, _contentRoot.transform, (val) => _username = val);
+            UIFactory.CreateLabelInputRow("Username:", _username, _contentRoot.transform, (val) => {
+                _username = val;
+                LobbyManager.Instance?.SetLocalPlayerName(val);
+            });
             UIFactory.CreateNativeButton("HOST GAME", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.HostSetup));
             UIFactory.CreateNativeButton("BROWSE LAN", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.Browse));
             UIFactory.CreateNativeButton("DIRECT CONNECT", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.DirectConnect));
@@ -278,6 +300,36 @@ namespace TCAMultiplayer.UI
                 }
             }
 
+            // Mod Sync Status (client only — host always compatible with itself)
+            if (!isHost && lobby != null)
+            {
+                string syncText;
+                switch (lobby.ModSyncStatus)
+                {
+                    case LobbyManager.ModSyncState.Checking:
+                        syncText = "<color=yellow>MOD SYNC: Checking compatibility...</color>";
+                        break;
+                    case LobbyManager.ModSyncState.Compatible:
+                        syncText = "<color=green>MOD SYNC: Compatible \u2713</color>";
+                        break;
+                    case LobbyManager.ModSyncState.Incompatible:
+                        syncText = $"<color=red>MOD SYNC: Incompatible \u2717</color>";
+                        break;
+                    default:
+                        syncText = "<color=#888888>MOD SYNC: Not checked</color>";
+                        break;
+                }
+                UIFactory.CreateNativeText(syncText, _contentRoot.transform, 16);
+
+                // Show detailed error if incompatible
+                if (lobby.ModSyncStatus == LobbyManager.ModSyncState.Incompatible && !string.IsNullOrEmpty(lobby.ModSyncError))
+                {
+                    var errorGroup = UIFactory.CreateVerticalGroup(_contentRoot.transform, 2, 5);
+                    errorGroup.AddComponent<Image>().color = new Color(0.5f, 0, 0, 0.3f);
+                    UIFactory.CreateNativeText($"<color=#FF6666><size=14>{lobby.ModSyncError}</size></color>", errorGroup.transform, 14, TextAlignmentOptions.Left);
+                }
+            }
+
             // Aircraft Selection (Lobby only - not available mid-match)
             var aircraftNames = LoadoutHelper.GetAircraftNames();
             string selectedAircraft = lobby?.LocalSelectedAircraft;
@@ -301,21 +353,14 @@ namespace TCAMultiplayer.UI
                     }
                 }
                 
-                var aircraftDropdown = UIFactory.CreateLabeledDropdown("Aircraft:", aircraftDisplayNames, selectedAircraftIndex, _contentRoot.transform);
-                if (aircraftDropdown != null)
-                {
-                    aircraftDropdown.onValueChanged.AddListener((index) => {
-                        lobby?.SetLocalAircraft(aircraftNames[index]);
-                        // Send aircraft selection to other players
-                        Plugin.Instance.Lobby?.SendAircraftSelect(aircraftNames[index]);
-                        // Also update loadout to default for new aircraft
-                        var defaultLoadout = LoadoutHelper.GetDefaultLoadoutForAircraft(aircraftNames[index]);
-                        lobby?.SetLocalLoadout(defaultLoadout);
-                        // Send loadout selection to other players
-                        Plugin.Instance.Lobby?.SendLoadoutSelect(defaultLoadout);
-                        RefreshUI();
-                    });
-                }
+                UIFactory.CreateLabeledSelector("Aircraft:", aircraftDisplayNames, selectedAircraftIndex, _contentRoot.transform, (index) => {
+                    lobby?.SetLocalAircraft(aircraftNames[index]);
+                    Plugin.Instance.Lobby?.SendAircraftSelect(aircraftNames[index]);
+                    var defaultLoadout = LoadoutHelper.GetDefaultLoadoutForAircraft(aircraftNames[index]);
+                    lobby?.SetLocalLoadout(defaultLoadout);
+                    Plugin.Instance.Lobby?.SendLoadoutSelect(defaultLoadout);
+                    RefreshUI();
+                });
             }
 
             // Loadout Selection
@@ -338,16 +383,11 @@ namespace TCAMultiplayer.UI
                     }
                 }
                 
-                var loadoutDropdown = UIFactory.CreateLabeledDropdown("Loadout:", loadoutNames, selectedLoadoutIndex, _contentRoot.transform);
-                if (loadoutDropdown != null)
-                {
-                    loadoutDropdown.onValueChanged.AddListener((index) => {
-                        lobby?.SetLocalLoadout(loadoutNames[index]);
-                        // Send loadout selection to other players
-                        Plugin.Instance.Lobby?.SendLoadoutSelect(loadoutNames[index]);
-                        RefreshUI();
-                    });
-                }
+                UIFactory.CreateLabeledSelector("Loadout:", loadoutNames, selectedLoadoutIndex, _contentRoot.transform, (index) => {
+                    lobby?.SetLocalLoadout(loadoutNames[index]);
+                    Plugin.Instance.Lobby?.SendLoadoutSelect(loadoutNames[index]);
+                    RefreshUI();
+                });
             }
 
             // Airfield Selection
@@ -372,15 +412,11 @@ namespace TCAMultiplayer.UI
                     }
                 }
                 
-                var airfieldDropdown = UIFactory.CreateLabeledDropdown("Airfield:", airfieldList, selectedAirfieldIndex, _contentRoot.transform);
-                if (airfieldDropdown != null)
-                {
-                    airfieldDropdown.onValueChanged.AddListener((index) => {
-                        lobby?.SetLocalAirfield(airfieldList[index]);
-                        Plugin.Instance.Lobby?.SendAirfieldSelect(airfieldList[index]);
-                        RefreshUI();
-                    });
-                }
+                UIFactory.CreateLabeledSelector("Airfield:", airfieldList, selectedAirfieldIndex, _contentRoot.transform, (index) => {
+                    lobby?.SetLocalAirfield(airfieldList[index]);
+                    Plugin.Instance.Lobby?.SendAirfieldSelect(airfieldList[index]);
+                    RefreshUI();
+                });
             }
 
             // Spawn Type Selection
@@ -388,21 +424,49 @@ namespace TCAMultiplayer.UI
             var currentSpawnType = lobby?.SpawnType ?? LobbySpawnType.Runway;
             int spawnTypeIndex = (int)currentSpawnType;
             
-            var spawnTypeDropdown = UIFactory.CreateLabeledDropdown("Spawn Type:", spawnTypeNames, spawnTypeIndex, _contentRoot.transform);
-            if (spawnTypeDropdown != null)
+            string spawnLabel = isHost ? "Spawn Type:" : "Spawn Type: <size=70%><color=#888888>[HOST]</color></size>";
+            var spawnBtn = UIFactory.CreateLabeledSelector(spawnLabel, spawnTypeNames, spawnTypeIndex, _contentRoot.transform,
+                isHost ? (Action<int>)((index) => {
+                    lobby?.SetSpawnSettings((LobbySpawnType)index);
+                    RefreshUI();
+                }) : null);
+            if (spawnBtn != null && !isHost)
             {
-                if (isHost)
+                spawnBtn.interactable = false;
+            }
+
+            // Time of Day (Host only)
+            var timeNames = new List<string> { "Dawn", "Morning", "Noon", "Afternoon", "Evening", "Night" };
+            var currentTime = lobby?.SelectedTimeOfDay ?? TimeOfDay.Morning;
+            int timeIndex = (int)currentTime;
+            
+            string timeLabel = isHost ? "Time:" : "Time: <size=70%><color=#888888>[HOST]</color></size>";
+            var timeBtn = UIFactory.CreateLabeledSelector(timeLabel, timeNames, timeIndex, _contentRoot.transform,
+                isHost ? (Action<int>)((index) => {
+                    lobby?.SetTimeOfDay((TimeOfDay)index);
+                    RefreshUI();
+                }) : null);
+            if (timeBtn != null && !isHost)
+            {
+                timeBtn.interactable = false;
+            }
+
+            // Aircraft Collisions Toggle (Host only)
+            if (isHost)
+            {
+                var collisionsToggle = UIFactory.CreateLabeledToggle("Aircraft Collisions:", lobby.AircraftCollisionsEnabled, _contentRoot.transform);
+                if (collisionsToggle != null)
                 {
-                    spawnTypeDropdown.onValueChanged.AddListener((index) => {
-                        lobby?.SetSpawnSettings((LobbySpawnType)index);
+                    collisionsToggle.onValueChanged.AddListener((enabled) => {
+                        lobby?.SetAircraftCollisionsEnabled(enabled);
                         RefreshUI();
                     });
                 }
-                else
-                {
-                    // Client sees read-only dropdown
-                    spawnTypeDropdown.interactable = false;
-                }
+            }
+            else
+            {
+                // Client sees read-only label
+                UIFactory.CreateNativeText($"<color=#888888>[HOST]</color> Aircraft Collisions: {(lobby.AircraftCollisionsEnabled ? "<color=green>ON</color>" : "<color=red>OFF</color>")}", _contentRoot.transform, 18);
             }
 
             var spacer = new GameObject("Spacer", typeof(RectTransform), typeof(LayoutElement));

@@ -1,6 +1,8 @@
 using System;
 using UnityEngine;
 using TCAMultiplayer.Game;
+using TCAMultiplayer.ModCompatibility;
+using Cysharp.Threading.Tasks;
 
 namespace TCAMultiplayer.Networking
 {
@@ -78,6 +80,7 @@ namespace TCAMultiplayer.Networking
             // Combat
             _router.RegisterHandler(PacketType.DamageDealt, HandleDamageDealt);
             _router.RegisterHandler(PacketType.MissileLaunch, HandleMissileLaunch);
+            _router.RegisterHandler(PacketType.MissileUpdate, HandleMissileUpdate);
             _router.RegisterHandler(PacketType.BombDrop, HandleBombDrop);
             _router.RegisterHandler(PacketType.CraterSpawn, HandleCraterSpawn);
             _router.RegisterHandler(PacketType.BuildingDestroy, HandleBuildingDestroy);
@@ -86,6 +89,8 @@ namespace TCAMultiplayer.Networking
             _router.RegisterHandler(PacketType.ProjectileImpact, HandleProjectileImpact);
             _router.RegisterHandler(PacketType.KillConfirm, HandleKillConfirm);
             _router.RegisterHandler(PacketType.AircraftCollision, HandleAircraftCollision);
+            _router.RegisterHandler(PacketType.ExplosionSync, HandleExplosionSync);
+            _router.RegisterHandler(PacketType.AircraftDestructionVfx, HandleAircraftDestructionVfx);
 
             // Lobby packets - routed to LobbyManager
             _router.RegisterHandler(PacketType.LobbyState, HandleLobbyState);
@@ -101,6 +106,10 @@ namespace TCAMultiplayer.Networking
             _router.RegisterHandler(PacketType.LobbyLoadingComplete, HandleLobbyLoadingComplete);
             _router.RegisterHandler(PacketType.LobbySpawnPlayers, HandleLobbySpawnPlayers);
             _router.RegisterHandler(PacketType.LobbyRespawnRequest, HandleLobbyRespawnRequest);
+
+            // Mod compatibility packets
+            _router.RegisterHandler(PacketType.ModManifest, HandleModManifest);
+            _router.RegisterHandler(PacketType.ModCompatibilityResult, HandleModCompatibilityResult);
         }
 
         #region Transport Management
@@ -141,6 +150,16 @@ namespace TCAMultiplayer.Networking
         {
             _remoteAircraft.Cleanup();
             Transport?.Disconnect();
+        }
+
+        /// <summary>
+        /// Kick a specific peer without shutting down the host.
+        /// Only works when hosting.
+        /// </summary>
+        public void DisconnectPeer(ulong peerId)
+        {
+            if (!IsHost) return;
+            Transport?.DisconnectPeer(peerId);
         }
 
         public void Update()
@@ -297,18 +316,25 @@ namespace TCAMultiplayer.Networking
             OnPeerDisconnected?.Invoke(peerId);
             Plugin.Instance?.Lobby?.HandlePlayerLeft(peerId);
 
-            // Graceful disconnect: transition GameStateMachine to Disconnected
-            // so the game state is properly reset regardless of current phase
-            var gsm = GameStateMachine.Instance;
-            if (gsm != null && gsm.CurrentState != GameState.Disconnected)
+            // Only tear down the game state if we're a CLIENT that lost the host.
+            // If we're the HOST, a client leaving should NOT kill the server.
+            if (!IsHost)
             {
-                Plugin.Log.LogInfo($"[NetworkManager] Peer disconnected while in state {gsm.CurrentState} — transitioning to Disconnected");
-                gsm.Disconnect();
-            }
+                var gsm = GameStateMachine.Instance;
+                if (gsm != null && gsm.CurrentState != GameState.Disconnected)
+                {
+                    Plugin.Log.LogInfo($"[NetworkManager] Lost connection to host while in state {gsm.CurrentState} — transitioning to Disconnected");
+                    gsm.Disconnect();
+                }
 
-            // Stop LAN discovery broadcasting/listening
-            Plugin.Instance?.Discovery?.StopBroadcasting();
-            Plugin.Instance?.Discovery?.StopListening();
+                // Stop LAN discovery broadcasting/listening
+                Plugin.Instance?.Discovery?.StopBroadcasting();
+                Plugin.Instance?.Discovery?.StopListening();
+            }
+            else
+            {
+                Plugin.Log.LogInfo($"[NetworkManager] Client {peerId} left. Host remains active in state {GameStateMachine.Instance?.CurrentState}");
+            }
         }
 
         private void HandleDataReceived(ulong peerId, byte[] data)
@@ -377,6 +403,16 @@ namespace TCAMultiplayer.Networking
             Patches.WeaponPatches.HandleMissileLaunch(packet);
         }
 
+        private void HandleMissileUpdate(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeMissileUpdate(payload);
+            // Log less frequently to avoid spam
+            if (LogHelper.IsEnabled(LogCategory.Packets))
+                LogHelper.Info(LogCategory.Packets, $"[NetworkManager] Received missile update: id={packet.MissileInstanceId} target={packet.TargetId} track={packet.IsTracking}");
+            Player.RealCombatSync.HandleMissileUpdate(packet);
+        }
+
         private void HandleBombDrop(ulong peerId, byte[] payload)
         {
             if (payload == null) return;
@@ -433,6 +469,22 @@ namespace TCAMultiplayer.Networking
             var packet = PacketSerializer.DeserializeAircraftCollision(payload);
             Plugin.Log.LogInfo($"[NetworkManager] Received aircraft collision: {packet.PlayerA} vs {packet.PlayerB} damage=({packet.DamageA},{packet.DamageB})");
             Player.AircraftCollisionManager.Instance?.HandleCollisionPacket(packet);
+        }
+
+        private void HandleExplosionSync(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeExplosionSync(payload);
+            Plugin.Log.LogInfo($"[NetworkManager] Received explosion sync: {packet.WeaponName} radius={packet.BlastRadius} surface={packet.ImpactSurface} type={packet.ExplosionType}");
+            Patches.ExplosionPatches.HandleExplosionSync(packet);
+        }
+
+        private void HandleAircraftDestructionVfx(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeAircraftDestructionVfx(payload);
+            Plugin.Log.LogInfo($"[NetworkManager] Received aircraft destruction VFX: victim={packet.VictimId} reason={packet.DestructionReason}");
+            Patches.AircraftDestructionPatches.HandleAircraftDestructionVfx(packet);
         }
 
         #endregion
@@ -520,6 +572,10 @@ namespace TCAMultiplayer.Networking
                     new LobbyAircraftSelectPacket { PeerId = LocalPeerId, AircraftName = lobby.LocalSelectedAircraft }), true);
                 SendPacket(PacketType.LoadoutSelect, PacketSerializer.SerializeLobbyLoadoutSelect(
                     new LobbyLoadoutSelectPacket { PeerId = LocalPeerId, LoadoutName = lobby.LocalSelectedLoadout }), true);
+
+                // Send mod manifest to host for compatibility check
+                lobby.SetModSyncChecking();
+                SendModManifest();
             }
         }
 
@@ -616,6 +672,136 @@ namespace TCAMultiplayer.Networking
             var respawnPacket = new AircraftChangedPacket { AircraftType = "" };
             _remoteAircraft.HandleRespawn(packet.PeerId, respawnPacket);
         }
+
+        #region Mod Compatibility Handlers
+
+        // Track pending mod compatibility checks
+        private static System.Collections.Generic.Dictionary<ulong, ModManifest> _pendingModChecks = new System.Collections.Generic.Dictionary<ulong, ModManifest>();
+
+        /// <summary>
+        /// Host receives mod manifest from connecting client.
+        /// LobbyWelcome was already sent in HandlePeerConnected - this just validates mods.
+        /// If incompatible, the host disconnects the client.
+        /// </summary>
+        private void HandleModManifest(ulong peerId, byte[] payload)
+        {
+            if (!IsHost) return; // Only host processes mod manifests
+            if (payload == null) return;
+
+            try
+            {
+                var packet = PacketSerializer.DeserializeModManifest(payload);
+                var clientManifest = ModManifest.Deserialize(packet.ManifestData);
+                
+                Plugin.Log?.LogInfo($"[NetworkManager] Received mod manifest from {peerId}: " +
+                    $"{clientManifest.LoadedPlugins.Count} plugins, " +
+                    $"{clientManifest.GameMods.Count} game mods, " +
+                    $"{clientManifest.CustomContent.Count} content items");
+
+                // Collect host's manifest
+                var hostManifest = ModManifestCollector.CollectManifest();
+
+                // Check compatibility
+                var result = ModManifestCollector.CheckCompatibility(hostManifest, clientManifest);
+
+                // Send result to client
+                var resultPacket = new ModCompatibilityResultPacket
+                {
+                    PeerId = peerId,
+                    IsCompatible = result.IsCompatible,
+                    RejectionReason = result.IsCompatible ? "" : result.GetSummary()
+                };
+                SendPacket(PacketType.ModCompatibilityResult, 
+                    PacketSerializer.SerializeModCompatibilityResult(resultPacket), true);
+
+                if (result.IsCompatible)
+                {
+                    Plugin.Log?.LogInfo($"[NetworkManager] Mod compatibility PASSED for peer {peerId}");
+                    
+                    // Log warnings if any
+                    foreach (var warning in result.Warnings)
+                    {
+                        Plugin.Log?.LogWarning($"[NetworkManager] Mod warning: {warning}");
+                    }
+                }
+                else
+                {
+                    Plugin.Log?.LogWarning($"[NetworkManager] Mod compatibility FAILED for peer {peerId}: {result.GetSummary()}");
+                    
+                    // Kick the incompatible client after a short delay to let them receive the rejection.
+                    // Use DisconnectPeer so the host stays alive and can accept new connections.
+                    UniTask.Create(async () =>
+                    {
+                        await UniTask.Delay(1500);
+                        Plugin.Log?.LogInfo($"[NetworkManager] Kicking incompatible peer {peerId}");
+                        DisconnectPeer(peerId);
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[NetworkManager] Error processing mod manifest: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Client receives mod compatibility result from host
+        /// </summary>
+        private void HandleModCompatibilityResult(ulong peerId, byte[] payload)
+        {
+            if (IsHost) return; // Only clients receive this
+            if (payload == null) return;
+
+            try
+            {
+                var packet = PacketSerializer.DeserializeModCompatibilityResult(payload);
+                
+                if (packet.IsCompatible)
+                {
+                    Plugin.Log?.LogInfo("[NetworkManager] Mod compatibility check passed by host");
+                    Plugin.Instance?.Lobby?.SetModSyncCompatible();
+                }
+                else
+                {
+                    Plugin.Log?.LogError($"[NetworkManager] Mod compatibility check FAILED: {packet.RejectionReason}");
+                    
+                    // Show error to user and disconnect
+                    Plugin.Instance?.Lobby?.ShowModCompatibilityError(packet.RejectionReason);
+                    Disconnect();
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[NetworkManager] Error processing mod compatibility result: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Send mod manifest to host (called by client when connecting)
+        /// </summary>
+        public void SendModManifest()
+        {
+            if (IsHost) return;
+
+            try
+            {
+                var manifest = ModManifestCollector.CollectManifest();
+                var packet = new ModManifestPacket
+                {
+                    PeerId = LocalPeerId,
+                    ManifestData = manifest.Serialize()
+                };
+                
+                Plugin.Log?.LogInfo($"[NetworkManager] Sending mod manifest: {manifest.LoadedPlugins.Count} plugins, {manifest.GameMods.Count} game mods, {manifest.CustomContent.Count} content items");
+                SendPacket(PacketType.ModManifest, PacketSerializer.SerializeModManifest(packet), true);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[NetworkManager] Error sending mod manifest: {ex.Message}");
+            }
+        }
+
+        #endregion
 
         #endregion
     }

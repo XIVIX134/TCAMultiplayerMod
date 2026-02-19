@@ -98,6 +98,9 @@ D:\Tiny.Combat.Arena.v0.14.1.4\TCAMultiplayer\
     │   ├── FloatingOriginHelper.cs # Coordinate system conversion
     │   └── MarkerComponents.cs     # Debug visual markers
     │
+    ├── ModCompatibility\
+    │   └── ModManifestCollector.cs  # Mod/plugin manifest collection & compatibility checking
+    │
     ├── Player\
     │   ├── RemoteAircraftController.cs  # Controls cloned aircraft visuals
     │   └── RemotePlayer.cs              # Remote player data container
@@ -144,6 +147,17 @@ D:\Tiny.Combat.Arena.v0.14.1.4\TCAMultiplayer\
 - [x] RCS curve configuration for radar detection
 - [x] IR signature configuration for heat seekers
 - [x] Damageable component setup
+
+### Phase 5b: Mod Compatibility Sync (COMPLETE)
+- [x] ModManifestCollector: Collects BepInEx plugins, TCA game mods (Mods/ folder), and all game content
+- [x] ModManifest serialization/deserialization for network transmission
+- [x] CompatibilityResult with strict checking (game mods, content) and warnings (non-TCAMultiplayer plugins)
+- [x] Connection flow: Client sends manifest after LobbyWelcome → Host checks → sends result
+- [x] LobbyManager ModSyncState tracking (NotChecked/Checking/Compatible/Incompatible)
+- [x] Lobby UI shows mod sync status with colored indicators (client side)
+- [x] Detailed error display when mods are incompatible
+- [x] Auto-disconnect on incompatibility (with delay for client to see reason)
+- [x] ModManifestCollector.Initialize() called at plugin startup
 
 ### Phase 5: Death & Respawn (IN PROGRESS)
 - [x] Aircraft destroyed notification

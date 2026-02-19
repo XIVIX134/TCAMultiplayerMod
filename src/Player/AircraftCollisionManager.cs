@@ -118,6 +118,9 @@ namespace TCAMultiplayer.Player
             // Only host runs collision detection
             if (!GameStateMachine.Instance?.IsHost ?? true) return;
 
+            // Check if aircraft collisions are enabled
+            if (!LobbyManager.Instance?.AircraftCollisionsEnabled ?? false) return;
+
             // Need local aircraft and remote manager
             if (_localAircraft == null || _remoteAircraftManager == null) return;
 

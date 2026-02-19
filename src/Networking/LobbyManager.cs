@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Falcon.World;
 using UnityEngine;
 
 namespace TCAMultiplayer.Networking
@@ -22,6 +23,8 @@ namespace TCAMultiplayer.Networking
         public bool GameStarted { get; private set; }
         public bool GameLoading { get; private set; }
         public bool SoloModeEnabled { get; set; } = true;
+        public bool AircraftCollisionsEnabled { get; private set; } = true;
+        public TimeOfDay SelectedTimeOfDay { get; private set; } = TimeOfDay.Morning;
 
         // Players
         private Dictionary<ulong, LobbyPlayerInfo> _players = new Dictionary<ulong, LobbyPlayerInfo>();
@@ -36,6 +39,18 @@ namespace TCAMultiplayer.Networking
         public bool LocalIsReady { get; private set; }
         public bool LocalIsLoaded { get; private set; }
 
+        // Mod sync state
+        public enum ModSyncState
+        {
+            NotChecked,
+            Checking,
+            Compatible,
+            Incompatible
+        }
+
+        public ModSyncState ModSyncStatus { get; private set; } = ModSyncState.NotChecked;
+        public string ModSyncError { get; private set; } = "";
+
         // Events
         public event Action OnLobbyStateChanged;
         public event Action<ulong, string> OnPlayerJoined;
@@ -45,6 +60,7 @@ namespace TCAMultiplayer.Networking
         public event Action OnGameStarting;
         public event Action OnAllPlayersLoaded;
         public event Action OnSpawnPlayers;
+        public event Action<string> OnModCompatibilityError;
 
         // Random name generator
         private static readonly string[] _adjectives = { "Red", "Blue", "Swift", "Ace", "Wild", "Iron", "Shadow", "Storm", "Thunder", "Ghost" };
@@ -71,6 +87,24 @@ namespace TCAMultiplayer.Networking
             string noun = _nouns[_random.Next(_nouns.Length)];
             int num = _random.Next(1, 100);
             return $"{adj}{noun}{num}";
+        }
+
+        /// <summary>
+        /// Set the local player's display name
+        /// </summary>
+        public void SetLocalPlayerName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return;
+            LocalPlayerName = name;
+
+            // Update in player dict if already in lobby
+            if (_players.ContainsKey(LocalPeerId))
+            {
+                _players[LocalPeerId].PlayerName = name;
+            }
+
+            Plugin.Log?.LogInfo($"[LobbyManager] Username set to: {name}");
+            OnLobbyStateChanged?.Invoke();
         }
 
         /// <summary>
@@ -139,6 +173,8 @@ namespace TCAMultiplayer.Networking
         {
             GameStarted = false;
             GameLoading = false;
+            ModSyncStatus = ModSyncState.NotChecked;
+            ModSyncError = "";
             _players.Clear();
 
             Plugin.Log?.LogInfo("[LobbyManager] Left lobby");
@@ -157,6 +193,8 @@ namespace TCAMultiplayer.Networking
             SpawnType = packet.SpawnType;
             GameStarted = packet.GameStarted;
             GameLoading = packet.GameLoading;
+            AircraftCollisionsEnabled = packet.AircraftCollisionsEnabled;
+            SelectedTimeOfDay = packet.TimeOfDay;
 
             // Update player list
             var newPlayers = new Dictionary<ulong, LobbyPlayerInfo>();
@@ -407,6 +445,27 @@ namespace TCAMultiplayer.Networking
         }
 
         /// <summary>
+        /// Set aircraft collisions enabled (host only)
+        /// </summary>
+        public void SetAircraftCollisionsEnabled(bool enabled)
+        {
+            if (!IsHost) return;
+
+            AircraftCollisionsEnabled = enabled;
+            Plugin.Log?.LogInfo($"[LobbyManager] Aircraft collisions: {enabled}");
+            OnLobbyStateChanged?.Invoke();
+        }
+
+        public void SetTimeOfDay(TimeOfDay timeOfDay)
+        {
+            if (!IsHost) return;
+
+            SelectedTimeOfDay = timeOfDay;
+            Plugin.Log?.LogInfo($"[LobbyManager] Time of day: {timeOfDay}");
+            OnLobbyStateChanged?.Invoke();
+        }
+
+        /// <summary>
         /// Start the game (host only)
         /// </summary>
         public void StartGame()
@@ -518,6 +577,8 @@ namespace TCAMultiplayer.Networking
                 SpawnType = SpawnType,
                 GameStarted = GameStarted,
                 GameLoading = GameLoading,
+                AircraftCollisionsEnabled = AircraftCollisionsEnabled,
+                TimeOfDay = SelectedTimeOfDay,
                 Players = _players.Values.ToArray()
             };
         }
@@ -761,6 +822,39 @@ namespace TCAMultiplayer.Networking
         }
 
         /// <summary>
+        /// Show mod compatibility error (called by NetworkManager when host rejects)
+        /// </summary>
+        public void ShowModCompatibilityError(string reason)
+        {
+            ModSyncStatus = ModSyncState.Incompatible;
+            ModSyncError = reason ?? "Unknown compatibility error";
+            Plugin.Log?.LogError($"[LobbyManager] Mod compatibility error: {ModSyncError}");
+            OnModCompatibilityError?.Invoke(ModSyncError);
+            OnLobbyStateChanged?.Invoke();
+        }
+
+        /// <summary>
+        /// Mark mod sync as checking (called when client sends manifest)
+        /// </summary>
+        public void SetModSyncChecking()
+        {
+            ModSyncStatus = ModSyncState.Checking;
+            ModSyncError = "";
+            OnLobbyStateChanged?.Invoke();
+        }
+
+        /// <summary>
+        /// Mark mod sync as compatible (called when host approves)
+        /// </summary>
+        public void SetModSyncCompatible()
+        {
+            ModSyncStatus = ModSyncState.Compatible;
+            ModSyncError = "";
+            Plugin.Log?.LogInfo("[LobbyManager] Mod sync: Compatible!");
+            OnLobbyStateChanged?.Invoke();
+        }
+
+        /// <summary>
         /// Broadcast lobby state to all clients (host calls this periodically)
         /// Only sends if state has changed since last broadcast.
         /// </summary>
@@ -788,6 +882,8 @@ namespace TCAMultiplayer.Networking
                 hash = hash * 31 + (int)SpawnType;
                 hash = hash * 31 + (GameStarted ? 1 : 0);
                 hash = hash * 31 + (GameLoading ? 1 : 0);
+                hash = hash * 31 + (AircraftCollisionsEnabled ? 1 : 0);
+                hash = hash * 31 + (int)SelectedTimeOfDay;
                 hash = hash * 31 + _players.Count;
 
                 foreach (var kvp in _players)

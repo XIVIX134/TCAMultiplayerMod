@@ -140,6 +140,35 @@ namespace TCAMultiplayer.Networking
             Plugin.Log.LogInfo("DirectTransport: Disconnected");
         }
 
+        public void DisconnectPeer(ulong peerId)
+        {
+            if (!_isRunning || !_isHost) return;
+
+            // Send disconnect message to the peer
+            if (_isConnected && _remoteEndPoint != null)
+            {
+                try
+                {
+                    SendRaw(new byte[] { MSG_DISCONNECT }, _remoteEndPoint);
+                }
+                catch { }
+            }
+
+            // Reset connection state but keep the host socket alive
+            _isConnected = false;
+            _remoteEndPoint = null;
+
+            lock (_reliableLock)
+            {
+                _pendingAcks.Clear();
+                _receivedSequences.Clear();
+                _nextSequenceNumber = 1;
+            }
+
+            Plugin.Log.LogInfo($"DirectTransport: Kicked peer {peerId}, host still listening");
+            OnPeerDisconnected?.Invoke(peerId);
+        }
+
         public void Send(byte[] data, bool reliable = true)
         {
             if (!_isConnected || _remoteEndPoint == null)
@@ -339,6 +368,15 @@ namespace TCAMultiplayer.Networking
                 ulong peerId = _isHost ? CLIENT_ID : HOST_ID;
                 _isConnected = false;
                 _remoteEndPoint = null;
+
+                // Reset reliable state so next connection starts fresh
+                lock (_reliableLock)
+                {
+                    _pendingAcks.Clear();
+                    _receivedSequences.Clear();
+                    _nextSequenceNumber = 1;
+                }
+
                 OnPeerDisconnected?.Invoke(peerId);
             }
         }
@@ -354,7 +392,14 @@ namespace TCAMultiplayer.Networking
                 case MSG_CONNECT:
                     if (_isHost && !_isConnected)
                     {
-                        // Accept connection
+                        // Accept connection — reset reliable state for the new peer
+                        lock (_reliableLock)
+                        {
+                            _pendingAcks.Clear();
+                            _receivedSequences.Clear();
+                            _nextSequenceNumber = 1;
+                        }
+
                         _remoteEndPoint = sender;
                         _isConnected = true;
                         _lastPongTime = UnityEngine.Time.time; // Initialize keepalive
@@ -385,6 +430,14 @@ namespace TCAMultiplayer.Networking
                         ulong peerId = _isHost ? CLIENT_ID : HOST_ID;
                         _isConnected = false;
                         _remoteEndPoint = null;
+
+                        // Reset reliable state so next connection starts fresh
+                        lock (_reliableLock)
+                        {
+                            _pendingAcks.Clear();
+                            _receivedSequences.Clear();
+                            _nextSequenceNumber = 1;
+                        }
 
                         Plugin.Log.LogInfo("DirectTransport: Peer disconnected");
                         OnPeerDisconnected?.Invoke(peerId);

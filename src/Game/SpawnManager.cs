@@ -329,17 +329,46 @@ namespace TCAMultiplayer.Game
 
                 Plugin.Log?.LogInfo($"[SpawnManager] Spawning {aircraftName} at ({position.x:F0}, {position.y:F0}, {position.z:F0}) with loadout: {loadoutName}");
 
+                // Get a valid ammo belt for this aircraft, or empty string to keep the default
+                // CRITICAL: Passing a belt name that doesn't exist (e.g. "Mixed" for F4E/Kestrel)
+                // causes LoadAmmoBelt to set Gun.AmmoBelt = null, which crashes gun firing with NullRef.
+                // Only AV8B has a "Mixed" belt defined. Empty string causes LoadAmmoBelt to return early,
+                // preserving the default AmmoBelt created in the Gun2 constructor.
+                string ammoBelt = "";
+                try
+                {
+                    var getDefaultBeltMethod = Type.GetType("Falcon.GameDataLoadouts, Assembly-CSharp")
+                        ?.GetMethod("GetDefaultAmmoBeltName", BindingFlags.Public | BindingFlags.Static);
+                    if (getDefaultBeltMethod != null)
+                    {
+                        var defaultBelt = getDefaultBeltMethod.Invoke(null, new object[] { aircraftName }) as string;
+                        if (!string.IsNullOrEmpty(defaultBelt))
+                        {
+                            ammoBelt = defaultBelt;
+                            Plugin.Log?.LogInfo($"[SpawnManager] Using default ammo belt for {aircraftName}: '{ammoBelt}'");
+                        }
+                        else
+                        {
+                            Plugin.Log?.LogInfo($"[SpawnManager] No ammo belts defined for {aircraftName}, using default gun ammo");
+                        }
+                    }
+                }
+                catch (Exception beltEx)
+                {
+                    Plugin.Log?.LogWarning($"[SpawnManager] Could not get default ammo belt: {beltEx.Message}");
+                }
+
                 _spawnPlayerAtPositionMethod.Invoke(flightGame, new object[]
                 {
                     aircraftName,
                     position,
                     rotation,
                     loadoutName, // Use selected loadout
-                    "Mixed",    // Ammo belt
+                    ammoBelt,   // Ammo belt - empty string keeps Gun2 constructor default
                     isGrounded,
                     faction,
-                    true,       // Is player
-                    1           // Skin index
+                    false,      // inNavMode - false to start in combat mode (guns ready)
+                    1           // count
                 });
 
                 IsSpawned = true;
@@ -400,7 +429,8 @@ namespace TCAMultiplayer.Game
             }
 
             IsSpawned = false;
-            return SpawnPlayerAtAirfield(SpawnedAirfield, "AV8B", SpawnedType);
+            string aircraft = Plugin.Instance?.Lobby?.LocalSelectedAircraft ?? "AV8B";
+            return SpawnPlayerAtAirfield(SpawnedAirfield, aircraft, SpawnedType);
         }
 
         /// <summary>

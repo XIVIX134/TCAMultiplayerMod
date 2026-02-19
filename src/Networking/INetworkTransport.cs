@@ -34,9 +34,15 @@ namespace TCAMultiplayer.Networking
         void Connect(string address, int port);
         
         /// <summary>
-        /// Disconnect from current session
+        /// Disconnect from current session (tears down entire transport)
         /// </summary>
         void Disconnect();
+        
+        /// <summary>
+        /// Disconnect a specific peer without shutting down the transport.
+        /// Used by the host to kick a client while keeping the server alive.
+        /// </summary>
+        void DisconnectPeer(ulong peerId);
         
         /// <summary>
         /// Send data to the connected peer(s)

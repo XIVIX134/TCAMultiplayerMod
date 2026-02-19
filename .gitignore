@@ -6,6 +6,6 @@ BepInEx/
 *.log
 *.tmp
 plans/AIRCRAFT_COLLISION_PLAN.md
-TinyCombatArena[Host]/
-TinyCombatArena[Client]/
+TinyCombatArena\[Host\]/
+TinyCombatArena\[Client\]/
 Decompiled/

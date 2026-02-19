@@ -25,9 +25,9 @@ namespace TCAMultiplayer.UI
         private int _selectedLoadoutIndex = 0;
         private string[] _loadoutNames = new string[0];
 
-        // Dropdowns
-        private TMP_Dropdown _loadoutDropdown;
-        private TMP_Dropdown _airfieldDropdown;
+        // Selector buttons (replaced TMP_Dropdown with native popup selectors)
+        private Button _loadoutSelector;
+        private Button _airfieldSelector;
 
         // Events
         public event Action<string, LobbySpawnType> OnRespawnRequested;
@@ -84,8 +84,8 @@ namespace TCAMultiplayer.UI
                 Destroy(_canvas);
                 _canvas = null;
                 _contentRoot = null;
-                _loadoutDropdown = null;
-                _airfieldDropdown = null;
+                _loadoutSelector = null;
+                _airfieldSelector = null;
 
                 // Re-lock cursor for flight mode
                 Cursor.lockState = CursorLockMode.Locked;
@@ -143,7 +143,7 @@ namespace TCAMultiplayer.UI
             // Semi-transparent background
             var bg = new GameObject("Background", typeof(RectTransform), typeof(Image));
             bg.transform.SetParent(_canvas.transform, false);
-            bg.GetComponent<Image>().color = new Color(0, 0, 0, 0.75f);
+            bg.GetComponent<Image>().color = new Color(0, 0, 0, 0.85f);
             var bgRect = bg.GetComponent<RectTransform>();
             bgRect.anchorMin = Vector2.zero;
             bgRect.anchorMax = Vector2.one;
@@ -167,9 +167,10 @@ namespace TCAMultiplayer.UI
             layout.padding = new RectOffset(40, 40, 30, 30);
             layout.childAlignment = TextAnchor.UpperCenter;
 
-            // Panel background
+            // Panel background (matching native QMB panel style)
             var panelBg = _contentRoot.AddComponent<Image>();
-            panelBg.color = new Color(0.08f, 0.08f, 0.12f, 0.95f);
+            panelBg.color = UIFactory.GetPanelFillColor();
+            UIFactory.AddGreenBorder(_contentRoot);
 
             // Title
             UIFactory.CreateNativeText("AIRCRAFT DESTROYED", _contentRoot.transform, 36);
@@ -212,17 +213,13 @@ namespace TCAMultiplayer.UI
             if (_loadoutNames.Length > 0)
             {
                 var loadoutOptions = new List<string>(_loadoutNames);
-                _loadoutDropdown = UIFactory.CreateLabeledDropdown("Loadout:", loadoutOptions, _selectedLoadoutIndex, _contentRoot.transform);
-                if (_loadoutDropdown != null)
-                {
-                    _loadoutDropdown.onValueChanged.AddListener((index) => {
-                        _selectedLoadoutIndex = index;
-                        if (_loadoutNames.Length > index)
-                        {
-                            Plugin.Instance?.Lobby?.SetLocalLoadout(_loadoutNames[index]);
-                        }
-                    });
-                }
+                _loadoutSelector = UIFactory.CreateLabeledSelector("Loadout:", loadoutOptions, _selectedLoadoutIndex, _contentRoot.transform, (index) => {
+                    _selectedLoadoutIndex = index;
+                    if (_loadoutNames.Length > index)
+                    {
+                        Plugin.Instance?.Lobby?.SetLocalLoadout(_loadoutNames[index]);
+                    }
+                });
             }
             else
             {
@@ -236,17 +233,13 @@ namespace TCAMultiplayer.UI
             if (_airfieldNames.Length > 0)
             {
                 var airfieldOptions = new List<string>(_airfieldNames);
-                _airfieldDropdown = UIFactory.CreateLabeledDropdown("Airfield:", airfieldOptions, _selectedAirfieldIndex, _contentRoot.transform);
-                if (_airfieldDropdown != null)
-                {
-                    _airfieldDropdown.onValueChanged.AddListener((index) => {
-                        _selectedAirfieldIndex = index;
-                        if (_airfieldNames.Length > index)
-                        {
-                            Plugin.Instance?.Lobby?.SetLocalAirfield(_airfieldNames[index]);
-                        }
-                    });
-                }
+                _airfieldSelector = UIFactory.CreateLabeledSelector("Airfield:", airfieldOptions, _selectedAirfieldIndex, _contentRoot.transform, (index) => {
+                    _selectedAirfieldIndex = index;
+                    if (_airfieldNames.Length > index)
+                    {
+                        Plugin.Instance?.Lobby?.SetLocalAirfield(_airfieldNames[index]);
+                    }
+                });
             }
             else
             {
@@ -261,10 +254,10 @@ namespace TCAMultiplayer.UI
             var spawnTypeNames = new List<string> { "Air (300m)", "Runway", "Ramp" };
             int spawnTypeIndex = (int)currentSpawnType;
             
-            var spawnTypeDropdown = UIFactory.CreateLabeledDropdown("Spawn Type:", spawnTypeNames, spawnTypeIndex, _contentRoot.transform);
-            if (spawnTypeDropdown != null)
+            var spawnBtn = UIFactory.CreateLabeledSelector("Spawn Type:", spawnTypeNames, spawnTypeIndex, _contentRoot.transform, null);
+            if (spawnBtn != null)
             {
-                spawnTypeDropdown.interactable = false; // Read-only
+                spawnBtn.interactable = false; // Read-only
             }
 
             // Spacer

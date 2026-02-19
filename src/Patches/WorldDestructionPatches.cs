@@ -17,6 +17,9 @@ namespace TCAMultiplayer.Patches
         private static Type _craterSizeType;
         private static Type _buildingType;
 
+        // Building.IsDestroyed property — used to skip already-destroyed buildings in the search
+        private static PropertyInfo _buildingIsDestroyedProp;
+
         // CraterSize enum values
         private const byte CRATER_SIZE_SMALL = 0;
         private const byte CRATER_SIZE_MEDIUM = 1;
@@ -26,6 +29,13 @@ namespace TCAMultiplayer.Patches
 
         // Track if we're processing a network event (to avoid echo)
         private static bool _isProcessingNetworkEvent = false;
+
+        /// <summary>
+        /// Allow sibling patches (e.g. ExplosionPatches.TrySpawnCraterForExplosion) to
+        /// set the processing flag so that SpawnCraterPostfix treats their SpawnCrater
+        /// calls as network events and does NOT echo a CraterSpawn packet back.
+        /// </summary>
+        public static void SetProcessingFlag(bool value) { _isProcessingNetworkEvent = value; }
 
         /// <summary>
         /// Apply Harmony patches manually with proper type resolution.
@@ -71,7 +81,12 @@ namespace TCAMultiplayer.Patches
                 else
                 {
                     Plugin.Log?.LogInfo($"[WorldDestruction] Building type found");
-                    
+
+                    // Cache IsDestroyed property for skipping already-destroyed buildings in HandleBuildingDestroy
+                    _buildingIsDestroyedProp = _buildingType.GetProperty("IsDestroyed",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    Plugin.Log?.LogInfo($"[WorldDestruction] Building.IsDestroyed property: {(_buildingIsDestroyedProp != null ? "found" : "NOT FOUND")}");
+
                     // Patch Building.DestroyBuilding
                     var destroyBuildingMethod = _buildingType.GetMethod("DestroyBuilding", BindingFlags.Public | BindingFlags.Instance);
                     if (destroyBuildingMethod != null)
@@ -124,6 +139,14 @@ namespace TCAMultiplayer.Patches
                 Plugin.Instance.Network.SendPacket(PacketType.CraterSpawn, data, reliable: true);
 
                 Plugin.Log?.LogInfo($"[WorldDestruction] Sent crater spawn at ({absolutePos.x:F1}, {absolutePos.y:F1}, {absolutePos.z:F1}) size={craterSizeByte}");
+
+                // For huge craters (nukes from modded weapons), also send an explosion VFX packet.
+                // The nuke bypasses Munition.Explode() and Explosion.Trigger() entirely, so this
+                // is the only reliable interception point for its visual effect.
+                if (craterSizeByte >= CRATER_SIZE_HUGE)
+                {
+                    ExplosionPatches.SendExplosionSyncForNukeCrater(position);
+                }
             }
             catch (Exception ex)
             {
@@ -239,23 +262,36 @@ namespace TCAMultiplayer.Patches
                 _isProcessingNetworkEvent = true;
                 try
                 {
-                    // Find building by position (since InstanceID won't match across clients)
-                    // Look for buildings near the position
+                // Find building by position (since InstanceID won't match across clients).
+                    // Skip already-destroyed buildings so we always match the correct live one,
+                    // even when multiple buildings explode in quick succession near each other.
                     var buildings = UnityEngine.Object.FindObjectsOfType(_buildingType);
                     MonoBehaviour closestBuilding = null;
-                    float closestDist = 50f; // Max 50m distance
+                    float closestDist = 100f; // Max 100m distance — increased from 50m for robustness
 
                     foreach (var building in buildings)
                     {
                         var mb = building as MonoBehaviour;
-                        if (mb != null)
+                        if (mb == null) continue;
+
+                        // Skip buildings that are already destroyed — they are no longer valid targets.
+                        // Without this check, an already-destroyed building that happens to be the
+                        // closest match would "absorb" the packet while the intended building is missed.
+                        if (_buildingIsDestroyedProp != null)
                         {
-                            float dist = Vector3.Distance(mb.transform.position, localPos);
-                            if (dist < closestDist)
+                            try
                             {
-                                closestDist = dist;
-                                closestBuilding = mb;
+                                bool alreadyDestroyed = (bool)_buildingIsDestroyedProp.GetValue(mb);
+                                if (alreadyDestroyed) continue;
                             }
+                            catch { /* if reflection fails, include the building anyway */ }
+                        }
+
+                        float dist = Vector3.Distance(mb.transform.position, localPos);
+                        if (dist < closestDist)
+                        {
+                            closestDist = dist;
+                            closestBuilding = mb;
                         }
                     }
 

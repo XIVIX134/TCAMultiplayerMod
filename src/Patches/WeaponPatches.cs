@@ -52,6 +52,12 @@ namespace TCAMultiplayer.Patches
         private static PropertyInfo _munitionHasSeekerProp = null;
         private static FieldInfo _munitionVelocityField = null;
 
+        // ===== NUKE EFFECT PATH CACHE =====
+        // Populated in SendBombDropFromPolling when the bomb's StoreData.Effects.Ground path is read.
+        // Consumed by ExplosionPatches.SendExplosionSyncForNukeCrater to fill EffectPath in the packet.
+        public static string LastNukeGroundEffectPath = "";
+        public static string LastNukeAirEffectPath = "";
+
         /// <summary>
         /// Get the local player's peer ID
         /// </summary>
@@ -173,13 +179,17 @@ namespace TCAMultiplayer.Patches
 
                     int instanceId = (missile as UnityEngine.Object)?.GetInstanceID() ?? missile.GetHashCode();
 
-                    // Already processed this missile
-                    if (_processedMissileIds.Contains(instanceId)) continue;
-
-                    _processedMissileIds.Add(instanceId);
-
                     // Check if this missile belongs to the LOCAL player (not a remote clone or network missile)
                     if (!IsLocalPlayerMissile(missile)) continue;
+
+                    // If we already processed this missile, just poll its target state
+                    if (_processedMissileIds.Contains(instanceId))
+                    {
+                        PollMissileTargetUpdate(missile, instanceId);
+                        continue;
+                    }
+
+                    _processedMissileIds.Add(instanceId);
 
                     // NEW LOCAL MISSILE DETECTED — send launch packet
                     Plugin.Log?.LogInfo($"[WeaponPatches] POLL: New local missile detected! InstanceId={instanceId}");
@@ -192,6 +202,64 @@ namespace TCAMultiplayer.Patches
             {
                 if (LogHelper.ShouldLogInterval("WeaponPatches.PollMissiles.Error", 5f))
                     Plugin.Log?.LogError($"[WeaponPatches] PollMissileLaunches error: {ex.Message}");
+            }
+        }
+
+        // Keep track of the last sent target ID for each missile
+        private static Dictionary<int, ulong> _missileLastTarget = new Dictionary<int, ulong>();
+        
+        private static void PollMissileTargetUpdate(object missile, int instanceId)
+        {
+            try
+            {
+                var munition = missile as MonoBehaviour;
+                if (munition == null) return;
+
+                // Get the Target field from Munition to check if there's an actual target
+                var targetField = munition.GetType().GetField("Target", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (targetField == null) return;
+                
+                var target = targetField.GetValue(missile);
+                ulong currentTargetId = 0;
+                bool isTracking = false;
+                
+                if (target != null)
+                {
+                    // Target is present
+                    currentTargetId = GetRemotePlayerId(); // Assume the target is the remote player
+                    isTracking = true;
+                }
+                
+                // Compare with last sent state
+                ulong lastTargetId = 0;
+                if (_missileLastTarget.TryGetValue(instanceId, out ulong lastId))
+                {
+                    lastTargetId = lastId;
+                }
+                
+                if (currentTargetId != lastTargetId)
+                {
+                    // Target has changed (e.g. acquired lock mid-flight or lost lock)
+                    _missileLastTarget[instanceId] = currentTargetId;
+                    
+                    var packet = new MissileUpdatePacket
+                    {
+                        ShooterId = GetLocalPlayerId(),
+                        MissileInstanceId = instanceId,
+                        TargetId = currentTargetId,
+                        IsTracking = isTracking
+                    };
+
+                    byte[] data = PacketSerializer.SerializeMissileUpdate(packet);
+                    Plugin.Instance.Network.SendPacket(PacketType.MissileUpdate, data, reliable: true);
+
+                    Plugin.Log?.LogInfo($"[WeaponPatches] POLL: Sent missile update: InstanceId={instanceId}, TargetId={currentTargetId}, Tracking={isTracking}");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (LogHelper.ShouldLogInterval("WeaponPatches.PollMissiles.UpdateError", 5f))
+                    Plugin.Log?.LogWarning($"[WeaponPatches] PollMissileTargetUpdate error: {ex.Message}");
             }
         }
 
@@ -392,7 +460,8 @@ namespace TCAMultiplayer.Patches
                     LaunchPosZ = absoluteLaunchPos.z,
                     LaunchDirX = launchDir.x,
                     LaunchDirY = launchDir.y,
-                    LaunchDirZ = launchDir.z
+                    LaunchDirZ = launchDir.z,
+                    MissileInstanceId = (missile as UnityEngine.Object)?.GetInstanceID() ?? missile.GetHashCode()
                 };
 
                 byte[] data2 = PacketSerializer.SerializeMissileLaunch(packet);
@@ -544,7 +613,7 @@ namespace TCAMultiplayer.Patches
 
                 var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
 
-                // Get bomb name
+                // Get bomb name AND cache nuke effect paths from StoreData.Effects.*
                 string bombName = munition.gameObject.name;
                 if (_munitionDataProp != null)
                 {
@@ -557,6 +626,10 @@ namespace TCAMultiplayer.Patches
                         {
                             bombName = displayNameProp.GetValue(data) as string ?? bombName;
                         }
+
+                        // Cache the nuke's VFX asset paths so SendExplosionSyncForNukeCrater
+                        // can send the correct EffectPath to the remote client.
+                        TryCacheNukeEffectPaths(data);
                     }
                 }
 
@@ -879,6 +952,97 @@ namespace TCAMultiplayer.Patches
             }
             catch { }
             return null;
+        }
+
+        /// <summary>
+        /// Try to read StoreData.Effects.Ground (and .Air) from a bomb's StoreData object and
+        /// cache the asset paths in LastNukeGroundEffectPath / LastNukeAirEffectPath.
+        ///
+        /// Works for both vanilla (Effects.Ground is a GameObject reference) and Tiny Weapon Shop
+        /// (Effects.Ground is a string like "assets/tws/fx/20ktblast.prefab").
+        /// Only updates the cache when a non-empty path is found, so vanilla bombs (which have
+        /// no modded nuke prefab) leave the cache unchanged.
+        /// </summary>
+        private static void TryCacheNukeEffectPaths(object storeData)
+        {
+            if (storeData == null) return;
+            try
+            {
+                var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+                var dataType = storeData.GetType();
+
+                // Locate the Effects sub-object — TWS names it "Effects"; vanilla may differ
+                object effects = null;
+                foreach (var memberName in new[] { "Effects", "WeaponEffects", "ExplosionEffects", "WeaponEffect" })
+                {
+                    var prop = dataType.GetProperty(memberName, flags);
+                    if (prop != null) { effects = prop.GetValue(storeData); break; }
+                    var field = dataType.GetField(memberName, flags);
+                    if (field != null) { effects = field.GetValue(storeData); break; }
+                }
+
+                if (effects == null) return;
+
+                var effectsType = effects.GetType();
+
+                string groundPath = GetStringMemberValue(effects, effectsType, flags, "Ground");
+                string airPath    = GetStringMemberValue(effects, effectsType, flags, "Air");
+
+                if (!string.IsNullOrEmpty(groundPath))
+                {
+                    LastNukeGroundEffectPath = groundPath;
+                    Plugin.Log?.LogInfo($"[WeaponPatches] Cached nuke ground effect path: '{groundPath}'");
+                }
+
+                if (!string.IsNullOrEmpty(airPath))
+                {
+                    LastNukeAirEffectPath = airPath;
+                    Plugin.Log?.LogInfo($"[WeaponPatches] Cached nuke air effect path: '{airPath}'");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[WeaponPatches] TryCacheNukeEffectPaths error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Read a named property or field from an object and return its value as a string.
+        /// Handles three cases:
+        ///   1. Member value is already a string  → return as-is
+        ///   2. Member value is a UnityEngine.Object → GetIdentifier() for bundle-aware path
+        ///   3. Member value is anything else     → .ToString() (last resort)
+        /// Returns null / empty if the member does not exist or the value is null.
+        /// </summary>
+        private static string GetStringMemberValue(object obj, Type type, BindingFlags flags, string name)
+        {
+            object value = null;
+
+            var prop = type.GetProperty(name, flags);
+            if (prop != null)
+            {
+                try { value = prop.GetValue(obj); } catch { return null; }
+            }
+            else
+            {
+                var field = type.GetField(name, flags);
+                if (field != null)
+                {
+                    try { value = field.GetValue(obj); } catch { return null; }
+                }
+            }
+
+            if (value == null) return null;
+            if (value is string s) return s;
+
+            // Unity object (e.g. vanilla WeaponEffectProperties stores a GameObject reference)
+            var unityObj = value as UnityEngine.Object;
+            if (unityObj != null)
+                return UniversalAssetFinder.GetIdentifier(unityObj);
+
+            // Last resort: use ToString() but skip type names (not useful)
+            string str = value.ToString();
+            return (string.IsNullOrEmpty(str) || str == value.GetType().FullName) ? null : str;
         }
 
         /// <summary>

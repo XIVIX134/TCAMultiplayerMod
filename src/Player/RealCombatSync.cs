@@ -50,6 +50,16 @@ namespace TCAMultiplayer.Player
         // Target system
         private static Type _targetType;
 
+        // Gun/Aircraft data for multi-type bullet sync
+        private static Type _gameDataAircraftType;
+        private static MethodInfo _getAircraftDataMethod;
+        private static Type _uniAircraftDataType;
+        private static FieldInfo _aircraftDataGunField;
+        private static Type _gunDataType;
+        private static PropertyInfo _gunBulletProperty;
+        private static PropertyInfo _gunMuzzleVelocityProperty;
+        private static bool _gunDataReflectionInitialized = false;
+
         // Tracked network missiles (for cleanup)
         private static List<object> _networkMissiles = new List<object>();
 
@@ -161,6 +171,9 @@ namespace TCAMultiplayer.Player
                 // Target
                 _targetType = ReflectionHelper.GetGameType("Falcon.Targeting.Target");
 
+                // Initialize gun data reflection for multi-type bullet sync
+                InitializeGunDataReflection();
+
                 _initialized = true;
                 Plugin.Log?.LogInfo("[RealCombatSync] Initialization complete");
             }
@@ -168,6 +181,163 @@ namespace TCAMultiplayer.Player
             {
                 Plugin.Log?.LogError($"[RealCombatSync] Initialize error: {ex.Message}\n{ex.StackTrace}");
                 _initialized = true; // Don't retry
+            }
+        }
+
+        /// <summary>
+        /// Initialize reflection for looking up gun/bullet data per aircraft type.
+        /// This enables firing the correct bullet type for each aircraft (M61, GAU12, etc.)
+        /// </summary>
+        private static void InitializeGunDataReflection()
+        {
+            if (_gunDataReflectionInitialized) return;
+            _gunDataReflectionInitialized = true;
+
+            try
+            {
+                var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+                // GameDataAircraft for looking up aircraft data by name
+                _gameDataAircraftType = Type.GetType("Falcon.GameDataAircraft, Assembly-CSharp");
+                if (_gameDataAircraftType != null)
+                {
+                    _getAircraftDataMethod = _gameDataAircraftType.GetMethod("GetByName", flags);
+                    Plugin.Log?.LogInfo($"[RealCombatSync] GunData reflection: GameDataAircraft.GetByName={_getAircraftDataMethod != null}");
+                }
+
+                // UniAircraftData (the Data property on UniAircraft)
+                _uniAircraftDataType = Type.GetType("Falcon.UniversalAircraft.UniAircraftData, Assembly-CSharp");
+                if (_uniAircraftDataType != null)
+                {
+                    // Gun is a field on UniAircraftData (type: AircraftGunModelData)
+                    _aircraftDataGunField = _uniAircraftDataType.GetField("Gun", flags);
+                    Plugin.Log?.LogInfo($"[RealCombatSync] GunData reflection: UniAircraftData.Gun field={_aircraftDataGunField != null}");
+                }
+
+                // GunData (GameDataGuns.GetByName returns GunData)
+                _gunDataType = Type.GetType("Falcon.Weapons.GunData, Assembly-CSharp");
+                if (_gunDataType != null)
+                {
+                    // Bullet property (string bullet name)
+                    _gunBulletProperty = _gunDataType.GetProperty("Bullet", flags);
+                    // Muzzle velocity from nested Gun property
+                    var gunProp = _gunDataType.GetProperty("Gun", flags);
+                    if (gunProp != null)
+                    {
+                        var gunStatsType = gunProp.PropertyType;
+                        _gunMuzzleVelocityProperty = gunStatsType.GetProperty("MuzzleVelocity", flags);
+                    }
+                    Plugin.Log?.LogInfo($"[RealCombatSync] GunData reflection: GunData.Bullet={_gunBulletProperty != null}, MuzzleVelocity={_gunMuzzleVelocityProperty != null}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[RealCombatSync] GunData reflection init error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Get the aircraft type name from a GameObject by looking for UniAircraft component
+        /// </summary>
+        private static string GetAircraftTypeFromGameObject(GameObject aircraft)
+        {
+            if (aircraft == null) return null;
+
+            try
+            {
+                // Look for UniAircraft component
+                var uniAircraftType = Type.GetType("Falcon.UniversalAircraft.UniAircraft, Assembly-CSharp");
+                if (uniAircraftType == null) return null;
+
+                var uniAircraft = aircraft.GetComponent(uniAircraftType);
+                if (uniAircraft == null)
+                {
+                    // Try to find in children (FireControl hierarchy)
+                    uniAircraft = aircraft.GetComponentInChildren(uniAircraftType);
+                }
+                if (uniAircraft == null) return null;
+
+                // Get the Data property
+                var dataProp = uniAircraftType.GetProperty("Data");
+                if (dataProp == null) return null;
+
+                var data = dataProp.GetValue(uniAircraft);
+                if (data == null) return null;
+
+                // Get the Name property from the data
+                var nameProp = data.GetType().GetProperty("Name");
+                if (nameProp == null) return null;
+
+                return nameProp.GetValue(data) as string;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Get the bullet name and muzzle velocity for a specific aircraft type.
+        /// Returns null if lookup fails.
+        /// </summary>
+        private static (string bulletName, float muzzleVelocity) GetGunInfoForAircraft(string aircraftName)
+        {
+            // Initialize if needed
+            if (!_gunDataReflectionInitialized)
+                InitializeGunDataReflection();
+
+            try
+            {
+                // Step 1: Get aircraft data via GameDataAircraft.GetByName
+                if (_getAircraftDataMethod == null) return (null, 1000f);
+                var aircraftData = _getAircraftDataMethod.Invoke(null, new object[] { aircraftName });
+                if (aircraftData == null) return (null, 1000f);
+
+                // Step 2: Get Gun field from aircraft data (returns AircraftGunModelData)
+                if (_aircraftDataGunField == null) return (null, 1000f);
+                var gunModelData = _aircraftDataGunField.GetValue(aircraftData);
+                if (gunModelData == null) return (null, 1000f);
+
+                // Step 3: Get Weapon property from AircraftGunModelData (string gun name like "M61" or "GAU12")
+                var weaponProp = gunModelData.GetType().GetProperty("Weapon");
+                if (weaponProp == null) return (null, 1000f);
+                string gunName = weaponProp.GetValue(gunModelData) as string;
+                if (string.IsNullOrEmpty(gunName)) return (null, 1000f);
+
+                // Step 4: Look up GunData via GameDataGuns.GetByName
+                var gameDataGunsType = Type.GetType("Falcon.GameDataGuns, Assembly-CSharp");
+                if (gameDataGunsType == null) return (null, 1000f);
+                var getGunMethod = gameDataGunsType.GetMethod("GetByName", BindingFlags.Public | BindingFlags.Static);
+                if (getGunMethod == null) return (null, 1000f);
+                var gunData = getGunMethod.Invoke(null, new object[] { gunName });
+                if (gunData == null) return (null, 1000f);
+
+                // Step 5: Get bullet name from GunData
+                string bulletName = null;
+                if (_gunBulletProperty != null)
+                {
+                    bulletName = _gunBulletProperty.GetValue(gunData) as string;
+                }
+
+                // Step 6: Get muzzle velocity from GunData.Gun.MuzzleVelocity
+                float muzzleVelocity = 1000f; // Default fallback
+                if (_gunMuzzleVelocityProperty != null)
+                {
+                    var gunStats = gunData.GetType().GetProperty("Gun")?.GetValue(gunData);
+                    if (gunStats != null)
+                    {
+                        var mv = _gunMuzzleVelocityProperty.GetValue(gunStats);
+                        if (mv != null) muzzleVelocity = (float)mv;
+                    }
+                }
+
+                return (bulletName, muzzleVelocity);
+            }
+            catch (Exception ex)
+            {
+                if (LogHelper.ShouldLogInterval("GetGunInfoError", 10f))
+                    Plugin.Log?.LogWarning($"[RealCombatSync] GetGunInfoForAircraft error: {ex.Message}");
+                return (null, 1000f);
             }
         }
 
@@ -607,6 +777,60 @@ namespace TCAMultiplayer.Player
             }
         }
 
+        public static void HandleMissileUpdate(MissileUpdatePacket packet)
+        {
+            Initialize();
+            if (_munitionType == null || _seekerType == null) return;
+
+            try
+            {
+                // We don't have a reliable way to map MissileInstanceId to the actual instantiated Munition object
+                // on the client side, because `_networkMissiles` just holds raw Munition components, and the Unity InstanceID
+                // changes when we instantiate it.
+                // For now, let's just find ALL active missiles owned by this shooter and update their target.
+                // In a dogfight, usually only 1-2 missiles are in the air anyway.
+                
+                // If the target is the local player, we find our Target component.
+                object localTarget = null;
+                if (packet.TargetId != 0 && packet.TargetId == Plugin.Instance?.Network?.LocalPeerId)
+                {
+                    localTarget = FindLocalPlayerTarget();
+                }
+
+                int updatedCount = 0;
+                foreach (var mObj in _networkMissiles)
+                {
+                    if (mObj == null) continue;
+                    var munition = mObj as Component;
+                    if (munition == null || munition.gameObject == null) continue;
+                    
+                    // We can't strictly filter by ShooterId because we don't store it on the Munition component easily.
+                    // But we can just update the seeker if it exists.
+                    var seeker = _munitionSeekerField?.GetValue(mObj);
+                    if (seeker != null)
+                    {
+                        if (_seekerTargetField != null)
+                        {
+                            _seekerTargetField.SetValue(seeker, localTarget);
+                        }
+
+                        if (_seekerIsTrackingField != null)
+                        {
+                            _seekerIsTrackingField.SetValue(seeker, packet.IsTracking);
+                        }
+                        
+                        updatedCount++;
+                    }
+                }
+                
+                Plugin.Log?.LogInfo($"[RealCombatSync] Updated {updatedCount} active network missiles with new target state (TargetId={packet.TargetId}, IsTracking={packet.IsTracking})");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[RealCombatSync] HandleMissileUpdate error: {ex.Message}");
+            }
+        }
+        
         /// <summary>
         /// Spawn a missile using GameDataStores.SpawnStore()
         /// </summary>
@@ -1715,20 +1939,42 @@ namespace TCAMultiplayer.Player
         {
             try
             {
+                // DEBUG: Log entry
+                Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] FireBulletsDirectly called for {remoteAircraft?.name}");
+
                 // Throttle bullet firing - check FIRST to skip all work
                 double currentTime = Time.timeAsDouble;
                 if (currentTime - _lastBulletFireTime < BULLET_FIRE_INTERVAL)
+                {
+                    Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] Throttled - last fire was {(currentTime - _lastBulletFireTime):F3}s ago");
                     return;
+                }
                 _lastBulletFireTime = currentTime;
 
-                if (remoteAircraft == null) return;
+                if (remoteAircraft == null) 
+                {
+                    Plugin.Log?.LogWarning("[RealCombatSync DEBUG] remoteAircraft is null!");
+                    return;
+                }
 
                 // Cache Bullet2Manager instance (only look up once)
                 var bulletManager = TryGetBullet2ManagerInstance();
-                if (bulletManager == null) return;
+                if (bulletManager == null) 
+                {
+                    Plugin.Log?.LogWarning("[RealCombatSync DEBUG] Bullet2Manager instance is null!");
+                    return;
+                }
+                Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] Got Bullet2Manager instance: {bulletManager.GetType().Name}");
 
-                // Cache BulletData (only look up once)
-                if (_cachedBulletData == null)
+                // Determine aircraft type and get the correct bullet for this aircraft
+                string aircraftName = GetAircraftTypeFromGameObject(remoteAircraft) ?? "AV8B";
+                var (bulletName, muzzleVelocity) = GetGunInfoForAircraft(aircraftName);
+                
+                Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] Aircraft: {aircraftName}, Bullet: {bulletName ?? "fallback"}, MuzzleVelocity: {muzzleVelocity}");
+
+                // Look up bullet data for this aircraft's gun
+                object bulletData = null;
+                if (!string.IsNullOrEmpty(bulletName))
                 {
                     var gameDataBulletsType = Type.GetType("Falcon.GameDataBullets, Assembly-CSharp");
                     if (gameDataBulletsType != null)
@@ -1737,59 +1983,103 @@ namespace TCAMultiplayer.Player
                             BindingFlags.Public | BindingFlags.Static);
                         if (getBulletByName != null)
                         {
-                            // Use actual game bullet names from Weapons/Bullets/Aircraft.json
-                            string[] bulletNames = { "20mm M61", "25mm GAU12 HE", "23mm Gsh23", "25mm GAU12 AP" };
-                            foreach (var name in bulletNames)
-                            {
-                                _cachedBulletData = getBulletByName.Invoke(null, new object[] { name });
-                                if (_cachedBulletData != null)
-                                {
-                                    Plugin.Log?.LogInfo($"[RealCombatSync] Cached bullet data: {name}");
-                                    break;
-                                }
-                            }
+                            bulletData = getBulletByName.Invoke(null, new object[] { bulletName });
                         }
                     }
                 }
 
-                if (_cachedBulletData == null) return;
+                // Fallback to cached/default bullet if specific lookup failed
+                if (bulletData == null)
+                {
+                    if (_cachedBulletData == null)
+                    {
+                        // Initialize fallback bullet (first available)
+                        var gameDataBulletsType = Type.GetType("Falcon.GameDataBullets, Assembly-CSharp");
+                        if (gameDataBulletsType != null)
+                        {
+                            var getAllMethod = gameDataBulletsType.GetMethod("GetAll", BindingFlags.Public | BindingFlags.Static);
+                            if (getAllMethod != null)
+                            {
+                                var allBullets = getAllMethod.Invoke(null, null) as System.Collections.IEnumerable;
+                                if (allBullets != null)
+                                {
+                                    foreach (var bullet in allBullets)
+                                    {
+                                        if (bullet != null)
+                                        {
+                                            _cachedBulletData = bullet;
+                                            var nameProp = bullet.GetType().GetProperty("Name");
+                                            var fallbackName = nameProp?.GetValue(bullet) as string ?? "Unknown";
+                                            Plugin.Log?.LogInfo($"[RealCombatSync] Initialized fallback bullet: {fallbackName}");
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    bulletData = _cachedBulletData;
+                }
+                else
+                {
+                    // Cache successful lookup for potential reuse
+                    _cachedBulletData = bulletData;
+                }
+
+                if (bulletData == null)
+                {
+                    Plugin.Log?.LogError("[RealCombatSync DEBUG] CRITICAL: Could not get bullet data for aircraft!");
+                    return;
+                }
+                Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] Using bullet: {bulletName ?? "fallback"} for {aircraftName}");
 
                 // Ensure type caches for overload resolution
                 if (_bulletDataType == null)
                 {
                     _bulletDataType = Type.GetType("Falcon.Weapons.BulletData, Assembly-CSharp");
+                    Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] BulletData type: {_bulletDataType?.Name ?? "NULL"}");
                 }
                 if (_targetType == null)
                 {
                     _targetType = Type.GetType("Falcon.Targeting.Target, Assembly-CSharp");
+                    Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] Target type: {_targetType?.Name ?? "NULL"}");
                 }
 
                 // Resolve FireBullet overload and argument mapping
-                if (!ResolveFireBulletMethod()) return;
+                if (!ResolveFireBulletMethod()) 
+                {
+                    Plugin.Log?.LogError("[RealCombatSync DEBUG] ResolveFireBulletMethod returned false!");
+                    return;
+                }
+                Plugin.Log?.LogInfo("[RealCombatSync DEBUG] FireBullet method resolved successfully");
 
                 // Get Target component from aircraft (needed for bullet ownership)
                 var target = GetRemoteTarget(remoteAircraft);
+                Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] GetRemoteTarget result: {target?.GetType().Name ?? "NULL"}");
+                
                 if (target == null)
                 {
                     target = FindLocalPlayerTarget() as Component;
                     if (target == null)
                     {
+                        Plugin.Log?.LogError("[RealCombatSync DEBUG] CRITICAL: No target found (neither remote nor local)!");
                         if (LogHelper.ShouldLogInterval("FireBullets.NoTarget", 5f))
                             Plugin.Log?.LogWarning("[RealCombatSync] FireBulletsDirectly: no Target found");
                         return;
                     }
 
+                    Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] Using local target fallback: {target.GetType().Name}");
                     if (LogHelper.ShouldLogInterval("FireBullets.TargetFallback", 10f))
                         Plugin.Log?.LogInfo("[RealCombatSync] FireBulletsDirectly: using local Target fallback");
                 }
 
                 // Find gun muzzle position
                 Transform firePoint = GetRemoteFirePoint(remoteAircraft) ?? remoteAircraft.transform;
+                Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] FirePoint: {firePoint.name} at {firePoint.position}");
 
                 // Calculate bullet velocity
                 Vector3 firePos = firePoint.position;
                 Vector3 fireDir = firePoint.forward;
-                float muzzleVelocity = 1000f;
 
                 // Get aircraft velocity
                 var rb = remoteAircraft.GetComponent<Rigidbody>();
@@ -1800,8 +2090,20 @@ namespace TCAMultiplayer.Player
                 var barrel = TryGetBarrelFromGun(gun);
 
                 // Fire the bullet!
-                var args = BuildFireBulletArgs(remoteAircraft, target, _cachedBulletData, firePoint, firePos, fireDir, bulletVelocity, rb, gun, barrel, muzzleVelocity);
-                _bullet2ManagerFireBulletMethod.Invoke(bulletManager, args);
+                Plugin.Log?.LogInfo("[RealCombatSync DEBUG] Building FireBullet args...");
+                var args = BuildFireBulletArgs(remoteAircraft, target, bulletData, firePoint, firePos, fireDir, bulletVelocity, rb, gun, barrel, muzzleVelocity);
+                Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] Args built, invoking FireBullet with {args.Length} parameters...");
+                
+                try
+                {
+                    _bullet2ManagerFireBulletMethod.Invoke(bulletManager, args);
+                    Plugin.Log?.LogInfo($"[RealCombatSync DEBUG] SUCCESS! Bullet fired from {remoteAircraft.name}");
+                }
+                catch (TargetInvocationException tie)
+                {
+                    Plugin.Log?.LogError($"[RealCombatSync DEBUG] FireBullet threw exception: {tie.InnerException?.GetType().Name}: {tie.InnerException?.Message}");
+                    throw;
+                }
 
                 if (LogHelper.ShouldLogInterval("BulletFired", 2f))
                 {
