@@ -359,12 +359,20 @@ namespace TCAMultiplayer.Patches
                 // Apply damage using the public method - wrapped in separate try-catch to prevent exceptions from breaking pipeline
                 try
                 {
-                    damageable.ApplyDamageFromImpact(damageSource);
-                    Plugin.Log?.LogInfo($"[DamagePatches] Applied {packet.Damage} damage to local aircraft. HP: {damageable.HitPoints}/{damageable.MaxHitpoints}");
+                    if (packet.DamageType == 1) // Explosive damage
+                    {
+                        damageable.ApplyDamageFromExplosion(damageSource);
+                        Plugin.Log?.LogInfo($"[DamagePatches] Applied {packet.Damage} EXPLOSION damage to local aircraft. HP: {damageable.HitPoints}/{damageable.MaxHitpoints}");
+                    }
+                    else
+                    {
+                        damageable.ApplyDamageFromImpact(damageSource);
+                        Plugin.Log?.LogInfo($"[DamagePatches] Applied {packet.Damage} IMPACT damage to local aircraft. HP: {damageable.HitPoints}/{damageable.MaxHitpoints}");
+                    }
                 }
                 catch (Exception applyEx)
                 {
-                    Plugin.Log?.LogWarning($"[DamagePatches] ApplyDamageFromImpact threw exception (damage may not have applied): {applyEx.Message}");
+                    Plugin.Log?.LogWarning($"[DamagePatches] ApplyDamage threw exception (damage may not have applied): {applyEx.Message}");
                     // Continue execution - don't let a single damage application failure break the whole system
                 }
 
