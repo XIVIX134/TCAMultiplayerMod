@@ -22,6 +22,9 @@ namespace TCAMultiplayer.Networking
         private static Vector3d _previousOffset = Vector3d.zero;
         private static float _lastUpdateTime = -1f;
         
+        // Property for ReferenceObject
+        private static FieldInfo _referenceObjectField;
+
         /// <summary>
         /// The total offset applied by FloatingOrigin since game start
         /// This is how far the origin has been shifted from true world (0,0,0)
@@ -107,6 +110,9 @@ namespace TCAMultiplayer.Networking
                         Plugin.Log?.LogInfo($"[FloatingOriginHelper] Found via FindObjectOfType: {_floatingOriginInstance != null}");
                     }
                 }
+                
+                // Get ReferenceObject field
+                _referenceObjectField = _floatingOriginType.GetField("ReferenceObject", BindingFlags.Public | BindingFlags.Instance);
                 
                 _initialized = true;
                 Plugin.Log?.LogInfo($"[FloatingOriginHelper] Initialized. TotalOffsetProperty: {_totalOffsetProperty?.Name ?? "null"}");
@@ -242,6 +248,29 @@ namespace TCAMultiplayer.Networking
             {
                 // If anything fails, just return the position as-is
                 return new Vector3((float)absolutePos.x, (float)absolutePos.y, (float)absolutePos.z);
+            }
+        }
+        
+        /// <summary>
+        /// Manually set the ReferenceObject for the FloatingOrigin system
+        /// Ensures floating point precision is maintained when spawning new local aircraft
+        /// </summary>
+        public static void SetReferenceObject(Transform referenceTransform)
+        {
+            try
+            {
+                if (!Initialize() || _floatingOriginInstance == null || _referenceObjectField == null)
+                {
+                    Plugin.Log?.LogWarning("[FloatingOriginHelper] Cannot set ReferenceObject - FloatingOrigin unavailable");
+                    return;
+                }
+                
+                _referenceObjectField.SetValue(_floatingOriginInstance, referenceTransform);
+                Plugin.Log?.LogInfo($"[FloatingOriginHelper] Successfully set ReferenceObject to {(referenceTransform != null ? referenceTransform.name : "null")}");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[FloatingOriginHelper] Failed to set ReferenceObject: {ex.Message}");
             }
         }
     }

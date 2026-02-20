@@ -377,6 +377,26 @@ namespace TCAMultiplayer.Game
                 // Initialize flight mode
                 InitializeFlightMode(flightGame, spawnType);
 
+                // Fix Floating Origin: When we respawn, the base game doesn't properly re-assign
+                // the FloatingOrigin.ReferenceObject, which leads to massive floating point errors
+                // (cockpit jitter) at map edges. We must explicitly set it to the new local player.
+                try
+                {
+                    var playerAircraftProp = flightGame.GetType().GetProperty("PlayerAircraft", BindingFlags.Public | BindingFlags.Instance);
+                    if (playerAircraftProp != null)
+                    {
+                        var playerAircraft = playerAircraftProp.GetValue(flightGame) as Component;
+                        if (playerAircraft != null)
+                        {
+                            Networking.FloatingOriginHelper.SetReferenceObject(playerAircraft.transform);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log?.LogWarning($"[SpawnManager] Failed to apply FloatingOrigin fix: {ex.Message}");
+                }
+
                 Plugin.Log?.LogInfo("[SpawnManager] Spawn complete!");
                 OnSpawnComplete?.Invoke();
                 return true;
