@@ -67,7 +67,6 @@ namespace TCAMultiplayer.UI
 
             ShowAll();
             UpdateCompactScore();
-            UpdateKillFeed();
             UpdateFullScoreboard();
         }
 

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
+using UnityEngine.EventSystems;
 using TMPro;
 using TCAMultiplayer.Networking;
 using TCAMultiplayer.Game;
@@ -270,6 +271,13 @@ namespace TCAMultiplayer.UI
                 var img = respawnBtn.GetComponent<Image>();
                 if (img != null) img.color = new Color(0.2f, 0.7f, 0.2f, 1f);
                 respawnBtn.onClick.AddListener(DoRespawn);
+
+                // Auto-select for controller support
+                if (EventSystem.current != null)
+                {
+                    EventSystem.current.SetSelectedGameObject(null);
+                    EventSystem.current.SetSelectedGameObject(respawnBtn.gameObject);
+                }
             }
         }
 

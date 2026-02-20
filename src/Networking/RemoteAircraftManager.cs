@@ -887,12 +887,13 @@ namespace TCAMultiplayer.Networking
                         $"[RemoteAircraftManager] Terrain height adjust: height={terrainHeight:F2} finalY={spawnPosition.y:F2}");
                 }
 
+                string playerName = GetRemotePlayerName(peerId);
                 object[] args = _spawnAircraftHasName
-                    ? new object[] { $"MP_Remote_{peerId}", aircraftName, faction, skill, spawnPosition, spawnRotation, isAirstart }
+                    ? new object[] { playerName, aircraftName, faction, skill, spawnPosition, spawnRotation, isAirstart }
                     : new object[] { aircraftName, faction, skill, spawnPosition, spawnRotation, isAirstart };
 
                 LogHelper.Info(LogCategory.Reflection,
-                    $"[RemoteAircraftManager] Spawn args: name={( _spawnAircraftHasName ? $"MP_Remote_{peerId}" : "(none)" )}, type={aircraftName}, skill={skill}, airstart={isAirstart}, spawnPos={spawnPosition}");
+                    $"[RemoteAircraftManager] Spawn args: name={( _spawnAircraftHasName ? playerName : "(none)" )}, type={aircraftName}, skill={skill}, airstart={isAirstart}, spawnPos={spawnPosition}");
 
                 var spawnResult = _spawnAircraftMethod.Invoke(null, args);
                 var component = spawnResult as Component;
@@ -903,7 +904,7 @@ namespace TCAMultiplayer.Networking
                 }
 
                 var go = component.gameObject;
-                go.name = $"MP_Remote_{peerId}";
+                go.name = playerName;
 
                 // Get the remote player's selected loadout
                 string loadoutName = GetRemoteSelectedLoadout(peerId) ?? "Clean";
@@ -945,7 +946,7 @@ namespace TCAMultiplayer.Networking
                             if (prefab != null)
                             {
                                 var instance = GameObject.Instantiate(prefab, state.DisplayPosition, state.DisplayRotation);
-                                instance.name = $"MP_Remote_{peerId}";
+                                instance.name = GetRemotePlayerName(peerId);
 
                                 // Configure for remote control
                                 ConfigureRemoteAircraft(instance);
@@ -1215,6 +1216,19 @@ namespace TCAMultiplayer.Networking
             }
 
             return null;
+        }
+
+        private static string GetRemotePlayerName(ulong peerId)
+        {
+            var lobby = Plugin.Instance?.Lobby;
+            if (lobby == null) return $"Player {peerId}";
+
+            if (lobby.Players != null && lobby.Players.TryGetValue(peerId, out var info))
+            {
+                if (!string.IsNullOrEmpty(info?.PlayerName)) return info.PlayerName;
+            }
+
+            return $"Player {peerId}";
         }
 
         private static string GetRemoteSelectedAircraft(ulong peerId)

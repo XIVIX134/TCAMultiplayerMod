@@ -75,15 +75,19 @@ namespace TCAMultiplayer.Game
         /// </summary>
         public void RecordKill(ulong killerId, ulong victimId, string weaponName)
         {
+            string killerName = $"Player {killerId}";
+            string victimName = $"Player {victimId}";
+
             lock (_lock)
             {
                 if (_scores.TryGetValue(killerId, out var killerScore))
                 {
                     killerScore.Kills++;
+                    killerName = killerScore.PlayerName;
                 }
                 else
                 {
-                    var score = new PlayerScore(killerId, $"Player {killerId}");
+                    var score = new PlayerScore(killerId, killerName);
                     score.Kills = 1;
                     _scores[killerId] = score;
                 }
@@ -91,17 +95,14 @@ namespace TCAMultiplayer.Game
                 if (_scores.TryGetValue(victimId, out var victimScore))
                 {
                     victimScore.Deaths++;
+                    victimName = victimScore.PlayerName;
                 }
                 else
                 {
-                    var score = new PlayerScore(victimId, $"Player {victimId}");
+                    var score = new PlayerScore(victimId, victimName);
                     score.Deaths = 1;
                     _scores[victimId] = score;
                 }
-
-                // Add to kill feed
-                string killerName = _scores.ContainsKey(killerId) ? _scores[killerId].PlayerName : $"Player {killerId}";
-                string victimName = _scores.ContainsKey(victimId) ? _scores[victimId].PlayerName : $"Player {victimId}";
 
                 _killFeed.Add(new KillFeedEntry
                 {
@@ -116,6 +117,21 @@ namespace TCAMultiplayer.Game
                 {
                     _killFeed.RemoveAt(0);
                 }
+            }
+
+            // Display in the game's native message log
+            try
+            {
+                // The game's native system handles colors via rich text
+                string safeWeapon = string.IsNullOrEmpty(weaponName) ? "Unknown Weapon" : weaponName;
+                string msg = $"<color=#00FF00>{killerName}</color> destroyed <color=#FF4444>{victimName}</color> [{safeWeapon}]";
+                
+                // Native UI method: AddMessage(string messageText, FlightMessageType type, FlightMessageSound sound = FlightMessageSound.None, float displayTime = 5f)
+                Falcon.Game2.UI.FlightMessages2.AddMessage(msg, Falcon.Game2.UI.FlightMessageType.Flight, Falcon.Game2.UI.FlightMessageSound.ObjectiveComplete, 8f);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[ScoreTracker] Failed to push native kill message: {ex.Message}");
             }
 
             Plugin.Log?.LogInfo($"[ScoreTracker] Kill recorded: {killerId} -> {victimId} with {weaponName}");
