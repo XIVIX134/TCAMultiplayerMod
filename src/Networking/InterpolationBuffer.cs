@@ -47,12 +47,12 @@ namespace TCAMultiplayer.Networking
         /// How far behind real-time to render (in seconds)
         /// Higher = smoother but more latency
         /// </summary>
-        public float InterpolationDelay { get; set; } = 0.1f; // 100ms default
+        public float InterpolationDelay { get; set; } = 0.15f; 
         
         /// <summary>
         /// Maximum time to extrapolate beyond last known state
         /// </summary>
-        public float MaxExtrapolationTime { get; set; } = 0.25f; // 250ms
+        public float MaxExtrapolationTime { get; set; } = 0.5f;
         
         /// <summary>
         /// Smoothing factor for additional position smoothing (0-1, lower = smoother)
@@ -136,11 +136,11 @@ namespace TCAMultiplayer.Networking
         /// eliminate jitter from variable network arrival times.
         /// Uses Hermite spline interpolation for smooth movement curves.
         /// </summary>
-        public (Vector3 position, Quaternion rotation, bool isExtrapolating) GetInterpolatedState()
+        public (Vector3 position, Quaternion rotation, bool isExtrapolating, bool justTeleported) GetInterpolatedState()
         {
             if (_count == 0)
             {
-                return (Vector3.zero, Quaternion.identity, false);
+                return (Vector3.zero, Quaternion.identity, false, false);
             }
             
             // Convert current local time to remote time domain using clock offset
@@ -182,23 +182,23 @@ namespace TCAMultiplayer.Networking
             Quaternion rawRotation;
             bool isExtrapolating = false;
             
-            // Case 1: We have both before and after - use Hermite interpolation
+            // Case 1: We have both before and after - use Linear interpolation
             if (before.IsValid && after.IsValid && before.RemoteTime != after.RemoteTime)
             {
                 float duration = after.RemoteTime - before.RemoteTime;
                 float t = (remoteRenderTime - before.RemoteTime) / duration;
                 t = Mathf.Clamp01(t);
                 
-                // Use Hermite spline interpolation for position (in absolute space)
-                rawAbsolutePosition = HermiteInterpolateAbsolute(
-                    before.AbsolutePosition, before.Velocity,
-                    after.AbsolutePosition, after.Velocity,
-                    duration, t);
+                // Use precise linear interpolation for position (in absolute space)
+                // Hermite spline is too sensitive to noisy physics velocity
+                rawAbsolutePosition = new Vector3d(
+                    before.AbsolutePosition.x + (after.AbsolutePosition.x - before.AbsolutePosition.x) * t,
+                    before.AbsolutePosition.y + (after.AbsolutePosition.y - before.AbsolutePosition.y) * t,
+                    before.AbsolutePosition.z + (after.AbsolutePosition.z - before.AbsolutePosition.z) * t
+                );
                 
-                // Use smooth squad interpolation for rotation
-                rawRotation = SmoothSlerpRotation(before.Rotation, after.Rotation, 
-                    before.AngularVelocity, after.AngularVelocity,
-                    duration, t);
+                // Use standard Slerp for rotation
+                rawRotation = Quaternion.Slerp(before.Rotation, after.Rotation, t);
             }
             // Case 2: Only have before (most common when delay is working) - extrapolate
             else if (before.IsValid)
@@ -241,7 +241,7 @@ namespace TCAMultiplayer.Networking
                 }
                 else
                 {
-                    return (Vector3.zero, Quaternion.identity, false);
+                    return (Vector3.zero, Quaternion.identity, false, false);
                 }
             }
             
@@ -250,25 +250,24 @@ namespace TCAMultiplayer.Networking
             // using the latest offset, so FloatingOrigin shifts don't cause jumps.
             Vector3 rawLocalPosition = FloatingOriginHelper.AbsoluteToLocal(rawAbsolutePosition);
             
+            bool justTeleported = false;
+
             // Detect FloatingOrigin shift: if the raw local position jumped far from the
-            // smoothed position, the origin shifted. Snap the smoothed position to avoid
-            // the smoothing layer causing a slow drift back from the wrong position.
+            // previous frame's position, the origin shifted. 
             float posDelta = (rawLocalPosition - _smoothedPosition).sqrMagnitude;
             if (posDelta > 10000f) // > 100m means FloatingOrigin shifted
             {
-                _smoothedPosition = rawLocalPosition;
+                justTeleported = true;
             }
             
-            // Apply additional smoothing layer to reduce micro-jitter
-            // Use frame-rate independent smoothing
-            float dt = Time.deltaTime;
-            float posSmoothT = 1f - Mathf.Pow(1f - PositionSmoothingFactor, dt * 60f);
-            float rotSmoothT = 1f - Mathf.Pow(1f - RotationSmoothingFactor, dt * 60f);
+            // WE MUST NOT apply secondary EMA smoothing (Lerp) to fast-moving objects.
+            // A plane moving at 200m/s will permanently lag 10+ meters behind the true interpolation
+            // if we Lerp its absolute position, and variable framerates will cause it to jitter violently!
+            // Hermite/Linear interpolation already gives us perfectly smooth continuous coordinates.
+            _smoothedPosition = rawLocalPosition;
+            _smoothedRotation = rawRotation;
             
-            _smoothedPosition = Vector3.Lerp(_smoothedPosition, rawLocalPosition, posSmoothT);
-            _smoothedRotation = Quaternion.Slerp(_smoothedRotation, rawRotation, rotSmoothT);
-            
-            return (_smoothedPosition, _smoothedRotation, isExtrapolating);
+            return (_smoothedPosition, _smoothedRotation, isExtrapolating, justTeleported);
         }
         
         /// <summary>

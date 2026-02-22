@@ -307,8 +307,12 @@ namespace TCAMultiplayer.Networking
         public void Update()
         {
             UpdateLocalPlayerPosition();
-            UpdateAllInterpolation();
             TryRetryAllClones();
+        }
+
+        public void LateUpdate()
+        {
+            UpdateAllInterpolation();
         }
 
         private void UpdateLocalPlayerPosition()
@@ -361,11 +365,20 @@ namespace TCAMultiplayer.Networking
                     rb.useGravity = false;
                 }
                 
-                var (position, rotation, isExtrapolating) = state.Buffer.GetInterpolatedState();
+                var (position, rotation, isExtrapolating, justTeleported) = state.Buffer.GetInterpolatedState();
 
                 state.DisplayPosition = position;
                 state.DisplayRotation = rotation;
                 state.IsExtrapolating = isExtrapolating;
+
+                if (justTeleported && state.Aircraft != null)
+                {
+                    var trail = state.Aircraft.GetComponentInChildren<TrailRenderer>();
+                    if (trail != null)
+                    {
+                        trail.Clear();
+                    }
+                }
 
                 if (state.IsExtrapolating != state.WasExtrapolating)
                 {
@@ -483,14 +496,13 @@ namespace TCAMultiplayer.Networking
                 state.LastSequenceNumber = packet.SequenceNumber;
                 state.LastUpdateTime = Time.time;
 
-                // Calculate clock offset: how much AHEAD local time is vs remote time.
-                // ClockOffset = LocalTime - RemoteTime (positive means local is ahead of remote)
-                // Used in InterpolationBuffer as: remoteRenderTime = Time.time - ClockOffset - delay
-                //   = localNow - (local - remote) - delay = remoteNow - delay  (correct!)
+                // Calculate instant offset: how much AHEAD local time is vs remote time.
+                // ClockOffset = LocalTime - RemoteTime
                 float instantOffset = Time.time - packet.Timestamp;
                 
-                // Smooth the clock offset using exponential moving average to prevent jitter
-                // On first packet, snap to the value; thereafter, smooth with alpha=0.05
+                // Track the true clock difference + base ping.
+                // We track the minimum offset because that represents the fastest packet
+                // (the one with the least network delay).
                 if (!state.ClockOffsetInitialized)
                 {
                     state.ClockOffset = instantOffset;
@@ -498,11 +510,24 @@ namespace TCAMultiplayer.Networking
                 }
                 else
                 {
-                    const float CLOCK_SMOOTH_ALPHA = 0.05f;
-                    state.ClockOffset = state.ClockOffset + CLOCK_SMOOTH_ALPHA * (instantOffset - state.ClockOffset);
+                    if (instantOffset < state.ClockOffset)
+                    {
+                        // Found a packet with lower latency.
+                        // Only snap if it's significantly faster to avoid micro-jitter
+                        if (state.ClockOffset - instantOffset > 0.005f)
+                        {
+                            state.ClockOffset = instantOffset;
+                        }
+                    }
+                    else
+                    {
+                        // Slowly drift upwards to handle remote clock drifting ahead.
+                        // This drift is extremely slow to keep the clock stable.
+                        state.ClockOffset += Time.deltaTime * 0.0001f;
+                    }
                 }
 
-                // Propagate clock offset to interpolation buffer for RemoteTime-based interpolation
+                // Propagate stable clock offset to interpolation buffer
                 state.Buffer.ClockOffset = state.ClockOffset;
 
                 if (!string.IsNullOrEmpty(packet.AircraftType) && packet.AircraftType != state.DesiredAircraftType)

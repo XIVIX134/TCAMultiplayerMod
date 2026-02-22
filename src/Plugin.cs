@@ -440,6 +440,11 @@ namespace TCAMultiplayer
             Plugin.Instance?.ScoreboardHUD?.Update();
         }
 
+        private void LateUpdate()
+        {
+            Plugin.Instance?.Network?.LateUpdate();
+        }
+
         private void OnGUI()
         {
             try

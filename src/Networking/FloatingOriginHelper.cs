@@ -130,9 +130,6 @@ namespace TCAMultiplayer.Networking
         private static void UpdateCachedOffset()
         {
             if (!Initialize()) return;
-            if (Time.time == _lastUpdateTime) return; // Already updated this frame
-            
-            _lastUpdateTime = Time.time;
             
             try
             {
@@ -168,10 +165,7 @@ namespace TCAMultiplayer.Networking
             catch (Exception ex)
             {
                 // Silently fail after first warning
-                if (_lastUpdateTime < 1f)
-                {
-                    Plugin.Log?.LogWarning($"[FloatingOriginHelper] Update error: {ex.Message}");
-                }
+                Plugin.Log?.LogWarning($"[FloatingOriginHelper] Update error: {ex.Message}");
             }
         }
         

@@ -168,6 +168,11 @@ namespace TCAMultiplayer.Networking
             _remoteAircraft.Update();
         }
 
+        public void LateUpdate()
+        {
+            _remoteAircraft.LateUpdate();
+        }
+
         public void Shutdown()
         {
             _remoteAircraft.Cleanup();
