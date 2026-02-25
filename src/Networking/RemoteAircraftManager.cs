@@ -36,6 +36,9 @@ namespace TCAMultiplayer.Networking
         public float LastUpdateTime { get; set; }
         public bool IsExtrapolating { get; set; }
         public bool WasExtrapolating { get; set; }
+        public bool HasAppliedPose { get; set; }
+        public Vector3 LastAppliedPosition { get; set; } = Vector3.zero;
+        public Quaternion LastAppliedRotation { get; set; } = Quaternion.identity;
 
         // Clone state
         public bool UsingRealAircraft { get; set; }
@@ -357,12 +360,35 @@ namespace TCAMultiplayer.Networking
                     return;
                 }
                 
-                // Silently ensure Rigidbody stays kinematic (UniAircraft should be disabled but safety check)
-                var rb = state.Aircraft.GetComponent<Rigidbody>();
-                if (rb != null && !rb.isKinematic)
+                // Silently ensure ALL rigidbodies stay kinematic (some aircraft use child rigidbodies)
+                var rigidbodies = state.Aircraft.GetComponentsInChildren<Rigidbody>(true);
+                foreach (var rb in rigidbodies)
                 {
-                    rb.isKinematic = true;
-                    rb.useGravity = false;
+                    if (rb != null && !rb.isKinematic)
+                    {
+                        rb.isKinematic = true;
+                        rb.useGravity = false;
+                    }
+                }
+
+                // Diagnostic: detect external pose writes between our interpolation ticks.
+                // If this fires, another system is moving the remote aircraft transform.
+                if (state.HasAppliedPose)
+                {
+                    var currentPos = state.Aircraft.transform.position;
+                    var currentRot = state.Aircraft.transform.rotation;
+                    float externalMoveDist = Vector3.Distance(currentPos, state.LastAppliedPosition);
+                    float externalRotDeg = Quaternion.Angle(currentRot, state.LastAppliedRotation);
+
+                    if ((externalMoveDist > 1.5f || externalRotDeg > 4f) &&
+                        LogHelper.IsEnabled(LogCategory.Interpolation) &&
+                        LogHelper.ShouldLogInterval($"RemoteAircraftManager.ExternalWrite.{state.PeerId}", 1.0f))
+                    {
+                        LogHelper.Info(LogCategory.Interpolation,
+                            $"[JitterDiag] Peer {state.PeerId} external transform write detected " +
+                            $"move={externalMoveDist:F2}m rot={externalRotDeg:F1}deg " +
+                            $"dt={Time.deltaTime:F3}s extrap={state.IsExtrapolating}");
+                    }
                 }
                 
                 var (position, rotation, isExtrapolating, justTeleported) = state.Buffer.GetInterpolatedState();
@@ -391,6 +417,9 @@ namespace TCAMultiplayer.Networking
                 // Apply to object — position is in local space, converted from absolute in GetInterpolatedState
                 state.Aircraft.transform.position = state.DisplayPosition;
                 state.Aircraft.transform.rotation = state.DisplayRotation;
+                state.LastAppliedPosition = state.DisplayPosition;
+                state.LastAppliedRotation = state.DisplayRotation;
+                state.HasAppliedPose = true;
             }
             catch (Exception ex)
             {
@@ -1170,17 +1199,20 @@ namespace TCAMultiplayer.Networking
                     Plugin.Log.LogInfo("[RemoteAircraftManager] Disabled UniAircraft component (prevents physics FixedUpdate)");
                 }
 
-                // CRITICAL: Make Rigidbody kinematic to prevent physics from fighting
-                // with our manual position updates. Without this, the game's physics engine
-                // and FloatingOrigin both move the aircraft independently, causing teleportation.
-                var rb = aircraft.GetComponent<Rigidbody>();
-                if (rb != null)
+                // CRITICAL: Make ALL rigidbodies kinematic to prevent physics from fighting
+                // with manual network interpolation updates.
+                var rigidbodies = aircraft.GetComponentsInChildren<Rigidbody>(true);
+                if (rigidbodies.Length > 0)
                 {
-                    rb.isKinematic = true;
-                    rb.useGravity = false;
-                    rb.interpolation = RigidbodyInterpolation.None;
-                    rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
-                    Plugin.Log.LogInfo("[RemoteAircraftManager] Set Rigidbody to kinematic (prevents physics/position fight)");
+                    foreach (var rb in rigidbodies)
+                    {
+                        if (rb == null) continue;
+                        rb.isKinematic = true;
+                        rb.useGravity = false;
+                        rb.interpolation = RigidbodyInterpolation.None;
+                        rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
+                    }
+                    Plugin.Log.LogInfo($"[RemoteAircraftManager] Set {rigidbodies.Length} Rigidbody components to kinematic (prevents physics/position fight)");
                 }
                 else
                 {

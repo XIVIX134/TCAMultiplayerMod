@@ -132,9 +132,8 @@ namespace TCAMultiplayer.Networking
         /// <summary>
         /// Get interpolated state at the current render time (now - delay).
         /// Returns position in LOCAL Unity space (converted from absolute at render time).
-        /// Uses RemoteTime (sender timestamps) for interpolation bracketing to
-        /// eliminate jitter from variable network arrival times.
-        /// Uses Hermite spline interpolation for smooth movement curves.
+        /// Uses LocalTime (receiver timeline) for interpolation bracketing.
+        /// Extrapolation is intentionally disabled to avoid overshoot/correction jitter.
         /// </summary>
         public (Vector3 position, Quaternion rotation, bool isExtrapolating, bool justTeleported) GetInterpolatedState()
         {
@@ -143,15 +142,15 @@ namespace TCAMultiplayer.Networking
                 return (Vector3.zero, Quaternion.identity, false, false);
             }
             
-            // Convert current local time to remote time domain using clock offset
-            // ClockOffset = local - remote, so remoteNow = localNow - ClockOffset
-            float remoteRenderTime = Time.time - ClockOffset - InterpolationDelay;
+            // Render on the LOCAL receive timeline. This avoids jitter from remote clock drift
+            // and one-way latency variance causing unstable remote-time bracketing.
+            float localRenderTime = Time.time - InterpolationDelay;
             
-            // Find the two snapshots surrounding remoteRenderTime using RemoteTime
+            // Find the two snapshots surrounding localRenderTime using LocalTime
             Snapshot before = Snapshot.Invalid;
             Snapshot after = Snapshot.Invalid;
             
-            // Search through buffer for bracketing snapshots (using RemoteTime)
+            // Search through buffer for bracketing snapshots (using LocalTime)
             for (int i = 0; i < _count; i++)
             {
                 int idx = (_writeIndex - 1 - i + _capacity) % _capacity;
@@ -159,17 +158,17 @@ namespace TCAMultiplayer.Networking
                 
                 if (!snap.IsValid) continue;
                 
-                if (snap.RemoteTime <= remoteRenderTime)
+                if (snap.LocalTime <= localRenderTime)
                 {
-                    if (!before.IsValid || snap.RemoteTime > before.RemoteTime)
+                    if (!before.IsValid || snap.LocalTime > before.LocalTime)
                     {
                         before = snap;
                     }
                 }
                 
-                if (snap.RemoteTime >= remoteRenderTime)
+                if (snap.LocalTime >= localRenderTime)
                 {
-                    if (!after.IsValid || snap.RemoteTime < after.RemoteTime)
+                    if (!after.IsValid || snap.LocalTime < after.LocalTime)
                     {
                         after = snap;
                     }
@@ -183,10 +182,10 @@ namespace TCAMultiplayer.Networking
             bool isExtrapolating = false;
             
             // Case 1: We have both before and after - use Linear interpolation
-            if (before.IsValid && after.IsValid && before.RemoteTime != after.RemoteTime)
+            if (before.IsValid && after.IsValid && before.LocalTime != after.LocalTime)
             {
-                float duration = after.RemoteTime - before.RemoteTime;
-                float t = (remoteRenderTime - before.RemoteTime) / duration;
+                float duration = after.LocalTime - before.LocalTime;
+                float t = (localRenderTime - before.LocalTime) / duration;
                 t = Mathf.Clamp01(t);
                 
                 // Use precise linear interpolation for position (in absolute space)
@@ -200,28 +199,13 @@ namespace TCAMultiplayer.Networking
                 // Use standard Slerp for rotation
                 rawRotation = Quaternion.Slerp(before.Rotation, after.Rotation, t);
             }
-            // Case 2: Only have before (most common when delay is working) - extrapolate
+            // Case 2: Only have before. Do NOT extrapolate; hold last known state.
+            // Extrapolation introduces overshoot/correction jitter on variable packet cadence.
             else if (before.IsValid)
             {
-                float timeSince = remoteRenderTime - before.RemoteTime;
-                isExtrapolating = timeSince > 0.01f;
-                
-                // Limit extrapolation time
-                if (timeSince > MaxExtrapolationTime)
-                {
-                    timeSince = MaxExtrapolationTime;
-                }
-                
-                // Extrapolate position using velocity with damping (in absolute space)
-                float dampFactor = 1f - Mathf.Clamp01(timeSince / MaxExtrapolationTime) * 0.3f;
-                rawAbsolutePosition = new Vector3d(
-                    before.AbsolutePosition.x + before.Velocity.x * timeSince * dampFactor,
-                    before.AbsolutePosition.y + before.Velocity.y * timeSince * dampFactor,
-                    before.AbsolutePosition.z + before.Velocity.z * timeSince * dampFactor);
-                
-                // Extrapolate rotation using angular velocity
-                Vector3 angularDelta = before.AngularVelocity * timeSince * Mathf.Rad2Deg;
-                rawRotation = before.Rotation * Quaternion.Euler(angularDelta);
+                rawAbsolutePosition = before.AbsolutePosition;
+                rawRotation = before.Rotation;
+                isExtrapolating = false;
             }
             // Case 3: Only have after (shouldn't happen normally)
             else if (after.IsValid)
