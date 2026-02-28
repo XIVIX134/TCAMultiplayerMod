@@ -15,6 +15,11 @@ namespace TCAMultiplayer.Networking
         public GameObject Aircraft { get; set; }
         public RemoteAircraftController Controller { get; set; }
         public InterpolationBuffer Buffer { get; }
+        public int ExternalWriteCount { get; set; } = 0;
+        public int FixedUpdateCount { get; set; } = 0;
+        public Vector3 SmoothedPosition { get; set; }
+        public Quaternion SmoothedRotation { get; set; } = Quaternion.identity;
+        public bool HasSmoothedPose { get; set; } = false;
 
         public string DesiredAircraftType { get; set; }
 
@@ -26,6 +31,38 @@ namespace TCAMultiplayer.Networking
         // Used in InterpolationBuffer: remoteRenderTime = Time.time - ClockOffset - delay
         public float ClockOffset { get; set; } = 0f;
         public bool ClockOffsetInitialized { get; set; } = false;
+
+        // Asymmetric EMA clock offset tracking.
+        // Fast-down (tau=0.1s): quickly adapts when genuine faster path appears,
+        //   keeps render point close to minimum latency = maximum buffer.
+        // Slow-up (tau=3s): filters stutter-induced high offsets that would
+        //   push render point backward and waste buffer.
+        private const float CLOCK_TAU_DOWN = 0.1f;
+        private const float CLOCK_TAU_UP = 3.0f;
+
+        public void RecordClockSample(float instantOffset, float localTime)
+        {
+            if (!ClockOffsetInitialized)
+            {
+                ClockOffset = instantOffset;
+                ClockOffsetInitialized = true;
+                return;
+            }
+
+            float dt = Mathf.Max(Time.deltaTime, 0.001f);
+            float tau = (instantOffset < ClockOffset) ? CLOCK_TAU_DOWN : CLOCK_TAU_UP;
+            float alpha = 1f - Mathf.Exp(-dt / tau);
+            ClockOffset = Mathf.Lerp(ClockOffset, instantOffset, alpha);
+        }
+
+        /// <summary>
+        /// Reset clock sync state (call on respawn/destroy to re-acquire offset).
+        /// </summary>
+        public void ResetClock()
+        {
+            ClockOffset = 0f;
+            ClockOffsetInitialized = false;
+        }
 
         // Display state (what we actually render)
         public Vector3 DisplayPosition { get; set; } = Vector3.zero;
@@ -309,121 +346,142 @@ namespace TCAMultiplayer.Networking
         /// </summary>
         public void Update()
         {
-            UpdateLocalPlayerPosition();
+            try { var cam = Camera.main; if (cam != null) _localPlayerPosition = cam.transform.position; } catch { }
             TryRetryAllClones();
         }
 
+        /// <summary>
+        /// LateUpdate: no position writes. Unity's RigidbodyInterpolation.Interpolate
+        /// handles smooth rendering between FixedUpdate positions automatically.
+        /// </summary>
         public void LateUpdate()
         {
-            UpdateAllInterpolation();
-        }
-
-        private void UpdateLocalPlayerPosition()
-        {
-            try
+            // Nothing — Unity interpolation renders the rigidbody smoothly.
+            // We only store display state for other systems that read it.
+            foreach (var kvp in _remotePlayers)
             {
-                var cam = Camera.main;
-                if (cam != null)
+                var state = kvp.Value;
+                if (state.Aircraft == null) continue;
+                try
                 {
-                    _localPlayerPosition = cam.transform.position;
+                    if (!state.Aircraft) continue;
+                    // Cache the Unity-interpolated position for other systems (HUD, radar, etc.)
+                    state.DisplayPosition = state.Aircraft.transform.position;
+                    state.DisplayRotation = state.Aircraft.transform.rotation;
                 }
+                catch { }
             }
-            catch { }
         }
 
-        private void UpdateAllInterpolation()
+        /// <summary>
+        /// FixedUpdate: VELOCITY-STEERING.
+        /// Compute interpolated target position, then set rb.velocity so the rigidbody
+        /// moves there over the next physics step. Unity's built-in Rigidbody interpolation
+        /// smoothly renders between physics steps at any display framerate.
+        /// This is the SAME rendering pipeline the local player uses.
+        /// </summary>
+        public void FixedUpdate()
         {
-            List<RemoteAircraftState> states;
-            lock (_playersLock)
+            foreach (var kvp in _remotePlayers)
             {
-                states = new List<RemoteAircraftState>(_remotePlayers.Values);
-            }
-
-            foreach (var state in states)
-            {
-                UpdateInterpolationForState(state);
+                var state = kvp.Value;
+                VelocitySteerForState(state);
             }
         }
 
-        private void UpdateInterpolationForState(RemoteAircraftState state)
+        private void VelocitySteerForState(RemoteAircraftState state)
         {
             if (state.Aircraft == null) return;
             if (!state.Buffer.HasData) return;
 
             try
             {
-                // Safety: check if Unity has destroyed the GameObject externally
-                if (!state.Aircraft)
-                {
-                    state.Aircraft = null;
-                    state.Controller = null;
-                    return;
-                }
-                
-                // Silently ensure ALL rigidbodies stay kinematic (some aircraft use child rigidbodies)
-                var rigidbodies = state.Aircraft.GetComponentsInChildren<Rigidbody>(true);
-                foreach (var rb in rigidbodies)
-                {
-                    if (rb != null && !rb.isKinematic)
-                    {
-                        rb.isKinematic = true;
-                        rb.useGravity = false;
-                    }
-                }
+                if (!state.Aircraft) { state.Aircraft = null; state.Controller = null; return; }
 
-                // Diagnostic: detect external pose writes between our interpolation ticks.
-                // If this fires, another system is moving the remote aircraft transform.
-                if (state.HasAppliedPose)
-                {
-                    var currentPos = state.Aircraft.transform.position;
-                    var currentRot = state.Aircraft.transform.rotation;
-                    float externalMoveDist = Vector3.Distance(currentPos, state.LastAppliedPosition);
-                    float externalRotDeg = Quaternion.Angle(currentRot, state.LastAppliedRotation);
+                var rb = state.Aircraft.GetComponent<Rigidbody>();
+                if (rb == null) return;
 
-                    if ((externalMoveDist > 1.5f || externalRotDeg > 4f) &&
-                        LogHelper.IsEnabled(LogCategory.Interpolation) &&
-                        LogHelper.ShouldLogInterval($"RemoteAircraftManager.ExternalWrite.{state.PeerId}", 1.0f))
-                    {
-                        LogHelper.Info(LogCategory.Interpolation,
-                            $"[JitterDiag] Peer {state.PeerId} external transform write detected " +
-                            $"move={externalMoveDist:F2}m rot={externalRotDeg:F1}deg " +
-                            $"dt={Time.deltaTime:F3}s extrap={state.IsExtrapolating}");
-                    }
-                }
-                
-                var (position, rotation, isExtrapolating, justTeleported) = state.Buffer.GetInterpolatedState();
+                // Enforce non-kinematic + no gravity every physics step
+                // (in case any game system resets these)
+                if (rb.isKinematic) rb.isKinematic = false;
+                if (rb.useGravity) rb.useGravity = false;
+                if (rb.interpolation != RigidbodyInterpolation.Interpolate)
+                    rb.interpolation = RigidbodyInterpolation.Interpolate;
+                if (rb.drag != 0f) rb.drag = 0f;
+                if (rb.angularDrag != 0f) rb.angularDrag = 0f;
 
-                state.DisplayPosition = position;
-                state.DisplayRotation = rotation;
+                var (targetPos, targetRot, isExtrapolating, justTeleported) = state.Buffer.GetInterpolatedState();
+
                 state.IsExtrapolating = isExtrapolating;
 
-                if (justTeleported && state.Aircraft != null)
+                float dt = Time.fixedDeltaTime;
+
+                if (justTeleported || !state.HasAppliedPose)
                 {
-                    var trail = state.Aircraft.GetComponentInChildren<TrailRenderer>();
-                    if (trail != null)
+                    // Snap on teleport (FloatingOrigin shift) or first frame
+                    rb.position = targetPos;
+                    rb.rotation = targetRot;
+                    rb.velocity = Vector3.zero;
+                    rb.angularVelocity = Vector3.zero;
+                    state.Aircraft.transform.position = targetPos;
+                    state.Aircraft.transform.rotation = targetRot;
+                }
+                else
+                {
+                    // VELOCITY STEERING: set velocity so rigidbody arrives at target
+                    // over the next FixedUpdate step. Unity physics integrates this,
+                    // and RigidbodyInterpolation.Interpolate smoothly renders between steps.
+                    rb.velocity = (targetPos - rb.position) / dt;
+
+                    // Data-driven velocity bound: use the synced packet velocity magnitude as reference.
+                    // The aircraft's actual speed comes from the game engine — no hardcoded limits.
+                    float packetSpeed = state.LastVelocity.magnitude;
+                    float steeringSpeed = rb.velocity.magnitude;
+                    float maxReasonableSpeed = Mathf.Max(packetSpeed * 2f, packetSpeed + 10f);
+                    if (maxReasonableSpeed > 0.1f && steeringSpeed > maxReasonableSpeed)
                     {
-                        trail.Clear();
+                        rb.velocity = rb.velocity * (maxReasonableSpeed / steeringSpeed);
+                    }
+
+                    // Angular velocity steering: compute the shortest rotation and convert to angular velocity
+                    Quaternion deltaRot = targetRot * Quaternion.Inverse(rb.rotation);
+                    // Ensure shortest path
+                    if (deltaRot.w < 0f)
+                    {
+                        deltaRot.x = -deltaRot.x;
+                        deltaRot.y = -deltaRot.y;
+                        deltaRot.z = -deltaRot.z;
+                        deltaRot.w = -deltaRot.w;
+                    }
+                    deltaRot.ToAngleAxis(out float angle, out Vector3 axis);
+                    if (angle > 0.001f && axis.sqrMagnitude > 0.001f)
+                    {
+                        rb.angularVelocity = axis.normalized * (angle * Mathf.Deg2Rad / dt);
+
+                        // Data-driven angular velocity bound using packet data
+                        var newest = state.Buffer.GetNewestSnapshot();
+                        if (newest.IsValid)
+                        {
+                            float packetAngSpeed = newest.AngularVelocity.magnitude;
+                            float steeringAngSpeed = rb.angularVelocity.magnitude;
+                            float maxReasonableAngSpeed = Mathf.Max(packetAngSpeed * 2f, packetAngSpeed + 1f);
+                            if (maxReasonableAngSpeed > 0.01f && steeringAngSpeed > maxReasonableAngSpeed)
+                            {
+                                rb.angularVelocity = rb.angularVelocity * (maxReasonableAngSpeed / steeringAngSpeed);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        rb.angularVelocity = Vector3.zero;
                     }
                 }
 
-                if (state.IsExtrapolating != state.WasExtrapolating)
-                {
-                    LogHelper.Info(LogCategory.Interpolation,
-                        $"[RemoteAircraftManager] Peer {state.PeerId} extrapolation {(state.IsExtrapolating ? "started" : "ended")} " +
-                        $"after {state.TimeSinceUpdate:F2}s");
-                }
-                state.WasExtrapolating = state.IsExtrapolating;
-
-                // Apply to object — position is in local space, converted from absolute in GetInterpolatedState
-                state.Aircraft.transform.position = state.DisplayPosition;
-                state.Aircraft.transform.rotation = state.DisplayRotation;
-                state.LastAppliedPosition = state.DisplayPosition;
-                state.LastAppliedRotation = state.DisplayRotation;
                 state.HasAppliedPose = true;
             }
             catch (Exception ex)
             {
-                Plugin.Log.LogError($"[RemoteAircraftManager] Interpolation error for peer {state.PeerId}: {ex.Message}");
+                Plugin.Log.LogError($"[RemoteAircraftManager] VelocitySteer error: {ex.Message}");
             }
         }
 
@@ -525,36 +583,14 @@ namespace TCAMultiplayer.Networking
                 state.LastSequenceNumber = packet.SequenceNumber;
                 state.LastUpdateTime = Time.time;
 
-                // Calculate instant offset: how much AHEAD local time is vs remote time.
-                // ClockOffset = LocalTime - RemoteTime
+                // Clock offset: use sliding-window minimum.
+                // The minimum over a recent time window represents the fastest
+                // packet (least network delay) and gives a stable estimate of
+                // true_clock_diff + base_latency.  Old all-time-min + slow-drift
+                // was vulnerable to a single fast packet permanently biasing the
+                // render point forward, causing buffer underruns and jitter.
                 float instantOffset = Time.time - packet.Timestamp;
-                
-                // Track the true clock difference + base ping.
-                // We track the minimum offset because that represents the fastest packet
-                // (the one with the least network delay).
-                if (!state.ClockOffsetInitialized)
-                {
-                    state.ClockOffset = instantOffset;
-                    state.ClockOffsetInitialized = true;
-                }
-                else
-                {
-                    if (instantOffset < state.ClockOffset)
-                    {
-                        // Found a packet with lower latency.
-                        // Only snap if it's significantly faster to avoid micro-jitter
-                        if (state.ClockOffset - instantOffset > 0.005f)
-                        {
-                            state.ClockOffset = instantOffset;
-                        }
-                    }
-                    else
-                    {
-                        // Slowly drift upwards to handle remote clock drifting ahead.
-                        // This drift is extremely slow to keep the clock stable.
-                        state.ClockOffset += Time.deltaTime * 0.0001f;
-                    }
-                }
+                state.RecordClockSample(instantOffset, Time.time);
 
                 // Propagate stable clock offset to interpolation buffer
                 state.Buffer.ClockOffset = state.ClockOffset;
@@ -667,7 +703,7 @@ namespace TCAMultiplayer.Networking
                 state.Controller = null;
                 state.Buffer.Clear();
                 state.UsingRealAircraft = false;
-                state.ClockOffsetInitialized = false;
+                state.ResetClock();
 
                 Plugin.Log.LogInfo($"[RemoteAircraftManager] Peer {peerId} destroyed — aircraft despawned, waiting for respawn");
             }
@@ -699,7 +735,7 @@ namespace TCAMultiplayer.Networking
                 state.Buffer.Clear();
                 state.NeedsRespawn = false;
                 state.DestroyedTime = 0f;
-                state.ClockOffsetInitialized = false;  // Reset clock offset for new aircraft
+                state.ResetClock();  // Reset clock offset for new aircraft
                 state.LastSequenceNumber = 0;  // Reset sequence number for new aircraft
 
                 Plugin.Log.LogInfo($"[RemoteAircraftManager] Peer {peerId} ready for new aircraft on next state packet");
@@ -836,6 +872,12 @@ namespace TCAMultiplayer.Networking
 
                     if (state.Aircraft != null)
                     {
+                        // CRITICAL: Configure the clone the same way as native spawn.
+                        // Without this, UniAircraft stays enabled, rigidbodies stay
+                        // non-kinematic, and the game's physics fights our interpolation
+                        // every frame — causing the 1-10m jitter.
+                        ConfigureRemoteAircraft(state.Aircraft);
+
                         state.UsingRealAircraft = true;
                         state.NeedsCloneRetry = false;
                         state.Controller = state.Aircraft.GetComponent<RemoteAircraftController>();
@@ -1184,10 +1226,51 @@ namespace TCAMultiplayer.Networking
         /// </summary>
         private void ConfigureRemoteAircraft(GameObject aircraft)
         {
+            Plugin.Log.LogWarning($"[RemoteAircraftManager] ConfigureRemoteAircraft ENTER for {aircraft?.name}");
             try
             {
                 // Disable player-specific components
                 DisableAIPilot(aircraft);
+
+                // CRITICAL: Blacklist from FloatingOrigin so it never moves this object.
+                // Our interpolation converts absolute→local each frame using the current
+                // TotalOffset, so we don't need the origin shift to touch the transform.
+                // Without this, FixedUpdate shifts the aircraft to a wrong position, and
+                // any system that reads it between FixedUpdate and our LateUpdate sees garbage.
+                try
+                {
+                    // Try property first (Blacklist is a static property, not a field)
+                    var blacklistProp = typeof(Falcon.World.FloatingOrigin)
+                        .GetProperty("Blacklist", BindingFlags.Public | BindingFlags.Static);
+                    object listObj = null;
+                    if (blacklistProp != null)
+                    {
+                        listObj = blacklistProp.GetValue(null);
+                    }
+                    else
+                    {
+                        // Fallback: try as field
+                        var blacklistField = typeof(Falcon.World.FloatingOrigin)
+                            .GetField("Blacklist", BindingFlags.Public | BindingFlags.Static);
+                        if (blacklistField != null)
+                            listObj = blacklistField.GetValue(null);
+                    }
+
+                    var list = listObj as System.Collections.IList;
+                    if (list != null && !list.Contains(aircraft))
+                    {
+                        list.Add(aircraft);
+                        Plugin.Log.LogInfo($"[RemoteAircraftManager] Added remote aircraft to FloatingOrigin.Blacklist (prop={blacklistProp != null})");
+                    }
+                    else if (list == null)
+                    {
+                        Plugin.Log.LogWarning("[RemoteAircraftManager] FloatingOrigin.Blacklist not found as property or field!");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Plugin.Log.LogWarning($"[RemoteAircraftManager] FloatingOrigin blacklist failed: {ex.Message}");
+                }
 
                 // CRITICAL: Disable UniAircraft component to prevent its FixedUpdate from
                 // resetting isKinematic=false every physics frame. The remote aircraft is
@@ -1197,26 +1280,127 @@ namespace TCAMultiplayer.Networking
                 {
                     uniAircraft.enabled = false;
                     Plugin.Log.LogInfo("[RemoteAircraftManager] Disabled UniAircraft component (prevents physics FixedUpdate)");
+
+                    // FIX: Prevent collision-triggered VFX and damage on remote aircraft.
+                    // Unity's OnCollisionEnter/OnCollisionStay fire even on disabled MonoBehaviours.
+                    // The remote clone's collisions with terrain trigger HandleFuselageImpact which:
+                    //  1. Spawns impact VFX (HardFuselageImpactPrefab etc.) → "nuclear explosion" visuals
+                    //  2. Applies damage → HP reaches 0 → DestroyAircraft() → spawns GroundImpactPrefab
+                    //     AND SpawnCrater which triggers explosion sync packets back to the client
+                    // Fix: null all VFX prefabs AND make Damage invulnerable AND disable colliders.
+                    try
+                    {
+                        var uniType = uniAircraft.GetType();
+                        
+                        // 1. Null out all impact/explosion VFX prefab fields
+                        string[] vfxFieldNames = {
+                            "HardFuselageImpactPrefab", "SoftFuselageImpactPrefab",
+                            "WaterFuselageImpactPrefab", "GroundImpactPrefab",
+                            "AirExplosionPrefab", "WaterImpactPrefab"
+                        };
+                        int nulled = 0;
+                        foreach (var fieldName in vfxFieldNames)
+                        {
+                            var field = uniType.GetField(fieldName,
+                                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                            if (field != null)
+                            {
+                                field.SetValue(uniAircraft, null);
+                                nulled++;
+                            }
+                        }
+                        Plugin.Log.LogInfo($"[RemoteAircraftManager] Nulled {nulled} impact/explosion VFX prefabs on remote aircraft");
+                        
+                        // 2. Make Damage component invulnerable so collision damage doesn't destroy the clone
+                        var damageProp = uniType.GetProperty("Damage",
+                            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                        if (damageProp != null)
+                        {
+                            var damageable = damageProp.GetValue(uniAircraft);
+                            if (damageable != null)
+                            {
+                                // Set MaxHitpoints very high so it never dies from collision damage
+                                var maxHpProp = damageable.GetType().GetProperty("MaxHitpoints",
+                                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                                if (maxHpProp != null && maxHpProp.CanWrite)
+                                    maxHpProp.SetValue(damageable, 999999);
+                                else
+                                {
+                                    var maxHpField = damageable.GetType().GetField("MaxHitpoints",
+                                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                                    if (maxHpField != null)
+                                        maxHpField.SetValue(damageable, 999999);
+                                }
+                                Plugin.Log.LogInfo("[RemoteAircraftManager] Set Damage.MaxHitpoints=999999 on remote aircraft");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.Log.LogWarning($"[RemoteAircraftManager] Failed to configure remote aircraft safety: {ex.Message}");
+                    }
                 }
 
-                // CRITICAL: Make ALL rigidbodies kinematic to prevent physics from fighting
-                // with manual network interpolation updates.
-                var rigidbodies = aircraft.GetComponentsInChildren<Rigidbody>(true);
-                if (rigidbodies.Length > 0)
+                // VELOCITY-STEERING: Configure the ROOT rigidbody as non-kinematic with
+                // Unity interpolation. We'll set rb.velocity each FixedUpdate to steer it
+                // toward the interpolated target. Unity's physics integration moves it,
+                // and RigidbodyInterpolation.Interpolate smoothly renders between physics steps.
+                // This is the SAME rendering pipeline the local player uses.
+                //
+                // Child rigidbodies (e.g. landing gear, weapons) stay kinematic.
+                var rootRb = aircraft.GetComponent<Rigidbody>();
+                if (rootRb != null)
                 {
-                    foreach (var rb in rigidbodies)
-                    {
-                        if (rb == null) continue;
-                        rb.isKinematic = true;
-                        rb.useGravity = false;
-                        rb.interpolation = RigidbodyInterpolation.None;
-                        rb.collisionDetectionMode = CollisionDetectionMode.ContinuousSpeculative;
-                    }
-                    Plugin.Log.LogInfo($"[RemoteAircraftManager] Set {rigidbodies.Length} Rigidbody components to kinematic (prevents physics/position fight)");
+                    rootRb.isKinematic = false;
+                    rootRb.useGravity = false;
+                    rootRb.drag = 0f;
+                    rootRb.angularDrag = 0f;
+                    rootRb.interpolation = RigidbodyInterpolation.Interpolate;
+                    rootRb.collisionDetectionMode = CollisionDetectionMode.Discrete;
+                    // Disable collision response: remote aircraft doesn't need to physically collide
+                    // with terrain. OnCollisionEnter/Stay still fire on disabled MonoBehaviours and cause
+                    // damage + VFX. Using detectCollisions=false prevents ALL collision callbacks while
+                    // keeping colliders active for raycast hit detection (bullets, missiles).
+                    rootRb.detectCollisions = false;
+                    rootRb.constraints = RigidbodyConstraints.None;
+                    rootRb.velocity = Vector3.zero;
+                    rootRb.angularVelocity = Vector3.zero;
+                    Plugin.Log.LogInfo($"[RemoteAircraftManager] Root Rigidbody: non-kinematic + Interpolate (velocity-steering mode)");
                 }
                 else
                 {
+                    Plugin.Log.LogWarning("[RemoteAircraftManager] No root Rigidbody found!");
+                }
+
+                // Child rigidbodies stay kinematic (weapons, gear, etc.)
+                var allRbs = aircraft.GetComponentsInChildren<Rigidbody>(true);
+                int childCount = 0;
+                foreach (var rb in allRbs)
+                {
+                    if (rb == null || rb == rootRb) continue;
+                    rb.isKinematic = true;
+                    rb.useGravity = false;
+                    rb.interpolation = RigidbodyInterpolation.None;
+                    childCount++;
+                }
+                if (childCount > 0)
+                    Plugin.Log.LogInfo($"[RemoteAircraftManager] Set {childCount} child Rigidbodies to kinematic");
+                else
+                {
                     Plugin.Log.LogWarning("[RemoteAircraftManager] No Rigidbody found on remote aircraft");
+                }
+
+                // Prevent animation/root-motion systems from writing transform deltas.
+                var animators = aircraft.GetComponentsInChildren<Animator>(true);
+                foreach (var animator in animators)
+                {
+                    if (animator == null) continue;
+                    animator.applyRootMotion = false;
+                    animator.updateMode = AnimatorUpdateMode.Normal;
+                }
+                if (animators.Length > 0)
+                {
+                    Plugin.Log.LogInfo($"[RemoteAircraftManager] Configured {animators.Length} Animator components (root motion disabled)");
                 }
 
                 // Disable cockpit camera
@@ -1236,6 +1420,7 @@ namespace TCAMultiplayer.Networking
                 {
                     listener.enabled = false;
                 }
+
             }
             catch (Exception ex)
             {
@@ -1687,6 +1872,23 @@ namespace TCAMultiplayer.Networking
             if (state.Aircraft != null)
             {
                 Plugin.Log.LogInfo($"[RemoteAircraftManager] Cleaning up remote aircraft for peer {state.PeerId}");
+
+                try
+                {
+                    var prop = typeof(Falcon.World.FloatingOrigin)
+                        .GetProperty("Blacklist", BindingFlags.Public | BindingFlags.Static);
+                    object listObj = null;
+                    if (prop != null) listObj = prop.GetValue(null);
+                    else
+                    {
+                        var field = typeof(Falcon.World.FloatingOrigin)
+                            .GetField("Blacklist", BindingFlags.Public | BindingFlags.Static);
+                        if (field != null) listObj = field.GetValue(null);
+                    }
+                    (listObj as System.Collections.IList)?.Remove(state.Aircraft);
+                }
+                catch { }
+
                 GameObject.Destroy(state.Aircraft);
                 state.Aircraft = null;
             }

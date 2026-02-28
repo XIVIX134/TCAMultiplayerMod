@@ -140,27 +140,38 @@ namespace TCAMultiplayer.Networking
                 (GameState.Connecting, GameState.Disconnected) => true, // Connection failed
 
                 // From Lobby states
+                (GameState.HostingLobby, GameState.HostingLobby) => true, // Re-host (port/name change)
                 (GameState.HostingLobby, GameState.Loading) => true,
                 (GameState.ClientLobby, GameState.Loading) => true,
 
                 // From Loading
                 (GameState.Loading, GameState.WaitingForPlayers) => true,
+                (GameState.Loading, GameState.HostingLobby) => true,    // Return to lobby
+                (GameState.Loading, GameState.ClientLobby) => true,      // Return to lobby
                 (GameState.Loading, GameState.Disconnected) => true, // Loading failed
 
                 // From WaitingForPlayers
                 (GameState.WaitingForPlayers, GameState.Spawning) => true,
+                (GameState.WaitingForPlayers, GameState.HostingLobby) => true, // Return to lobby
+                (GameState.WaitingForPlayers, GameState.ClientLobby) => true,   // Return to lobby
                 (GameState.WaitingForPlayers, GameState.Disconnected) => true, // Timeout
 
                 // From Spawning
                 (GameState.Spawning, GameState.InGame) => true,
+                (GameState.Spawning, GameState.HostingLobby) => true,   // Return to lobby
+                (GameState.Spawning, GameState.ClientLobby) => true,     // Return to lobby
                 (GameState.Spawning, GameState.Disconnected) => true, // Spawn failed
 
                 // From InGame
                 (GameState.InGame, GameState.Respawning) => true,
+                (GameState.InGame, GameState.HostingLobby) => true,     // End sortie -> lobby
+                (GameState.InGame, GameState.ClientLobby) => true,       // End sortie -> lobby
                 (GameState.InGame, GameState.Disconnected) => true, // Disconnect
 
                 // From Respawning
                 (GameState.Respawning, GameState.InGame) => true, // Respawned
+                (GameState.Respawning, GameState.HostingLobby) => true, // End sortie -> lobby
+                (GameState.Respawning, GameState.ClientLobby) => true,  // End sortie -> lobby
                 (GameState.Respawning, GameState.Disconnected) => true, // Leave
 
                 _ => false

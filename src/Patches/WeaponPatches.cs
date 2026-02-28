@@ -196,7 +196,16 @@ namespace TCAMultiplayer.Patches
                     SendMissileLaunchFromPolling(missile);
                 }
 
+
                 _lastKnownMissileCount = currentCount;
+
+                // FIX M7: Prevent unbounded growth of _processedMissileIds.
+                // When LaunchedMissiles shrinks (missiles expired), we can safely clear old IDs.
+                if (currentCount == 0 && _processedMissileIds.Count > 0)
+                {
+                    _processedMissileIds.Clear();
+                    _missileLastTarget.Clear();
+                }
             }
             catch (Exception ex)
             {
@@ -260,6 +269,78 @@ namespace TCAMultiplayer.Patches
             {
                 if (LogHelper.ShouldLogInterval("WeaponPatches.PollMissiles.UpdateError", 5f))
                     Plugin.Log?.LogWarning($"[WeaponPatches] PollMissileTargetUpdate error: {ex.Message}");
+            }
+        }
+
+        // Missile position sync state
+        private static double _lastMissilePositionSyncTime = 0;
+        private const double MISSILE_POSITION_SYNC_INTERVAL = 0.1; // 10Hz
+
+        /// <summary>
+        /// Send position/velocity updates for all active launched missiles.
+        /// Called every frame from FlightGamePatches; self-throttled to ~10Hz.
+        /// Sent unreliable (UDP) since stale positions are worse than dropped ones.
+        /// </summary>
+        public static void PollMissilePositionSync()
+        {
+            try
+            {
+                if (Plugin.Instance == null || Plugin.Instance.Network == null) return;
+                if (!Plugin.Instance.Network.IsConnected) return;
+
+                double now = UnityEngine.Time.timeAsDouble;
+                if (now - _lastMissilePositionSyncTime < MISSILE_POSITION_SYNC_INTERVAL) return;
+                _lastMissilePositionSyncTime = now;
+
+                if (_launchedMissilesList == null || _launchedMissilesList.Count == 0) return;
+                if (_munitionVelocityField == null) return;
+
+                var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+                for (int i = 0; i < _launchedMissilesList.Count; i++)
+                {
+                    var missile = _launchedMissilesList[i];
+                    if (missile == null) continue;
+
+                    var comp = missile as UnityEngine.Component;
+                    if (comp == null || comp.gameObject == null) continue;
+                    if (comp.gameObject.name.StartsWith("MP_")) continue; // Skip network missiles
+
+                    int instanceId = comp.GetInstanceID();
+                    if (!_processedMissileIds.Contains(instanceId)) continue; // Only sync missiles we launched
+
+                    // Check if still active
+                    bool isActive = comp.gameObject.activeInHierarchy;
+
+                    // Get position (convert to absolute for floating-origin safety)
+                    UnityEngine.Vector3 localPos = comp.transform.position;
+                    var absolutePos = FloatingOriginHelper.LocalToAbsolute(localPos);
+
+                    // Get velocity via reflection
+                    UnityEngine.Vector3 vel = UnityEngine.Vector3.zero;
+                    var velObj = _munitionVelocityField.GetValue(missile);
+                    if (velObj is UnityEngine.Vector3 v3) vel = v3;
+
+                    var packet = new MissilePositionSyncPacket
+                    {
+                        MissileInstanceId = instanceId,
+                        PosX = absolutePos.x,
+                        PosY = absolutePos.y,
+                        PosZ = absolutePos.z,
+                        VelX = vel.x,
+                        VelY = vel.y,
+                        VelZ = vel.z,
+                        IsActive = isActive
+                    };
+
+                    byte[] data = PacketSerializer.SerializeMissilePositionSync(packet);
+                    Plugin.Instance.Network.SendPacket(PacketType.MissilePositionSync, data, reliable: false);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (LogHelper.ShouldLogInterval("MissilePosSync", 5f))
+                    Plugin.Log?.LogWarning($"[WeaponPatches] PollMissilePositionSync error: {ex.Message}");
             }
         }
 

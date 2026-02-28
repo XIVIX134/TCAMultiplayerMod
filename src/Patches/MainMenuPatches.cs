@@ -25,7 +25,10 @@ namespace TCAMultiplayer.Patches
 
             UIFactory.Initialize(__instance);
 
-            if (_multiplayerButtonGo != null) return;
+            // Use ReferenceEquals-safe Unity null check. If the old button's scene was unloaded,
+            // the C# reference is non-null but the Unity object is destroyed.
+            if (_multiplayerButtonGo != null && _multiplayerButtonGo) return;
+            _multiplayerButtonGo = null; // Clear stale reference if destroyed
 
             Plugin.Log?.LogInfo("[MainMenuPatches] Injecting Multiplayer button into Main Menu...");
 

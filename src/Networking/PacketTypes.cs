@@ -72,7 +72,8 @@ namespace TCAMultiplayer.Networking
         LobbySpawnPlayers = 68,    // Trigger synchronized spawn
         LobbyRespawnRequest = 69,  // Player requests respawn after death
         LobbyWelcome = 70,         // Host welcomes client with assigned PeerID
-        
+        LobbyReturnToLobby = 71,   // Host forces all players back to multiplayer lobby
+
         // Mod Compatibility (sent during handshake)
         ModManifest = 75,          // Client sends mod manifest to host
         ModCompatibilityResult = 76, // Host responds with compatibility check result
@@ -81,7 +82,10 @@ namespace TCAMultiplayer.Networking
         ExplosionSync = 78,         // Explosion VFX/effect sync between players
 
         // Aircraft destruction VFX (reliable)
-        AircraftDestructionVfx = 79 // Aircraft explosion VFX sync between players
+        AircraftDestructionVfx = 79, // Aircraft explosion VFX sync between players
+
+        // Missile position sync (unreliable, high frequency)
+        MissilePositionSync = 80,    // Continuous missile position/velocity correction
     }
     
     /// <summary>
@@ -417,6 +421,23 @@ namespace TCAMultiplayer.Networking
         public int MissileInstanceId;
         public ulong TargetId;
         public bool IsTracking;
+    }
+
+    /// <summary>
+    /// Continuous missile position/velocity sync packet.
+    /// Sent by the attacker at ~10Hz so the receiver can correct trajectory divergence.
+    /// Uses absolute coordinates for floating-origin safety.
+    /// </summary>
+    public struct MissilePositionSyncPacket
+    {
+        public int MissileInstanceId;  // Sender's instance ID (maps to _missileIdToLocalMunition)
+        public double PosX;            // Absolute position
+        public double PosY;
+        public double PosZ;
+        public float VelX;             // Current velocity
+        public float VelY;
+        public float VelZ;
+        public bool IsActive;          // False = missile expired/exploded, receiver should destroy
     }
 
     /// <summary>
@@ -865,6 +886,42 @@ namespace TCAMultiplayer.Networking
                     MissileInstanceId = reader.ReadInt32(),
                     TargetId = reader.ReadUInt64(),
                     IsTracking = reader.ReadBoolean()
+                };
+            }
+        }
+
+        public static byte[] SerializeMissilePositionSync(MissilePositionSyncPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var writer = new BinaryWriter(ms))
+            {
+                writer.Write(packet.MissileInstanceId);
+                writer.Write(packet.PosX);
+                writer.Write(packet.PosY);
+                writer.Write(packet.PosZ);
+                writer.Write(packet.VelX);
+                writer.Write(packet.VelY);
+                writer.Write(packet.VelZ);
+                writer.Write(packet.IsActive);
+                return ms.ToArray();
+            }
+        }
+
+        public static MissilePositionSyncPacket DeserializeMissilePositionSync(byte[] data)
+        {
+            using (var ms = new MemoryStream(data))
+            using (var reader = new BinaryReader(ms))
+            {
+                return new MissilePositionSyncPacket
+                {
+                    MissileInstanceId = reader.ReadInt32(),
+                    PosX = reader.ReadDouble(),
+                    PosY = reader.ReadDouble(),
+                    PosZ = reader.ReadDouble(),
+                    VelX = reader.ReadSingle(),
+                    VelY = reader.ReadSingle(),
+                    VelZ = reader.ReadSingle(),
+                    IsActive = reader.ReadBoolean()
                 };
             }
         }

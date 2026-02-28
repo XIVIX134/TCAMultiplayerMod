@@ -11,6 +11,7 @@ using Cysharp.Threading.Tasks;
 using UnityEngine.SceneManagement;
 using Falcon.Database;
 using Falcon.Game2;
+using Falcon.UI;
 using Falcon.World;
 
 namespace TCAMultiplayer
@@ -43,6 +44,7 @@ namespace TCAMultiplayer
         
         public static ConfigEntry<string> ConfigLocalAircraft { get; private set; }
         public static ConfigEntry<string> ConfigLocalLoadout { get; private set; }
+        public static ConfigEntry<string> ConfigLocalAirfield { get; private set; }
         
         // Host settings
         public static ConfigEntry<int> ConfigHostSpawnType { get; private set; }
@@ -62,6 +64,8 @@ namespace TCAMultiplayer
 
         private Harmony _harmony;
         private GameObject _runnerObject;
+        private bool _isReturningToLobby;
+        private bool _isSpawningLocal;
 
         private void Awake()
         {
@@ -157,7 +161,7 @@ namespace TCAMultiplayer
                     if (success)
                     {
                         RespawnUI?.Hide();
-                        GameState?.OnSpawnComplete();
+                        HandleLocalRespawnCompleted();
                     }
                     else
                     {
@@ -167,7 +171,7 @@ namespace TCAMultiplayer
 
                 Log.LogInfo("===========================================");
                 Log.LogInfo("TCA Multiplayer loaded successfully!");
-                Log.LogInfo("Press F8 to toggle multiplayer menu");
+                Log.LogInfo("Click MULTIPLAYER on the main menu to open the lobby");
                 Log.LogInfo("===========================================");
             }
             catch (Exception ex)
@@ -181,6 +185,7 @@ namespace TCAMultiplayer
         {
             try
             {
+                TeardownLobbyEvents();
                 InstanceLogger.Shutdown();
                 _harmony?.UnpatchSelf();
                 Network?.Shutdown();
@@ -202,99 +207,146 @@ namespace TCAMultiplayer
             // by MultiplayerMenu.cs (native Canvas UI). No IMGUI event wiring needed.
 
             // Lobby events -> scene loading / spawning
-            Lobby.OnGameStarting += async () =>
+            // Use named methods instead of lambdas so they can be unsubscribed.
+            Lobby.OnGameStarting += OnGameStarting;
+            Lobby.OnAllPlayersLoaded += OnAllPlayersLoaded;
+            Lobby.OnSpawnPlayers += OnSpawnPlayers;
+            Spawner.OnPlayerDied += OnPlayerDied;
+        }
+
+        /// <summary>
+        /// Unsubscribe events wired in SetupLobbyEvents. Call during cleanup/dispose.
+        /// </summary>
+        private void TeardownLobbyEvents()
+        {
+            if (Lobby != null)
             {
-                Log.LogInfo("[Plugin] Game starting - loading scenes...");
-                GameState?.StartLoading();
+                Lobby.OnGameStarting -= OnGameStarting;
+                Lobby.OnAllPlayersLoaded -= OnAllPlayersLoaded;
+                Lobby.OnSpawnPlayers -= OnSpawnPlayers;
+            }
+            if (Spawner != null)
+            {
+                Spawner.OnPlayerDied -= OnPlayerDied;
+            }
+        }
 
-                try
+        private async void OnGameStarting()
+        {
+            Log.LogInfo("[Plugin] Game starting - loading scenes...");
+            bool canStartLoading = GameState?.StartLoading() ?? false;
+            if (!canStartLoading)
+            {
+                Log.LogWarning($"[Plugin] Ignoring duplicate game-start request in state {GameState?.CurrentState}");
+                return;
+            }
+
+            try
+            {
+                // Ensure stale airfield references from previous flights are discarded.
+                AirfieldHelper.ClearCache();
+                string mapName = Lobby?.MapName;
+                if (string.IsNullOrWhiteSpace(mapName))
                 {
-                    // 1. Load FlightGame scene (Core game logic)
-                    Log.LogInfo("[Plugin] Loading FlightGame scene...");
-                    await SceneManager.LoadSceneAsync("FlightGame", LoadSceneMode.Additive);
+                    mapName = "ActionIsland";
+                }
 
-                    // 2. Load Map
-                    string mapName = Lobby.MapName;
-                    Log.LogInfo($"[Plugin] Loading Map: {mapName}...");
+                // Defensive cleanup: if an earlier flow left duplicate gameplay scenes loaded,
+                // clear them before starting a new sortie.
+                await UnloadAllScenesByName("FlightGame");
+                if (!string.Equals(mapName, "FlightGame", StringComparison.OrdinalIgnoreCase))
+                {
+                    await UnloadAllScenesByName(mapName);
+                }
 
-                    // Try to get map data to find correct scene name
-                    string sceneName = mapName;
-                    /*
-                    try
-                    {
-                        var mapData = GameDataMaps.GetByName(mapName);
-                        if (mapData != null) sceneName = mapData.SceneName;
-                    }
-                    catch (Exception ex)
-                    {
-                        Log.LogWarning($"[Plugin] Could not get map data for {mapName}, using name as scene: {ex.Message}");
-                    }
-                    */
+                // 1. Load FlightGame scene (Core game logic)
+                Log.LogInfo("[Plugin] Loading FlightGame scene...");
+                await SceneManager.LoadSceneAsync("FlightGame", LoadSceneMode.Additive);
 
-                    await SceneManager.LoadSceneAsync(sceneName, LoadSceneMode.Additive);
+                // 2. Load Map
+                Log.LogInfo($"[Plugin] Loading Map: {mapName}...");
+                string sceneName = mapName;
 
-                    // 3. Set Active Scene
-                    Scene flightScene = SceneManager.GetSceneByName("FlightGame");
-                    if (flightScene.IsValid())
-                    {
-                        SceneManager.SetActiveScene(flightScene);
-                    }
+                await SceneManager.LoadSceneAsync(sceneName, LoadSceneMode.Additive);
 
-                    // 4. Wait for FlightGame instance
-                    Log.LogInfo("[Plugin] Waiting for FlightGame initialization...");
-                    float timeout = Time.time + 10f;
-                    FlightGame flightGameInstance = null;
-                    while (flightGameInstance == null && Time.time < timeout)
-                    {
-                        flightGameInstance = FlightGame.Instance;
-                        if (flightGameInstance == null)
-                        {
-                            await UniTask.Yield();
-                        }
-                    }
+                // 3. Set Active Scene
+                Scene flightScene = SceneManager.GetSceneByName("FlightGame");
+                if (flightScene.IsValid())
+                {
+                    SceneManager.SetActiveScene(flightScene);
+                }
 
+                // 4. Wait for FlightGame instance
+                Log.LogInfo("[Plugin] Waiting for FlightGame initialization...");
+                float timeout = Time.time + 10f;
+                FlightGame flightGameInstance = null;
+                while (flightGameInstance == null && Time.time < timeout)
+                {
+                    flightGameInstance = FlightGame.Instance;
                     if (flightGameInstance == null)
                     {
-                        Log.LogError("[Plugin] FlightGame.Instance timed out!");
-                        return; // Exit early - can't proceed without FlightGame
+                        await UniTask.Yield();
                     }
-
-                    Log.LogInfo("[Plugin] FlightGame initialized successfully");
-
-                    // Notify ready - OnLoadingComplete first to set state before SetLocalLoaded triggers OnAllPlayersLoaded
-                    GameState?.OnLoadingComplete();
-                    Lobby?.SetLocalLoaded();
-                    Lobby?.SendLoadingComplete();
                 }
-                catch (Exception ex)
+
+                if (flightGameInstance == null)
                 {
-                    Log.LogError($"[Plugin] Loading error: {ex.Message}\n{ex.StackTrace}");
+                    Log.LogError("[Plugin] FlightGame.Instance timed out!");
+                    return;
                 }
-            };
 
-            Lobby.OnAllPlayersLoaded += () =>
+                Log.LogInfo("[Plugin] FlightGame initialized successfully");
+
+                // Notify ready
+                GameState?.OnLoadingComplete();
+                Lobby?.SetLocalLoaded();
+                Lobby?.SendLoadingComplete();
+            }
+            catch (Exception ex)
             {
-                GameState?.StartSpawning();
-                if (Lobby.IsHost)
+                Log.LogError($"[Plugin] Loading error: {ex.Message}\n{ex.StackTrace}");
+            }
+        }
+
+        private void OnAllPlayersLoaded()
+        {
+            if (Lobby.IsHost)
+            {
+                Log.LogInfo("[Plugin] All players loaded - sending spawn signal");
+                Lobby?.SendSpawnPlayers();
+                Lobby?.HandleSpawnPlayers();
+            }
+        }
+
+        private void OnSpawnPlayers()
+        {
+            if (GameState?.CurrentState == Networking.GameState.InGame)
+            {
+                Log.LogInfo("[Plugin] Ignoring spawn signal while already InGame");
+                return;
+            }
+
+            Log.LogInfo("[Plugin] Spawn signal received");
+            if (GameState?.CurrentState != Networking.GameState.Spawning)
+            {
+                bool started = GameState?.StartSpawning() ?? false;
+                if (!started && GameState?.CurrentState != Networking.GameState.Spawning)
                 {
-                    Log.LogInfo("[Plugin] All players loaded - sending spawn signal");
-                    Lobby?.SendSpawnPlayers();
-                    DoSpawn();
+                    Log.LogWarning($"[Plugin] Ignoring spawn signal in state {GameState?.CurrentState}");
+                    return;
                 }
-            };
+            }
 
-            Lobby.OnSpawnPlayers += () =>
-            {
-                Log.LogInfo("[Plugin] Spawn signal received");
-                GameState?.StartSpawning();
-                DoSpawn();
-            };
+            DoSpawn();
+        }
 
-            // SpawnManager events — show NATIVE respawn screen
-            Spawner.OnPlayerDied += () =>
+        private void OnPlayerDied()
+        {
+            if (GameState?.CurrentState == Networking.GameState.InGame)
             {
-                RespawnUI?.Show();
-            };
+                GameState?.OnPlayerDied();
+            }
+            RespawnUI?.Show();
         }
 
         /// <summary>
@@ -302,41 +354,86 @@ namespace TCAMultiplayer
         /// </summary>
         private void DoSpawn()
         {
-            string airfield = Lobby?.LocalSelectedAirfield;
-            if (string.IsNullOrEmpty(airfield))
+            if (_isSpawningLocal)
             {
-                var airfields = AirfieldHelper.GetAirfieldNames();
-                if (airfields.Length > 0) airfield = airfields[0];
+                Log.LogWarning("[Plugin] DoSpawn ignored: spawn already in progress");
+                return;
             }
 
-            string aircraft = Lobby?.LocalSelectedAircraft ?? "AV8B";
-            Log.LogInfo($"[Plugin] Spawning at {airfield} with type {Lobby?.SpawnType} aircraft={aircraft}");
-            Spawner?.SpawnPlayerAtAirfield(airfield, aircraft, Lobby?.SpawnType ?? LobbySpawnType.Runway);
-
-            // Apply Time of Day
+            _isSpawningLocal = true;
             try
             {
-                var timeOfDay = Lobby?.SelectedTimeOfDay ?? TimeOfDay.Morning;
-                var env = UnityEngine.Object.FindObjectOfType<Falcon.World.Environment>();
-                if (env != null)
+                string airfield = Lobby?.LocalSelectedAirfield;
+                if (string.IsNullOrEmpty(airfield))
                 {
-                    env.SetTimeOfDayPreset(timeOfDay);
-                    Log.LogInfo($"[Plugin] Set time of day: {timeOfDay}");
+                    var airfields = AirfieldHelper.GetAirfieldNames();
+                    if (airfields.Length > 0) airfield = airfields[0];
                 }
-                else
+
+                string aircraft = Lobby?.LocalSelectedAircraft ?? "AV8B";
+                Log.LogInfo($"[Plugin] Spawning at {airfield} with type {Lobby?.SpawnType} aircraft={aircraft}");
+                bool spawnSuccess = false;
+                try
                 {
-                    Log.LogWarning("[Plugin] Environment singleton not found — cannot set time of day");
+                    spawnSuccess = Spawner?.SpawnPlayerAtAirfield(airfield, aircraft, Lobby?.SpawnType ?? LobbySpawnType.Runway) ?? false;
                 }
+                catch (Exception ex)
+                {
+                    Log.LogError($"[Plugin] Spawn exception: {ex.Message}");
+                }
+
+                if (!spawnSuccess)
+                {
+                    Log.LogError("[Plugin] Spawn failed - staying in current state");
+                    return;
+                }
+
+                // Apply Time of Day
+                try
+                {
+                    var timeOfDay = Lobby?.SelectedTimeOfDay ?? TimeOfDay.Morning;
+                    var env = UnityEngine.Object.FindObjectOfType<Falcon.World.Environment>();
+                    if (env != null)
+                    {
+                        env.SetTimeOfDayPreset(timeOfDay);
+                        Log.LogInfo($"[Plugin] Set time of day: {timeOfDay}");
+                    }
+                    else
+                    {
+                        Log.LogWarning("[Plugin] Environment singleton not found — cannot set time of day");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.LogWarning($"[Plugin] Failed to set time of day: {ex.Message}");
+                }
+
+                GameState?.OnSpawnComplete();
+
+                // Ensure ScoreTracker has all players registered with correct names at game start
+                RegisterAllPlayersInScoreTracker();
             }
-            catch (Exception ex)
+            finally
             {
-                Log.LogWarning($"[Plugin] Failed to set time of day: {ex.Message}");
+                _isSpawningLocal = false;
+            }
+        }
+
+        private void HandleLocalRespawnCompleted()
+        {
+            if (GameState == null) return;
+
+            if (GameState.CurrentState == Networking.GameState.Respawning)
+            {
+                GameState.OnRespawned();
+                return;
             }
 
-            GameState?.OnSpawnComplete();
-
-            // Ensure ScoreTracker has all players registered with correct names at game start
-            RegisterAllPlayersInScoreTracker();
+            // Defensive fallback: if this was actually part of initial synchronized spawn flow.
+            if (GameState.CurrentState == Networking.GameState.Spawning)
+            {
+                GameState.OnSpawnComplete();
+            }
         }
 
         /// <summary>
@@ -355,6 +452,191 @@ namespace TCAMultiplayer
             }
         }
 
+        /// <summary>
+        /// Host-only entry point used by sortie end patches.
+        /// Sends a synchronized lobby-return command, then runs local return flow.
+        /// </summary>
+        public void RequestReturnToLobbyAsHost(string source)
+        {
+            if (GameState?.IsHost != true)
+            {
+                Log?.LogWarning("[Plugin] RequestReturnToLobbyAsHost ignored: local player is not host");
+                return;
+            }
+
+            if (_isReturningToLobby) return;
+
+            Log?.LogInfo($"[Plugin] Host requested return to lobby (source={source ?? "unknown"})");
+            Network?.SendPacket(PacketType.LobbyReturnToLobby, null, reliable: true);
+            ReturnToLobbySequence(source ?? "host").Forget();
+        }
+
+        /// <summary>
+        /// Called when a client receives the host's return-to-lobby packet.
+        /// </summary>
+        public void HandleHostRequestedReturnToLobby(string source)
+        {
+            if (_isReturningToLobby) return;
+            Log?.LogInfo($"[Plugin] Host requested return to lobby (source={source ?? "network"})");
+            ReturnToLobbySequence(source ?? "network").Forget();
+        }
+
+        private async UniTaskVoid ReturnToLobbySequence(string source)
+        {
+            if (_isReturningToLobby) return;
+            _isReturningToLobby = true;
+
+            try
+            {
+                // Let the menu task that triggered this complete cleanly before scene teardown.
+                await UniTask.Yield(PlayerLoopTiming.Update);
+
+                Log?.LogInfo($"[Plugin] Returning to multiplayer lobby... source={source}");
+
+                // Ensure we leave flight in an unpaused/unblocked state.
+                if (Falcon.GamePause.IsPaused) Falcon.GamePause.ResumeGame();
+                Time.timeScale = 1f;
+                AudioListener.pause = false;
+                TinyCursor.LockState = CursorLockMode.None;
+
+                RespawnUI?.Hide();
+                Spawner?.Reset();
+                Scores?.Reset();
+                Network?.RemoteAircraftManager?.Cleanup();
+                Player.RealCombatSync.Cleanup();
+                Patches.FlightGamePatches.ClearCache();
+
+                string mapSceneName = Lobby?.MapName;
+                string runtimeMapName = AirfieldHelper.GetCurrentMapName();
+                if (string.Equals(runtimeMapName, "Unknown", StringComparison.OrdinalIgnoreCase))
+                {
+                    runtimeMapName = null;
+                }
+
+                string preferredMapSceneName = !string.IsNullOrWhiteSpace(runtimeMapName)
+                    ? runtimeMapName
+                    : mapSceneName;
+                EnsureSafeActiveSceneBeforeUnload(preferredMapSceneName);
+
+                await UnloadAllScenesByName("FlightGame");
+                await UnloadAllScenesByName(preferredMapSceneName);
+                if (!string.IsNullOrWhiteSpace(mapSceneName) &&
+                    !string.Equals(mapSceneName, preferredMapSceneName, StringComparison.OrdinalIgnoreCase))
+                {
+                    await UnloadAllScenesByName(mapSceneName);
+                }
+
+                Lobby?.ResetForNewGame();
+                AirfieldHelper.ClearCache();
+                _isSpawningLocal = false;
+
+                if (GameState != null)
+                {
+                    var targetState = GameState.IsHost
+                        ? Networking.GameState.HostingLobby
+                        : Networking.GameState.ClientLobby;
+
+                    if (GameState.CurrentState != targetState)
+                    {
+                        bool transitioned = GameState.TransitionTo(targetState);
+                        if (!transitioned)
+                        {
+                            Log?.LogWarning($"[Plugin] Failed to transition back to lobby state from {GameState.CurrentState}");
+                        }
+                    }
+                }
+
+                // Host should immediately broadcast fresh lobby state after reset.
+                if (Lobby?.IsHost == true)
+                {
+                    Lobby.BroadcastLobbyState();
+                }
+
+                // Re-open multiplayer lobby UI so players can launch the next sortie.
+                if (MultiplayerMenu.Instance == null)
+                {
+                    MultiplayerMenu.CreateAndRun().Forget();
+                }
+                else
+                {
+                    MultiplayerMenu.Instance.SetScreen(LobbyScreen.Lobby);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log?.LogError($"[Plugin] ReturnToLobbySequence error: {ex.Message}\n{ex.StackTrace}");
+            }
+            finally
+            {
+                _isReturningToLobby = false;
+            }
+        }
+
+        private void EnsureSafeActiveSceneBeforeUnload(string mapSceneName)
+        {
+            Scene active = SceneManager.GetActiveScene();
+            if (!active.IsValid() || !active.isLoaded) return;
+
+            bool isFlightOrMapScene = string.Equals(active.name, "FlightGame", StringComparison.OrdinalIgnoreCase) ||
+                                      (!string.IsNullOrWhiteSpace(mapSceneName) &&
+                                       string.Equals(active.name, mapSceneName, StringComparison.OrdinalIgnoreCase));
+            if (!isFlightOrMapScene) return;
+
+            for (int i = 0; i < SceneManager.sceneCount; i++)
+            {
+                Scene candidate = SceneManager.GetSceneAt(i);
+                if (!candidate.IsValid() || !candidate.isLoaded) continue;
+                if (string.Equals(candidate.name, "FlightGame", StringComparison.OrdinalIgnoreCase)) continue;
+                if (!string.IsNullOrWhiteSpace(mapSceneName) &&
+                    string.Equals(candidate.name, mapSceneName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                SceneManager.SetActiveScene(candidate);
+                return;
+            }
+        }
+
+        private static async UniTask UnloadAllScenesByName(string sceneName)
+        {
+            if (string.IsNullOrWhiteSpace(sceneName)) return;
+
+            int unloadedCount = 0;
+            int safety = 0;
+            while (safety++ < 32)
+            {
+                Scene sceneToUnload = default;
+                bool found = false;
+                for (int i = SceneManager.sceneCount - 1; i >= 0; i--)
+                {
+                    Scene candidate = SceneManager.GetSceneAt(i);
+                    if (!candidate.IsValid() || !candidate.isLoaded) continue;
+                    if (!string.Equals(candidate.name, sceneName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    sceneToUnload = candidate;
+                    found = true;
+                    break;
+                }
+
+                if (!found)
+                {
+                    break;
+                }
+
+                AsyncOperation unloadOp = SceneManager.UnloadSceneAsync(sceneToUnload);
+                if (unloadOp == null)
+                {
+                    break;
+                }
+
+                await unloadOp.ToUniTask();
+                unloadedCount++;
+            }
+
+            if (unloadedCount > 0)
+            {
+                Log?.LogInfo($"[Plugin] Unloaded {unloadedCount} instance(s) of scene '{sceneName}'");
+            }
+        }
+
         private void BindLoggingConfig()
         {
             ConfigUsername = Config.Bind("Player", "Username", "Player", "Your multiplayer username.");
@@ -368,6 +650,7 @@ namespace TCAMultiplayer
             
             ConfigLocalAircraft = Config.Bind("Player", "LastAircraft", "AV8B", "Last selected aircraft ID");
             ConfigLocalLoadout = Config.Bind("Player", "LastLoadout", "Clean", "Last selected loadout name");
+            ConfigLocalAirfield = Config.Bind("Player", "LastAirfield", "", "Last selected airfield name");
 
             VerboseAll = Config.Bind("Logging", "VerboseAll", true, "Enable verbose logs across the mod.");
             VerboseNetworking = Config.Bind("Logging", "VerboseNetworking", true, "Extra logs for network state handling.");
@@ -388,14 +671,11 @@ namespace TCAMultiplayer
 
     public class PluginRunner : MonoBehaviour
     {
-        private bool _showDebugUI = false;
         private int _updateCount = 0;
         private float _lastLogTime = 0f;
 
-        // GUI style with rich text support
+        // GUI style with rich text support (used by status HUD)
         private GUIStyle _richTextStyle;
-        private GUIStyle _richTextStyleBold;
-
         private void Start()
         {
             Plugin.Log?.LogInfo("[PluginRunner] Started!");
@@ -413,22 +693,28 @@ namespace TCAMultiplayer
                 Plugin.Log?.LogInfo($"[PluginRunner] Updates:{_updateCount} Sent:{net?.PacketsSent ?? 0} Recv:{net?.PacketsReceived ?? 0}");
             }
 
-            // Airfield list refresh is handled by MultiplayerMenu.RefreshUI() natively
-
-            try
+            // Multiplayer must not freeze when local pause is opened.
+            // Keep gameplay simulation running while we are in active game/respawn states.
+            // We must also call GamePause.ResumeGame() because the native camera system
+            // checks GamePause.IsPaused (not Time.timeScale) and stops updating — causing
+            // the 3rd-person camera to freeze while the game world continues.
+            if (Plugin.Instance?.GameState?.IsInGame == true)
             {
-                if (Input.GetKeyDown(KeyCode.F7))
+                if (Falcon.GamePause.IsPaused)
                 {
-                    _showDebugUI = !_showDebugUI;
-                    Plugin.Log?.LogInfo($"Debug UI toggled: {(_showDebugUI ? "Open" : "Closed")}");
+                    Falcon.GamePause.ResumeGame();
                 }
-                if (Input.GetKeyDown(KeyCode.F8))
+
+                if (Mathf.Abs(Time.timeScale - 1f) > 0.001f)
                 {
-                    NetworkConfig.IsThrottled = !NetworkConfig.IsThrottled;
-                    Plugin.Log?.LogInfo($"Bandwidth throttle: {(NetworkConfig.IsThrottled ? "ON (30Hz)" : "OFF (128Hz)")}");
+                    Time.timeScale = 1f;
+                }
+
+                if (AudioListener.pause)
+                {
+                    AudioListener.pause = false;
                 }
             }
-            catch { }
 
             Plugin.Instance?.Network?.Update();
             Plugin.Instance?.Discovery?.Update();
@@ -445,25 +731,26 @@ namespace TCAMultiplayer
             Plugin.Instance?.Network?.LateUpdate();
         }
 
+        private void FixedUpdate()
+        {
+            Plugin.Instance?.Network?.FixedUpdate();
+        }
+
         private void OnGUI()
         {
             try
             {
-                // Initialize rich text styles once
+                // Initialize rich text style once
                 if (_richTextStyle == null)
                 {
                     _richTextStyle = new GUIStyle(GUI.skin.label);
                     _richTextStyle.richText = true;
-
-                    _richTextStyleBold = new GUIStyle(GUI.skin.label);
-                    _richTextStyleBold.richText = true;
-                    _richTextStyleBold.fontStyle = FontStyle.Bold;
                 }
 
                 var gameState = Plugin.Instance?.GameState;
                 var lobby = Plugin.Instance?.Lobby;
 
-                // Corner indicator
+                // Corner status indicator
                 string statusText = "Disconnected";
                 string statusColor = "white";
 
@@ -504,14 +791,7 @@ namespace TCAMultiplayer
                 }
 
                 GUI.Label(new Rect(Screen.width - 250, 10, 240, 20),
-                    $"<color={statusColor}>TCA MP v{PluginInfo.VERSION} - {statusText}</color>", _richTextStyle);
-                GUI.Label(new Rect(Screen.width - 250, 30, 240, 20),
-                    "<color=#888888>F8: Menu | F7: Debug</color>", _richTextStyle);
-
-                if (_showDebugUI)
-                {
-                    DrawDebugPanel();
-                }
+                    $"<color={statusColor}>TCA MP - {statusText}</color>", _richTextStyle);
 
                 // Draw scoreboard HUD (kill counter, kill feed, TAB scoreboard)
                 Plugin.Instance?.ScoreboardHUD?.OnGUI();
@@ -520,66 +800,6 @@ namespace TCAMultiplayer
             {
                 GUI.Label(new Rect(10, 10, 400, 50), $"UI Error: {ex.Message}");
             }
-        }
-
-        private void DrawDebugPanel()
-        {
-            var network = Plugin.Instance?.Network;
-            var lobby = Plugin.Instance?.Lobby;
-
-            // Debug panel in corner
-            GUI.Box(new Rect(10, 10, 300, 350), "");
-            GUILayout.BeginArea(new Rect(20, 20, 280, 330));
-
-            GUILayout.Label($"<b>Debug Panel</b>", _richTextStyle);
-            GUILayout.Space(5);
-
-            // Connection status
-            GUILayout.Label($"<b>State:</b> {Plugin.Instance?.GameState?.CurrentState}", _richTextStyle);
-            GUILayout.Label($"<b>Transport:</b> {network?.CurrentTransportName ?? "None"}", _richTextStyle);
-
-            if (lobby?.IsInLobby == true)
-            {
-                GUILayout.Label($"<b>Lobby:</b> {(lobby.IsHost ? "Host" : "Client")}", _richTextStyle);
-                GUILayout.Label($"<b>Players:</b> {lobby.PlayerCount}", _richTextStyle);
-                GUILayout.Label($"<b>All Ready:</b> {lobby.AreAllPlayersReady}", _richTextStyle);
-            }
-
-            GUILayout.Space(10);
-            GUILayout.Label("<b>=== Network Stats ===</b>", _richTextStyle);
-            GUILayout.Label($"Packets Sent: {network?.PacketsSent ?? 0}");
-            GUILayout.Label($"Packets Received: {network?.PacketsReceived ?? 0}");
-
-            GUILayout.Space(5);
-            GUILayout.Label($"States Sent: {network?.AircraftStatesSent ?? 0}");
-            GUILayout.Label($"States Received: {network?.AircraftStatesReceived ?? 0}");
-            GUILayout.Label($"Remote Aircraft: {(network?.HasRemoteAircraft == true ? "<color=lime>YES</color>" : "<color=red>NO</color>")}", _richTextStyle);
-
-            if (network?.HasRemoteAircraft == true)
-            {
-                var remotePos = network.LastRemotePosition;
-                GUILayout.Label($"Remote: ({remotePos.x:F0}, {remotePos.y:F0}, {remotePos.z:F0})");
-                GUILayout.Label($"Distance: {network.DistanceToRemote:F0}m");
-            }
-
-            GUILayout.Space(10);
-            GUILayout.Label($"<b>Update Count:</b> {_updateCount}", _richTextStyle);
-
-            // FloatingOrigin debug
-            try
-            {
-                bool isAvail = Networking.FloatingOriginHelper.IsAvailable;
-                GUILayout.Label($"FloatOrigin: {(isAvail ? "<color=lime>OK</color>" : "<color=red>N/A</color>")}", _richTextStyle);
-            }
-            catch
-            {
-                GUILayout.Label("FloatOrigin: <color=red>ERROR</color>", _richTextStyle);
-            }
-
-            GUILayout.FlexibleSpace();
-            if (GUILayout.Button("Close Debug")) _showDebugUI = false;
-
-            GUILayout.EndArea();
         }
     }
 

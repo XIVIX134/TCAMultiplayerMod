@@ -131,6 +131,19 @@ namespace TCAMultiplayer.Networking
                     Plugin.Log.LogInfo("[AircraftCloneConfigurer] Disabled Rigidbody physics");
                 }
 
+                // Prevent animation/root-motion from writing transform drift on remote clones.
+                var animators = aircraft.GetComponentsInChildren<Animator>(true);
+                foreach (var animator in animators)
+                {
+                    if (animator == null) continue;
+                    animator.applyRootMotion = false;
+                    animator.updateMode = AnimatorUpdateMode.Normal;
+                }
+                if (animators.Length > 0)
+                {
+                    Plugin.Log.LogInfo($"[AircraftCloneConfigurer] Configured {animators.Length} Animator components (root motion disabled)");
+                }
+
                 // Configure colliders - keep body for hit detection, disable gear/wheels
                 ConfigureColliders(aircraft);
 

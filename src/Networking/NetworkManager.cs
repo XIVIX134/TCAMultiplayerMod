@@ -81,6 +81,7 @@ namespace TCAMultiplayer.Networking
             _router.RegisterHandler(PacketType.DamageDealt, HandleDamageDealt);
             _router.RegisterHandler(PacketType.MissileLaunch, HandleMissileLaunch);
             _router.RegisterHandler(PacketType.MissileUpdate, HandleMissileUpdate);
+            _router.RegisterHandler(PacketType.MissilePositionSync, HandleMissilePositionSync);
             _router.RegisterHandler(PacketType.BombDrop, HandleBombDrop);
             _router.RegisterHandler(PacketType.CraterSpawn, HandleCraterSpawn);
             _router.RegisterHandler(PacketType.BuildingDestroy, HandleBuildingDestroy);
@@ -106,6 +107,7 @@ namespace TCAMultiplayer.Networking
             _router.RegisterHandler(PacketType.LobbyLoadingComplete, HandleLobbyLoadingComplete);
             _router.RegisterHandler(PacketType.LobbySpawnPlayers, HandleLobbySpawnPlayers);
             _router.RegisterHandler(PacketType.LobbyRespawnRequest, HandleLobbyRespawnRequest);
+            _router.RegisterHandler(PacketType.LobbyReturnToLobby, HandleLobbyReturnToLobby);
 
             // Mod compatibility packets
             _router.RegisterHandler(PacketType.ModManifest, HandleModManifest);
@@ -171,6 +173,11 @@ namespace TCAMultiplayer.Networking
         public void LateUpdate()
         {
             _remoteAircraft.LateUpdate();
+        }
+
+        public void FixedUpdate()
+        {
+            _remoteAircraft.FixedUpdate();
         }
 
         public void Shutdown()
@@ -325,6 +332,16 @@ namespace TCAMultiplayer.Networking
             // If we're the HOST, a client leaving should NOT kill the server.
             if (!IsHost)
             {
+                // IMPORTANT: reset transport runtime state so reconnect can start a fresh client session.
+                // Without this, DirectTransport may remain "running" but disconnected and reject Connect().
+                try
+                {
+                    Transport?.Disconnect();
+                }
+                catch { }
+
+                LocalPeerId = 0;
+
                 var gsm = GameStateMachine.Instance;
                 if (gsm != null && gsm.CurrentState != GameState.Disconnected)
                 {
@@ -416,6 +433,13 @@ namespace TCAMultiplayer.Networking
             if (LogHelper.IsEnabled(LogCategory.Packets))
                 LogHelper.Info(LogCategory.Packets, $"[NetworkManager] Received missile update: id={packet.MissileInstanceId} target={packet.TargetId} track={packet.IsTracking}");
             Player.RealCombatSync.HandleMissileUpdate(packet);
+        }
+
+        private void HandleMissilePositionSync(ulong peerId, byte[] payload)
+        {
+            if (payload == null) return;
+            var packet = PacketSerializer.DeserializeMissilePositionSync(payload);
+            Player.RealCombatSync.HandleMissilePositionSync(packet);
         }
 
         private void HandleBombDrop(ulong peerId, byte[] payload)
@@ -676,6 +700,12 @@ namespace TCAMultiplayer.Networking
             // AircraftType will be set from the next state packet
             var respawnPacket = new AircraftChangedPacket { AircraftType = "" };
             _remoteAircraft.HandleRespawn(packet.PeerId, respawnPacket);
+        }
+
+        private void HandleLobbyReturnToLobby(ulong peerId, byte[] payload)
+        {
+            Plugin.Log?.LogInfo($"[NetworkManager] Return-to-lobby command received from {peerId}");
+            Plugin.Instance?.HandleHostRequestedReturnToLobby("network");
         }
 
         #region Mod Compatibility Handlers

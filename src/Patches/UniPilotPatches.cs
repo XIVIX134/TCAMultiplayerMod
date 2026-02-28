@@ -91,6 +91,10 @@ namespace TCAMultiplayer.Patches
         private static readonly HashSet<int> _loggedAmmoConsume = new HashSet<int>();
         private static readonly HashSet<int> _loggedNoAmmoConsume = new HashSet<int>();
         
+        // Reflection: Target.Velocity has a private setter — we need reflection to override it
+        // for correct bullet velocity on remote aircraft
+        private static PropertyInfo _targetVelocityProp;
+        private static bool _targetVelocityPropInitialized;
         
         /// <summary>
         /// Try to force FireControl to initialize its Gun2 if it's null
@@ -245,7 +249,57 @@ namespace TCAMultiplayer.Patches
             {
                 int ammoBefore = __instance.Gun.Ammo;
                 __instance.Gun.IsFiring = shouldFire;
+
+                // FIX: Override Target.Velocity with the actual synced velocity from network
+                // packets BEFORE Gun.Update(). Gun2.FireBullet() reads OwnTarget.Velocity to
+                // inherit aircraft speed into bullet velocity. Without this fix, bullets inherit
+                // the velocity-steering value (used for interpolation) instead of the aircraft's
+                // actual speed, causing shorter effective range on remote screens.
+                Vector3 savedVelocity = Vector3.zero;
+                bool didOverrideVelocity = false;
+                if (shouldFire && __instance.Gun.OwnTarget != null)
+                {
+                    try
+                    {
+                        // Lazy-init the reflection for Target.Velocity (private setter)
+                        if (!_targetVelocityPropInitialized)
+                        {
+                            _targetVelocityPropInitialized = true;
+                            _targetVelocityProp = __instance.Gun.OwnTarget.GetType()
+                                .GetProperty("Velocity", BindingFlags.Public | BindingFlags.Instance);
+                            Plugin.Log?.LogInfo($"[FireControlPatches] Target.Velocity reflection: {(_targetVelocityProp != null ? "found" : "NOT FOUND")}");
+                        }
+
+                        if (_targetVelocityProp != null && _targetVelocityProp.GetSetMethod(true) != null)
+                        {
+                            // Get the actual velocity from the network state packet
+                            var remoteManager = Plugin.Instance?.Network?.RemoteAircraftManager;
+                            if (remoteManager != null && controller != null)
+                            {
+                                var state = remoteManager.GetRemotePlayer(controller.PlayerId);
+                                if (state != null)
+                                {
+                                    savedVelocity = __instance.Gun.OwnTarget.Velocity;
+                                    _targetVelocityProp.SetValue(__instance.Gun.OwnTarget, state.LastVelocity);
+                                    didOverrideVelocity = true;
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Plugin.Log?.LogWarning($"[FireControlPatches] Target.Velocity override failed: {ex.Message}");
+                    }
+                }
+
                 __instance.Gun.Update(Time.timeAsDouble, Time.deltaTime);
+
+                // Restore original velocity after Gun.Update() so other systems aren't affected
+                if (didOverrideVelocity && _targetVelocityProp != null)
+                {
+                    try { _targetVelocityProp.SetValue(__instance.Gun.OwnTarget, savedVelocity); }
+                    catch { /* best effort restore */ }
+                }
                 
                 if (shouldFire && ammoBefore != __instance.Gun.Ammo)
                 {
@@ -320,6 +374,19 @@ namespace TCAMultiplayer.Patches
             }
             return __exception; // Let Unity handle it normally
         }
+
+        /// <summary>
+        /// Clear all static state between game sessions.
+        /// </summary>
+        public static void ClearState()
+        {
+            _attemptedInit.Clear();
+            _prevFiringState.Clear();
+            _loggedAmmoConsume.Clear();
+            _loggedNoAmmoConsume.Clear();
+            _fireControlStartMethod = null;
+            _fireControlAwakeMethod = null;
+            _reflectionCached = false;
     }
 
     /// <summary>
@@ -429,6 +496,7 @@ namespace TCAMultiplayer.Patches
                     $"ammoBelt=[{ammoBeltInfo}], isFiring={__instance.IsFiring}, barrels={__instance.Barrels?.Count ?? -1}: {__exception}");
             }
             return __exception;
+        }
         }
     }
 

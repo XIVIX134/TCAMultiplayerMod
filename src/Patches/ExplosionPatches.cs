@@ -67,22 +67,23 @@ namespace TCAMultiplayer.Patches
         // so Explosion.Trigger() postfix can skip when MunitionExplodePostfix already handled it
         private static Vector3 _lastSentExplosionLocalPos = Vector3.zero;
         private static float _lastSentExplosionTime = 0f;
-        private const float TRIGGER_DEDUP_SECONDS = 0.2f;
-        private const float TRIGGER_DEDUP_DISTANCE_SQ = 25f; // 5m squared
+        private const float TRIGGER_DEDUP_SECONDS = 0.1f;     // FIX E2: tighter window to avoid deduping legitimate nearby explosions
+        private const float TRIGGER_DEDUP_DISTANCE_SQ = 4f;    // FIX E2: 2m squared (was 5m) — only dedup truly same-source explosions
 
         // Reflection for Explosion component fields (radius, damage, optional effect)
         private static FieldInfo _explosionRadiusField;
         private static FieldInfo _explosionDamageField;
         private static FieldInfo _explosionEffectField;
 
-        // Known game resource paths for explosion VFX prefabs
-        // These match the WeaponEffectProperties defaults in the decompiled game code
-        private const string PATH_EXPLOSION_AIR_MEDIUM   = "Effects/Explosion/ExplosionAirMedium";
-        private const string PATH_EXPLOSION_AIR_LARGE    = "Effects/Explosion/ExplosionAirLarge";
-        private const string PATH_EXPLOSION_GROUND_MEDIUM = "Effects/Explosion/ExplosionGroundMedium";
-        private const string PATH_EXPLOSION_GROUND_LARGE  = "Effects/Explosion/ExplosionGroundLarge";
-        private const string PATH_EXPLOSION_WATER_MEDIUM  = "Effects/Explosion/ExplosionWaterMedium";
-        private const string PATH_EXPLOSION_WATER_LARGE   = "Effects/Explosion/ExplosionWaterLarge";
+        // Explosion VFX paths read from WeaponEffectProperties at runtime.
+        // Defaults match the game's own defaults (see decompiled WeaponEffectProperties.cs).
+        // These are populated via reflection in ApplyPatches() so they track game/mod changes.
+        private static string PATH_EXPLOSION_AIR_MEDIUM   = "Effects/Explosion/ExplosionAirMedium";
+        private static string PATH_EXPLOSION_AIR_LARGE    = "Effects/Explosion/ExplosionAirLarge";
+        private static string PATH_EXPLOSION_GROUND_MEDIUM = "Effects/Explosion/ExplosionGroundMedium";
+        private static string PATH_EXPLOSION_GROUND_LARGE  = "Effects/Explosion/ExplosionGroundLarge";
+        private static string PATH_EXPLOSION_WATER_MEDIUM  = "Effects/Explosion/ExplosionWaterMedium";
+        private static string PATH_EXPLOSION_WATER_LARGE   = "Effects/Explosion/ExplosionWaterLarge";
 
         // ImpactSurface byte values
         private const byte SURFACE_AIR    = 0;
@@ -133,6 +134,10 @@ namespace TCAMultiplayer.Patches
                     $"impactMaterial={_munitionImpactMaterialField != null}");
 
                 // Resolve WorldCraters2 for spawning craters on received ground explosions
+                InitializeWorldCratersReflection(flags);
+
+                // Read default explosion VFX paths from WeaponEffectProperties (data-driven)
+                InitializeExplosionVfxPaths(flags);
                 InitializeWorldCratersReflection(flags);
 
                 // Patch Munition.Explode(Vector3, bool, bool)
@@ -218,6 +223,59 @@ namespace TCAMultiplayer.Patches
             catch (Exception ex)
             {
                 Plugin.Log?.LogWarning($"[ExplosionPatches] WorldCraters2 reflection init failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Read default explosion VFX paths from WeaponEffectProperties.
+        /// Creates a default instance and reads its Air/Ground/Water fields.
+        /// This ensures paths track game updates and mod overrides rather than being hardcoded.
+        /// Falls back to the compiled-in defaults if reflection fails.
+        /// </summary>
+        private static void InitializeExplosionVfxPaths(BindingFlags flags)
+        {
+            try
+            {
+                var wepType = ReflectionHelper.GetGameType("Falcon.Stores.WeaponEffectProperties");
+                if (wepType == null) return;
+
+                // Create a default instance to read the game's default field values
+                var defaults = Activator.CreateInstance(wepType);
+                if (defaults == null) return;
+
+                string ReadStringField(string fieldName)
+                {
+                    var field = wepType.GetField(fieldName, flags);
+                    return field?.GetValue(defaults) as string;
+                }
+
+                // Read default paths — these are the same fields used in Munition.Explode()
+                string air = ReadStringField("Air");
+                string ground = ReadStringField("Ground");
+                string water = ReadStringField("Water");
+
+                if (!string.IsNullOrEmpty(air))
+                {
+                    PATH_EXPLOSION_AIR_MEDIUM = air;
+                    // Derive "Large" variant by replacing "Medium" if present
+                    PATH_EXPLOSION_AIR_LARGE = air.Replace("Medium", "Large");
+                }
+                if (!string.IsNullOrEmpty(ground))
+                {
+                    PATH_EXPLOSION_GROUND_MEDIUM = ground;
+                    PATH_EXPLOSION_GROUND_LARGE = ground.Replace("Medium", "Large");
+                }
+                if (!string.IsNullOrEmpty(water))
+                {
+                    PATH_EXPLOSION_WATER_MEDIUM = water;
+                    PATH_EXPLOSION_WATER_LARGE = water.Replace("Medium", "Large");
+                }
+
+                Plugin.Log?.LogInfo($"[ExplosionPatches] VFX paths from game data: Air='{PATH_EXPLOSION_AIR_MEDIUM}', Ground='{PATH_EXPLOSION_GROUND_MEDIUM}', Water='{PATH_EXPLOSION_WATER_MEDIUM}'");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[ExplosionPatches] InitializeExplosionVfxPaths error (using defaults): {ex.Message}");
             }
         }
 
@@ -394,7 +452,8 @@ namespace TCAMultiplayer.Patches
                 // Skip network munitions (MP_ prefix)
                 if (munition.gameObject.name.StartsWith("MP_")) return;
 
-                // Skip munitions belonging to remote aircraft
+                // Skip munitions belonging to remote aircraft or AI/NPC aircraft.
+                // Only sync explosions from the LOCAL player's own weapons.
                 if (_munitionOwnshipField != null)
                 {
                     var ownship = _munitionOwnshipField.GetValue(__instance);
@@ -403,9 +462,25 @@ namespace TCAMultiplayer.Patches
                         var ownshipComp = ownship as Component;
                         if (ownshipComp != null)
                         {
+                            // Skip remote aircraft munitions
                             var remoteCtrl = ownshipComp.GetComponentInParent<RemoteAircraftController>();
                             if (remoteCtrl != null) return;
+
+                            // Skip AI/NPC munitions — only sync the local player's own weapons.
+                            // Without this, ALL game AI explosions (SAMs, enemy aircraft bombs, etc.)
+                            // get synced as explosion packets, causing huge VFX on the other player's screen.
+                            var localPlayer = Falcon.UniversalAircraft.UniAircraft.Player;
+                            if (localPlayer != null)
+                            {
+                                var munitionAircraft = ownshipComp.GetComponentInParent<Falcon.UniversalAircraft.UniAircraft>();
+                                if (munitionAircraft != localPlayer) return;
+                            }
                         }
+                    }
+                    else
+                    {
+                        // No ownship = orphaned munition (SAM, ground weapon, etc.) — skip
+                        return;
                     }
                 }
 
@@ -452,6 +527,17 @@ namespace TCAMultiplayer.Patches
                     explosionType = 1; // Large bomb
                 else
                     explosionType = 0; // Standard
+
+                // DEDUP: Skip if SendExplosionSyncForNukeCrater already sent for this position
+                // (crater postfix fires DURING Explode() before this postfix runs)
+                float timeSinceLastSend = Time.time - _lastSentExplosionTime;
+                float dedupDistSq = (impactPoint - _lastSentExplosionLocalPos).sqrMagnitude;
+                if (timeSinceLastSend < TRIGGER_DEDUP_SECONDS && dedupDistSq < TRIGGER_DEDUP_DISTANCE_SQ)
+                {
+                    Plugin.Log?.LogInfo($"[ExplosionPatches] MunitionExplodePostfix: dedup skip " +
+                        $"(NukeCrater handled it {timeSinceLastSend*1000:F0}ms ago, dist={Mathf.Sqrt(dedupDistSq):F1}m)");
+                    return;
+                }
 
                 // Determine impact surface (air / ground / water)
                 byte impactSurface = DetermineImpactSurface(__instance, isAirburst);

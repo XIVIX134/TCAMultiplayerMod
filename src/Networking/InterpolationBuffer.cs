@@ -4,28 +4,31 @@ using TCAMultiplayer;
 namespace TCAMultiplayer.Networking
 {
     /// <summary>
-    /// Stores timestamped network snapshots and provides smooth interpolation
-    /// between past states using Hermite spline interpolation for smooth movement.
-    /// Renders at a configurable delay behind real-time to ensure we always have
-    /// two states to interpolate between.
+    /// Network interpolation buffer with smooth render clock.
     /// 
-    /// IMPORTANT: Positions are stored in ABSOLUTE (double-precision) world coordinates
-    /// to be immune to FloatingOrigin shifts. Conversion to local Unity space happens
-    /// only at render time in GetInterpolatedState().
+    /// DESIGN:
+    /// - Snapshots stored in ABSOLUTE double-precision coordinates (immune to FloatingOrigin)
+    /// - A smooth "render clock" advances at real-time rate with slow drift correction
+    ///   (the clock offset NEVER directly affects render time frame-to-frame)
+    /// - Simple linear interpolation between two bracketing snapshots
+    /// - Conversion to local Unity space happens only at the end
+    /// 
+    /// WHY SMOOTH RENDER CLOCK:
+    /// The naive approach (remoteRenderTime = Time.time - ClockOffset - delay) causes
+    /// the render time to JUMP every time ClockOffset updates (~90x/sec via EMA).
+    /// At 250 m/s, a 0.001s jump = 0.25m of position jitter per packet.
+    /// The render clock eliminates this by advancing smoothly and converging slowly.
     /// </summary>
     public class InterpolationBuffer
     {
-        /// <summary>
-        /// A single snapshot of remote aircraft state
-        /// </summary>
         public struct Snapshot
         {
-            public Vector3d AbsolutePosition;   // Stored in absolute world coords (immune to FloatingOrigin)
+            public Vector3d AbsolutePosition;
             public Quaternion Rotation;
             public Vector3 Velocity;
             public Vector3 AngularVelocity;
-            public float LocalTime;      // Time.time when received
-            public float RemoteTime;     // Timestamp from sender
+            public float LocalTime;
+            public float RemoteTime;
             public bool IsValid;
             
             public static Snapshot Invalid => new Snapshot { IsValid = false };
@@ -37,48 +40,28 @@ namespace TCAMultiplayer.Networking
         private readonly int _capacity;
         private bool _loggedFull = false;
         
-        // Smoothing state - applies additional smoothing on top of interpolation
-        // Stored in LOCAL space (recomputed each frame from absolute)
-        private Vector3 _smoothedPosition;
-        private Quaternion _smoothedRotation;
-        private bool _smoothingInitialized = false;
+        // --- Smooth render clock ---
+        // Instead of computing remoteRenderTime = Time.time - ClockOffset - delay each frame
+        // (which jumps when ClockOffset updates), we maintain a smooth clock that advances
+        // at real-time rate and slowly converges to the target.
+        private float _renderClock;
+        private bool _renderClockInitialized = false;
+        private Vector3 _lastLocalPosition; // For teleport detection
+        private bool _hasLastPosition = false;
         
         /// <summary>
-        /// How far behind real-time to render (in seconds)
-        /// Higher = smoother but more latency
+        /// How far behind real-time to render (in seconds).
         /// </summary>
-        public float InterpolationDelay { get; set; } = 0.15f; 
-        
-        /// <summary>
-        /// Maximum time to extrapolate beyond last known state
-        /// </summary>
-        public float MaxExtrapolationTime { get; set; } = 0.5f;
-        
-        /// <summary>
-        /// Smoothing factor for additional position smoothing (0-1, lower = smoother)
-        /// </summary>
-        public float PositionSmoothingFactor { get; set; } = 0.25f;
-        
-        /// <summary>
-        /// Smoothing factor for additional rotation smoothing (0-1, lower = smoother)
-        /// </summary>
-        public float RotationSmoothingFactor { get; set; } = 0.3f;
+        public float InterpolationDelay { get; set; } = 0.15f;
         
         /// <summary>
         /// Clock offset between local and remote time (local - remote).
         /// Set by RemoteAircraftManager from clock sync.
-        /// Used to convert local time to remote time domain for interpolation.
+        /// Used ONLY to compute the render clock TARGET, never directly for render time.
         /// </summary>
         public float ClockOffset { get; set; } = 0f;
         
-        /// <summary>
-        /// Number of snapshots currently in buffer
-        /// </summary>
         public int Count => _count;
-        
-        /// <summary>
-        /// Whether we have enough data to interpolate
-        /// </summary>
         public bool HasData => _count >= 1;
         
         public InterpolationBuffer(int capacity = NetworkConfig.INTERPOLATION_BUFFER_CAPACITY)
@@ -87,11 +70,7 @@ namespace TCAMultiplayer.Networking
             _buffer = new Snapshot[capacity];
         }
         
-        /// <summary>
-        /// Add a new snapshot to the buffer.
-        /// Position must be in ABSOLUTE world coordinates (not local Unity space).
-        /// </summary>
-        public void AddSnapshot(Vector3d absolutePosition, Quaternion rotation, Vector3 velocity, 
+        public void AddSnapshot(Vector3d absolutePosition, Quaternion rotation, Vector3 velocity,
             Vector3 angularVelocity, float remoteTimestamp)
         {
             var snapshot = new Snapshot
@@ -119,21 +98,11 @@ namespace TCAMultiplayer.Networking
                 _loggedFull = true;
                 LogHelper.Info(LogCategory.Interpolation, $"[InterpolationBuffer] Buffer full ({_capacity}), overwriting oldest");
             }
-            
-            // Initialize smoothing if this is the first snapshot
-            if (!_smoothingInitialized)
-            {
-                _smoothedPosition = FloatingOriginHelper.AbsoluteToLocal(absolutePosition);
-                _smoothedRotation = rotation;
-                _smoothingInitialized = true;
-            }
         }
         
         /// <summary>
-        /// Get interpolated state at the current render time (now - delay).
-        /// Returns position in LOCAL Unity space (converted from absolute at render time).
-        /// Uses LocalTime (receiver timeline) for interpolation bracketing.
-        /// Extrapolation is intentionally disabled to avoid overshoot/correction jitter.
+        /// Get interpolated state at the current smooth render time.
+        /// Returns position in LOCAL Unity space.
         /// </summary>
         public (Vector3 position, Quaternion rotation, bool isExtrapolating, bool justTeleported) GetInterpolatedState()
         {
@@ -142,78 +111,177 @@ namespace TCAMultiplayer.Networking
                 return (Vector3.zero, Quaternion.identity, false, false);
             }
             
-            // Render on the LOCAL receive timeline. This avoids jitter from remote clock drift
-            // and one-way latency variance causing unstable remote-time bracketing.
-            float localRenderTime = Time.time - InterpolationDelay;
+            // ======================================================================
+            // SMOOTH RENDER CLOCK
+            // ======================================================================
+            // Target = where we SHOULD be on the remote timeline right now.
+            // Render clock = where we ACTUALLY render, advancing smoothly.
+            //
+            // The clock advances by exactly Time.deltaTime each frame (smooth),
+            // plus a small bounded correction to converge toward the target.
+            // ClockOffset changes from EMA updates have ZERO frame-to-frame effect.
+            // ======================================================================
+            float targetRenderTime = Time.time - ClockOffset - InterpolationDelay;
             
-            // Find the two snapshots surrounding localRenderTime using LocalTime
-            Snapshot before = Snapshot.Invalid;
-            Snapshot after = Snapshot.Invalid;
+            if (!_renderClockInitialized)
+            {
+                _renderClock = targetRenderTime;
+                _renderClockInitialized = true;
+            }
+            else
+            {
+                // Advance at real-time rate
+                _renderClock += Time.deltaTime;
+                
+                // Compute drift from target
+                float error = targetRenderTime - _renderClock;
+                
+                // Large error (>0.5s) = snap (initial sync, major clock correction, respawn)
+                if (Mathf.Abs(error) > 0.5f)
+                {
+                    _renderClock = targetRenderTime;
+                }
+                else
+                {
+                    // Gentle correction: adjust rate by up to ±5% of deltaTime.
+                    // This converges over several seconds without any per-frame jitter.
+                    // At 0.05 * deltaTime, a 0.1s error takes ~2 seconds to correct.
+                    float maxCorrection = 0.05f * Time.deltaTime;
+                    float correction = Mathf.Clamp(error, -maxCorrection, maxCorrection);
+                    _renderClock += correction;
+                }
+            }
             
-            // Search through buffer for bracketing snapshots (using LocalTime)
+            float remoteRenderTime = _renderClock;
+            
+            // ======================================================================
+            // FIND 4 SNAPSHOTS for cubic Hermite (s0, s1=before, s2=after, s3)
+            // s1/s2 bracket render time. s0/s3 provide neighbor tangent data.
+            // ======================================================================
+            Snapshot s0 = Snapshot.Invalid, s1 = Snapshot.Invalid;
+            Snapshot s2 = Snapshot.Invalid, s3 = Snapshot.Invalid;
+
+            // Pass 1: find s1 (latest before) and s2 (earliest after)
             for (int i = 0; i < _count; i++)
             {
                 int idx = (_writeIndex - 1 - i + _capacity) % _capacity;
                 var snap = _buffer[idx];
-                
                 if (!snap.IsValid) continue;
-                
-                if (snap.LocalTime <= localRenderTime)
+                if (snap.RemoteTime <= remoteRenderTime)
                 {
-                    if (!before.IsValid || snap.LocalTime > before.LocalTime)
-                    {
-                        before = snap;
-                    }
+                    if (!s1.IsValid || snap.RemoteTime > s1.RemoteTime) s1 = snap;
                 }
-                
-                if (snap.LocalTime >= localRenderTime)
+                if (snap.RemoteTime >= remoteRenderTime)
                 {
-                    if (!after.IsValid || snap.LocalTime < after.LocalTime)
+                    if (!s2.IsValid || snap.RemoteTime < s2.RemoteTime) s2 = snap;
+                }
+            }
+            // Pass 2: find s0 (before s1) and s3 (after s2)
+            if (s1.IsValid || s2.IsValid)
+            {
+                for (int i = 0; i < _count; i++)
+                {
+                    int idx = (_writeIndex - 1 - i + _capacity) % _capacity;
+                    var snap = _buffer[idx];
+                    if (!snap.IsValid) continue;
+                    if (s1.IsValid && snap.RemoteTime < s1.RemoteTime)
                     {
-                        after = snap;
+                        if (!s0.IsValid || snap.RemoteTime > s0.RemoteTime) s0 = snap;
+                    }
+                    if (s2.IsValid && snap.RemoteTime > s2.RemoteTime)
+                    {
+                        if (!s3.IsValid || snap.RemoteTime < s3.RemoteTime) s3 = snap;
                     }
                 }
             }
-            
-            // Interpolation is done in ABSOLUTE space (doubles) then converted to local at the end.
-            // This prevents FloatingOrigin shifts from causing position jumps.
+
+            // Alias for case handling below
+            Snapshot before = s1, after = s2;
+
+            // ======================================================================
+            // INTERPOLATE — Cubic Hermite when 4 snapshots available, linear fallback
+            // Hermite smooths speed at segment boundaries (the actual jitter source).
+            // Tangents derived from POSITIONS (finite differences), not packet velocity.
+            // ======================================================================
             Vector3d rawAbsolutePosition;
             Quaternion rawRotation;
             bool isExtrapolating = false;
-            
-            // Case 1: We have both before and after - use Linear interpolation
-            if (before.IsValid && after.IsValid && before.LocalTime != after.LocalTime)
+
+            if (s1.IsValid && s2.IsValid && s1.RemoteTime != s2.RemoteTime)
             {
-                float duration = after.LocalTime - before.LocalTime;
-                float t = (localRenderTime - before.LocalTime) / duration;
-                t = Mathf.Clamp01(t);
-                
-                // Use precise linear interpolation for position (in absolute space)
-                // Hermite spline is too sensitive to noisy physics velocity
-                rawAbsolutePosition = new Vector3d(
-                    before.AbsolutePosition.x + (after.AbsolutePosition.x - before.AbsolutePosition.x) * t,
-                    before.AbsolutePosition.y + (after.AbsolutePosition.y - before.AbsolutePosition.y) * t,
-                    before.AbsolutePosition.z + (after.AbsolutePosition.z - before.AbsolutePosition.z) * t
-                );
-                
-                // Use standard Slerp for rotation
-                rawRotation = Quaternion.Slerp(before.Rotation, after.Rotation, t);
+                double duration = s2.RemoteTime - s1.RemoteTime;
+                double u = (remoteRenderTime - s1.RemoteTime) / duration;
+                u = System.Math.Max(0.0, System.Math.Min(1.0, u));
+
+                if (s0.IsValid && s3.IsValid)
+                {
+                    // Cubic Hermite with position-derived tangents + clamp
+                    double dt01 = s2.RemoteTime - s0.RemoteTime;
+                    double dt13 = s3.RemoteTime - s1.RemoteTime;
+
+                    double v1x = 0, v1y = 0, v1z = 0;
+                    if (dt01 > 0.001)
+                    {
+                        v1x = (s2.AbsolutePosition.x - s0.AbsolutePosition.x) / dt01;
+                        v1y = (s2.AbsolutePosition.y - s0.AbsolutePosition.y) / dt01;
+                        v1z = (s2.AbsolutePosition.z - s0.AbsolutePosition.z) / dt01;
+                    }
+                    double v2x = 0, v2y = 0, v2z = 0;
+                    if (dt13 > 0.001)
+                    {
+                        v2x = (s3.AbsolutePosition.x - s1.AbsolutePosition.x) / dt13;
+                        v2y = (s3.AbsolutePosition.y - s1.AbsolutePosition.y) / dt13;
+                        v2z = (s3.AbsolutePosition.z - s1.AbsolutePosition.z) / dt13;
+                    }
+
+                    double m1x = v1x * duration, m1y = v1y * duration, m1z = v1z * duration;
+                    double m2x = v2x * duration, m2y = v2y * duration, m2z = v2z * duration;
+
+                    // Tangent clamp (k=1.25 prevents overshoot)
+                    double cx = s2.AbsolutePosition.x - s1.AbsolutePosition.x;
+                    double cy = s2.AbsolutePosition.y - s1.AbsolutePosition.y;
+                    double cz = s2.AbsolutePosition.z - s1.AbsolutePosition.z;
+                    double segLen = System.Math.Sqrt(cx*cx + cy*cy + cz*cz);
+                    if (segLen > 1e-6)
+                    {
+                        double maxD = 1.25 * segLen;
+                        double l1 = System.Math.Sqrt(m1x*m1x+m1y*m1y+m1z*m1z);
+                        if (l1 > maxD) { double s = maxD/l1; m1x*=s; m1y*=s; m1z*=s; }
+                        double l2 = System.Math.Sqrt(m2x*m2x+m2y*m2y+m2z*m2z);
+                        if (l2 > maxD) { double s = maxD/l2; m2x*=s; m2y*=s; m2z*=s; }
+                    }
+
+                    // Hermite basis
+                    double u2 = u*u, u3 = u2*u;
+                    double h00 = 2*u3-3*u2+1, h10 = u3-2*u2+u, h01 = -2*u3+3*u2, h11 = u3-u2;
+
+                    rawAbsolutePosition = new Vector3d(
+                        h00*s1.AbsolutePosition.x + h10*m1x + h01*s2.AbsolutePosition.x + h11*m2x,
+                        h00*s1.AbsolutePosition.y + h10*m1y + h01*s2.AbsolutePosition.y + h11*m2y,
+                        h00*s1.AbsolutePosition.z + h10*m1z + h01*s2.AbsolutePosition.z + h11*m2z);
+                }
+                else
+                {
+                    // Linear fallback when <4 snapshots
+                    rawAbsolutePosition = new Vector3d(
+                        s1.AbsolutePosition.x + (s2.AbsolutePosition.x - s1.AbsolutePosition.x) * u,
+                        s1.AbsolutePosition.y + (s2.AbsolutePosition.y - s1.AbsolutePosition.y) * u,
+                        s1.AbsolutePosition.z + (s2.AbsolutePosition.z - s1.AbsolutePosition.z) * u);
+                }
+
+                rawRotation = Quaternion.Slerp(s1.Rotation, s2.Rotation, (float)u);
             }
-            // Case 2: Only have before. Do NOT extrapolate; hold last known state.
-            // Extrapolation introduces overshoot/correction jitter on variable packet cadence.
             else if (before.IsValid)
             {
+                // Only have "before" — hold position (no extrapolation)
                 rawAbsolutePosition = before.AbsolutePosition;
                 rawRotation = before.Rotation;
-                isExtrapolating = false;
             }
-            // Case 3: Only have after (shouldn't happen normally)
             else if (after.IsValid)
             {
                 rawAbsolutePosition = after.AbsolutePosition;
                 rawRotation = after.Rotation;
             }
-            // Fallback - get newest snapshot
             else
             {
                 var newest = GetNewestSnapshot();
@@ -229,132 +297,58 @@ namespace TCAMultiplayer.Networking
                 }
             }
             
-            // Convert absolute position to local Unity space using CURRENT FloatingOrigin offset.
-            // This is the key fix: all snapshots store absolute coords, and we convert here
-            // using the latest offset, so FloatingOrigin shifts don't cause jumps.
-            Vector3 rawLocalPosition = FloatingOriginHelper.AbsoluteToLocal(rawAbsolutePosition);
+            // ======================================================================
+            // CONVERT TO LOCAL SPACE
+            // ======================================================================
+            Vector3 localPosition = FloatingOriginHelper.AbsoluteToLocal(rawAbsolutePosition);
             
+            // Teleport detection (FloatingOrigin shift causes >100m jump in local space)
             bool justTeleported = false;
-
-            // Detect FloatingOrigin shift: if the raw local position jumped far from the
-            // previous frame's position, the origin shifted. 
-            float posDelta = (rawLocalPosition - _smoothedPosition).sqrMagnitude;
-            if (posDelta > 10000f) // > 100m means FloatingOrigin shifted
+            if (_hasLastPosition)
             {
-                justTeleported = true;
+                float delta = (localPosition - _lastLocalPosition).sqrMagnitude;
+                if (delta > 10000f) // > 100m
+                    justTeleported = true;
             }
+            _lastLocalPosition = localPosition;
+            _hasLastPosition = true;
             
-            // WE MUST NOT apply secondary EMA smoothing (Lerp) to fast-moving objects.
-            // A plane moving at 200m/s will permanently lag 10+ meters behind the true interpolation
-            // if we Lerp its absolute position, and variable framerates will cause it to jitter violently!
-            // Hermite/Linear interpolation already gives us perfectly smooth continuous coordinates.
-            _smoothedPosition = rawLocalPosition;
-            _smoothedRotation = rawRotation;
-            
-            return (_smoothedPosition, _smoothedRotation, isExtrapolating, justTeleported);
+            return (localPosition, rawRotation, isExtrapolating, justTeleported);
         }
         
-        /// <summary>
-        /// Hermite spline interpolation using absolute positions (doubles) and velocities.
-        /// Creates smooth curves that respect velocity at endpoints.
-        /// </summary>
-        private Vector3d HermiteInterpolateAbsolute(Vector3d p0, Vector3 v0, Vector3d p1, Vector3 v1, float duration, float t)
-        {
-            // Scale velocities by duration for proper interpolation
-            double m0x = v0.x * duration, m0y = v0.y * duration, m0z = v0.z * duration;
-            double m1x = v1.x * duration, m1y = v1.y * duration, m1z = v1.z * duration;
-            
-            // Hermite basis functions
-            double t2 = t * (double)t;
-            double t3 = t2 * t;
-            
-            double h00 = 2.0 * t3 - 3.0 * t2 + 1.0;  // position at p0
-            double h10 = t3 - 2.0 * t2 + t;            // tangent at p0
-            double h01 = -2.0 * t3 + 3.0 * t2;         // position at p1
-            double h11 = t3 - t2;                        // tangent at p1
-            
-            return new Vector3d(
-                h00 * p0.x + h10 * m0x + h01 * p1.x + h11 * m1x,
-                h00 * p0.y + h10 * m0y + h01 * p1.y + h11 * m1y,
-                h00 * p0.z + h10 * m0z + h01 * p1.z + h11 * m1z);
-        }
-        
-        /// <summary>
-        /// Smooth rotation interpolation that considers angular velocity
-        /// </summary>
-        private Quaternion SmoothSlerpRotation(Quaternion q0, Quaternion q1, 
-            Vector3 angVel0, Vector3 angVel1, float duration, float t)
-        {
-            // For small angular velocities, just use slerp
-            if (angVel0.sqrMagnitude < 0.01f && angVel1.sqrMagnitude < 0.01f)
-            {
-                return Quaternion.Slerp(q0, q1, SmoothStep(t));
-            }
-            
-            // Use smoothstep for eased interpolation
-            float smoothT = SmoothStep(t);
-            return Quaternion.Slerp(q0, q1, smoothT);
-        }
-        
-        /// <summary>
-        /// Smoothstep function for eased transitions
-        /// </summary>
-        private float SmoothStep(float t)
-        {
-            // Hermite smoothstep: 3t² - 2t³
-            return t * t * (3f - 2f * t);
-        }
-        
-        /// <summary>
-        /// Get the most recent snapshot
-        /// </summary>
         public Snapshot GetNewestSnapshot()
         {
             if (_count == 0) return Snapshot.Invalid;
-            
             int idx = (_writeIndex - 1 + _capacity) % _capacity;
             return _buffer[idx];
         }
         
-        /// <summary>
-        /// Get the oldest snapshot in buffer
-        /// </summary>
         public Snapshot GetOldestSnapshot()
         {
             if (_count == 0) return Snapshot.Invalid;
-            
             int idx = (_writeIndex - _count + _capacity) % _capacity;
             return _buffer[idx];
         }
         
-        /// <summary>
-        /// Clear all snapshots
-        /// </summary>
         public void Clear()
         {
             _writeIndex = 0;
             _count = 0;
-            _smoothingInitialized = false;
+            _renderClockInitialized = false;
+            _hasLastPosition = false;
             _loggedFull = false;
             for (int i = 0; i < _capacity; i++)
-            {
                 _buffer[i] = Snapshot.Invalid;
-            }
         }
         
-        /// <summary>
-        /// Get debug info about buffer state
-        /// </summary>
         public string GetDebugInfo()
         {
             if (_count == 0) return "Empty";
-            
             var oldest = GetOldestSnapshot();
             var newest = GetNewestSnapshot();
             float localSpan = newest.LocalTime - oldest.LocalTime;
             float remoteSpan = newest.RemoteTime - oldest.RemoteTime;
-            
-            return $"Count:{_count} LocalSpan:{localSpan:F2}s RemoteSpan:{remoteSpan:F2}s ClkOff:{ClockOffset:F3}s";
+            return $"Count:{_count} LocalSpan:{localSpan:F2}s RemoteSpan:{remoteSpan:F2}s ClkOff:{ClockOffset:F3}s RenderClk:{_renderClock:F3}";
         }
     }
 }

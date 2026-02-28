@@ -11,7 +11,7 @@ namespace TCAMultiplayer.Networking
         public const string DEFAULT_PORT_STRING = "7777";
 
         // State sync
-        public const float STATE_SEND_INTERVAL = 0.0078f; // ~128Hz for smooth interpolation
+        public const float STATE_SEND_INTERVAL = 0.0111f; // ~90Hz (more interpolation data for smoother remote movement)
         public const float STATE_SEND_INTERVAL_THROTTLED = 0.0333f; // ~30Hz for low-bandwidth mode
 
         // Bandwidth throttling (runtime-togglable)

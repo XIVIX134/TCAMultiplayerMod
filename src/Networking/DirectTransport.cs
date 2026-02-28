@@ -37,8 +37,8 @@ namespace TCAMultiplayer.Networking
         private UdpClient _udpClient;
         private readonly object _udpLock = new object();
         private Thread _receiveThread;
-        private bool _isRunning;
-        private bool _isConnected;
+        private volatile bool _isRunning;
+        private volatile bool _isConnected;
         private bool _isHost;
         private IPEndPoint _remoteEndPoint;
         private int _localPort;
@@ -70,6 +70,7 @@ namespace TCAMultiplayer.Networking
         private readonly Dictionary<uint, PendingReliablePacket> _pendingAcks = new Dictionary<uint, PendingReliablePacket>();
         private readonly object _reliableLock = new object();
         private readonly HashSet<uint> _receivedSequences = new HashSet<uint>(); // Dedup incoming
+        private uint _highestReceivedSeq = 0; // Track highest seen for sliding window
         // Constants now in NetworkConfig
 
         public void StartHost(int port)
@@ -83,6 +84,8 @@ namespace TCAMultiplayer.Networking
                 _isHost = true;
                 _isRunning = true;
                 _isConnected = false;
+                _waitingForConnection = false;
+                _remoteEndPoint = null;
 
                 StartReceiveThread();
 
@@ -135,6 +138,8 @@ namespace TCAMultiplayer.Networking
             }
 
             _isConnected = false;
+            _waitingForConnection = false;
+            _remoteEndPoint = null;
             Shutdown();
 
             Plugin.Log.LogInfo("DirectTransport: Disconnected");
@@ -157,13 +162,8 @@ namespace TCAMultiplayer.Networking
             // Reset connection state but keep the host socket alive
             _isConnected = false;
             _remoteEndPoint = null;
-
-            lock (_reliableLock)
-            {
-                _pendingAcks.Clear();
-                _receivedSequences.Clear();
-                _nextSequenceNumber = 1;
-            }
+            _waitingForConnection = false;
+            ResetReliableState();
 
             Plugin.Log.LogInfo($"DirectTransport: Kicked peer {peerId}, host still listening");
             OnPeerDisconnected?.Invoke(peerId);
@@ -368,14 +368,8 @@ namespace TCAMultiplayer.Networking
                 ulong peerId = _isHost ? CLIENT_ID : HOST_ID;
                 _isConnected = false;
                 _remoteEndPoint = null;
-
-                // Reset reliable state so next connection starts fresh
-                lock (_reliableLock)
-                {
-                    _pendingAcks.Clear();
-                    _receivedSequences.Clear();
-                    _nextSequenceNumber = 1;
-                }
+                _waitingForConnection = false;
+                ResetReliableState();
 
                 OnPeerDisconnected?.Invoke(peerId);
             }
@@ -390,18 +384,33 @@ namespace TCAMultiplayer.Networking
             switch (msgType)
             {
                 case MSG_CONNECT:
-                    if (_isHost && !_isConnected)
+                    if (_isHost)
                     {
-                        // Accept connection — reset reliable state for the new peer
-                        lock (_reliableLock)
+                        // Re-ACK duplicate connect from the same endpoint (lost ACK recovery).
+                        if (_isConnected && EndpointsEqual(_remoteEndPoint, sender))
                         {
-                            _pendingAcks.Clear();
-                            _receivedSequences.Clear();
-                            _nextSequenceNumber = 1;
+                            _lastPongTime = UnityEngine.Time.time;
+                            _lastPingTime = UnityEngine.Time.time;
+                            SendRaw(new byte[] { MSG_CONNECT_ACK }, sender);
+                            break;
                         }
 
+                        // Fast-reconnect path: replace stale peer immediately instead of waiting for keepalive timeout.
+                        if (_isConnected && _remoteEndPoint != null)
+                        {
+                            Plugin.Log.LogWarning($"DirectTransport: Replacing stale peer {_remoteEndPoint} with reconnect from {sender}");
+                            _isConnected = false;
+                            _remoteEndPoint = null;
+                            _waitingForConnection = false;
+                            ResetReliableState();
+                            OnPeerDisconnected?.Invoke(CLIENT_ID);
+                        }
+
+                        // Accept new connection.
+                        ResetReliableState();
                         _remoteEndPoint = sender;
                         _isConnected = true;
+                        _waitingForConnection = false;
                         _lastPongTime = UnityEngine.Time.time; // Initialize keepalive
                         _lastPingTime = UnityEngine.Time.time;
                         SendRaw(new byte[] { MSG_CONNECT_ACK }, sender);
@@ -430,14 +439,8 @@ namespace TCAMultiplayer.Networking
                         ulong peerId = _isHost ? CLIENT_ID : HOST_ID;
                         _isConnected = false;
                         _remoteEndPoint = null;
-
-                        // Reset reliable state so next connection starts fresh
-                        lock (_reliableLock)
-                        {
-                            _pendingAcks.Clear();
-                            _receivedSequences.Clear();
-                            _nextSequenceNumber = 1;
-                        }
+                        _waitingForConnection = false;
+                        ResetReliableState();
 
                         Plugin.Log.LogInfo("DirectTransport: Peer disconnected");
                         OnPeerDisconnected?.Invoke(peerId);
@@ -472,7 +475,7 @@ namespace TCAMultiplayer.Networking
                         // Send ACK immediately
                         SendAck(seqNum, sender);
 
-                        // Check for duplicate
+                        // Check for duplicate using sliding window
                         bool isDuplicate;
                         lock (_reliableLock)
                         {
@@ -480,11 +483,17 @@ namespace TCAMultiplayer.Networking
                             if (!isDuplicate)
                             {
                                 _receivedSequences.Add(seqNum);
+                                if (seqNum > _highestReceivedSeq)
+                                    _highestReceivedSeq = seqNum;
 
-                                // Prevent memory bloat - clear old sequences periodically
+                                // Sliding window: keep only sequences within window of the highest seen.
+                                // This avoids the nuclear Clear() that allowed packet replay.
                                 if (_receivedSequences.Count > NetworkConfig.MAX_RECEIVED_SEQUENCES)
                                 {
-                                    _receivedSequences.Clear();
+                                    uint windowMin = _highestReceivedSeq > (uint)NetworkConfig.MAX_RECEIVED_SEQUENCES
+                                        ? _highestReceivedSeq - (uint)NetworkConfig.MAX_RECEIVED_SEQUENCES
+                                        : 0;
+                                    _receivedSequences.RemoveWhere(s => s < windowMin);
                                 }
                             }
                         }
@@ -601,14 +610,13 @@ namespace TCAMultiplayer.Networking
         {
             _isRunning = false;
             _isConnected = false;
+            _waitingForConnection = false;
+            _remoteEndPoint = null;
+            _lastPingTime = 0f;
+            _lastPongTime = 0f;
 
             // Clear reliable packet state
-            lock (_reliableLock)
-            {
-                _pendingAcks.Clear();
-                _receivedSequences.Clear();
-                _nextSequenceNumber = 1;
-            }
+            ResetReliableState();
 
             try
             {
@@ -630,6 +638,24 @@ namespace TCAMultiplayer.Networking
             {
                 _incomingQueue.Clear();
             }
+        }
+
+        private void ResetReliableState()
+        {
+            lock (_reliableLock)
+            {
+                _pendingAcks.Clear();
+                _receivedSequences.Clear();
+                _highestReceivedSeq = 0;
+                _nextSequenceNumber = 1;
+            }
+        }
+
+        private static bool EndpointsEqual(IPEndPoint a, IPEndPoint b)
+        {
+            if (ReferenceEquals(a, b)) return true;
+            if (a == null || b == null) return false;
+            return a.Port == b.Port && Equals(a.Address, b.Address);
         }
     }
 }

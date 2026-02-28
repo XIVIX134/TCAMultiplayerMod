@@ -26,9 +26,15 @@ namespace TCAMultiplayer.UI
         private string _username;
         private bool _isConnecting = false;
         private string _connectionError = "";
+        private bool _isRefreshing = false;
+        private bool _refreshPending = false;
 
         public static async UniTask CreateAndRun()
         {
+            // Guard against creating duplicate menu instances (e.g. double-click,
+            // or ReturnToLobby racing with an existing menu).
+            if (Instance != null) return;
+
             var go = new GameObject("MultiplayerMenu", typeof(RectTransform));
             var menu = go.AddComponent<MultiplayerMenu>();
             await menu.RunMenu();
@@ -60,6 +66,8 @@ namespace TCAMultiplayer.UI
                 Plugin.Instance.Network.OnPeerConnected -= OnPeerConnected;
                 Plugin.Instance.Network.OnPeerDisconnected -= OnPeerDisconnected;
             }
+            // Clear singleton reference so CreateAndRun guard works correctly
+            if (Instance == this) Instance = null;
         }
 
         private void OnPeerConnected(ulong peerId)
@@ -112,7 +120,10 @@ namespace TCAMultiplayer.UI
 
         private void OnLobbyStateChanged()
         {
-            if (_currentScreen == LobbyScreen.Lobby || _currentScreen == LobbyScreen.HostSetup)
+            // Only refresh when on the Lobby screen. HostSetup has no dynamic lobby content
+            // and refreshing it mid-click (e.g. from CreateLobby) destroys the clicked button
+            // via DestroyImmediate, which aborts the rest of the onClick handler.
+            if (_currentScreen == LobbyScreen.Lobby)
                 RefreshUI();
         }
 
@@ -129,8 +140,9 @@ namespace TCAMultiplayer.UI
             _hostPort = Plugin.ConfigHostPort?.Value ?? NetworkConfig.DEFAULT_PORT_STRING;
 
             LobbyManager.Instance?.SetLocalPlayerName(_username);
-            
-            SetScreen(LobbyScreen.MainMenu);
+
+            bool alreadyInLobby = Plugin.Instance?.GameState?.IsInLobby ?? false;
+            SetScreen(alreadyInLobby ? LobbyScreen.Lobby : LobbyScreen.MainMenu);
             await UniTask.WaitUntil(() => _isCloseRequested, PlayerLoopTiming.Update, this.GetCancellationTokenOnDestroy());
             this.gameObject.SetActive(false);
             Destroy(this.gameObject);
@@ -206,7 +218,31 @@ namespace TCAMultiplayer.UI
 
         private void RefreshUI()
         {
-            foreach (Transform child in _contentRoot.transform) Destroy(child.gameObject);
+            // Re-entrancy guard: DrawLobby() can trigger OnLobbyStateChanged (e.g. via
+            // auto-selecting an airfield which calls SetLocalAirfield), which calls RefreshUI()
+            // WHILE DrawLobby() is still executing. Without this guard, the re-entrant call
+            // redraws the full UI, then the original DrawLobby() continues appending duplicate
+            // elements. Instead, defer the refresh until the current draw completes.
+            if (_isRefreshing)
+            {
+                _refreshPending = true;
+                return;
+            }
+
+            _isRefreshing = true;
+            _refreshPending = false;
+
+            // Detach children from parent FIRST (removes from layout immediately),
+            // then Destroy them (deferred — avoids killing a button mid-onClick).
+            // This prevents phantom clicks on pending-destroy buttons.
+            var toDestroy = new System.Collections.Generic.List<GameObject>();
+            foreach (Transform child in _contentRoot.transform)
+                toDestroy.Add(child.gameObject);
+            foreach (var go in toDestroy)
+            {
+                go.transform.SetParent(null);  // Remove from layout immediately
+                Destroy(go);                     // Clean up at end of frame
+            }
 
             switch (_currentScreen)
             {
@@ -216,6 +252,15 @@ namespace TCAMultiplayer.UI
                 case LobbyScreen.DirectConnect: DrawDirectConnect(); break;
                 case LobbyScreen.Lobby: DrawLobby(); break;
             }
+
+            _isRefreshing = false;
+
+            // If a refresh was requested while we were drawing, do it now
+            if (_refreshPending)
+            {
+                _refreshPending = false;
+                RefreshUI();
+            }
         }
 
         private void DrawMainMenu()
@@ -224,6 +269,7 @@ namespace TCAMultiplayer.UI
             UIFactory.CreateLabelInputRow("Username:", _username, _contentRoot.transform, (val) => {
                 _username = val;
                 if (Plugin.ConfigUsername != null) Plugin.ConfigUsername.Value = val;
+                Plugin.Instance?.Config?.Save();
                 LobbyManager.Instance?.SetLocalPlayerName(val);
             });
             UIFactory.CreateNativeButton("HOST GAME", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.HostSetup));
@@ -243,19 +289,35 @@ namespace TCAMultiplayer.UI
             UIFactory.CreateLabelInputRow("Server Name:", _hostName, _contentRoot.transform, val => {
                 _hostName = val;
                 if (Plugin.ConfigHostName != null) Plugin.ConfigHostName.Value = val;
+                Plugin.Instance?.Config?.Save();
             });
             UIFactory.CreateLabelInputRow("Port:", _hostPort, _contentRoot.transform, val => {
                 _hostPort = val;
                 if (Plugin.ConfigHostPort != null) Plugin.ConfigHostPort.Value = val;
+                Plugin.Instance?.Config?.Save();
             });
 
             UIFactory.CreateNativeButton("START SERVER", _contentRoot.transform).onClick.AddListener(() => {
                 int.TryParse(_hostPort, out int port);
+
+                // Reset transport state before re-hosting.
+                Plugin.Instance?.Network?.Disconnect();
+                Plugin.Instance?.Discovery?.StopBroadcasting();
+                Plugin.Instance?.Discovery?.StopListening();
                 Plugin.Instance?.GameState?.StartHosting(port, _hostName);
                 Plugin.Instance?.Network?.StartHost(port);
+
+                // CRITICAL: Switch screen to Lobby BEFORE CreateLobby, because CreateLobby
+                // fires OnLobbyStateChanged → BroadcastLobbyState, and the resulting network
+                // events can trigger OnPeerDisconnected/OnPeerConnected which call RefreshUI.
+                // With deferred Destroy(), the old HostSetup BACK button is still alive and
+                // Unity's event system can register a phantom click on it (due to layout shift),
+                // which calls SetScreen(MainMenu) and aborts the rest of this handler.
+                SetScreen(LobbyScreen.Lobby);
+
                 Plugin.Instance.Lobby?.CreateLobby(Plugin.Instance.Network.LocalPeerId, _hostName);
                 Plugin.Instance.Discovery?.StartBroadcasting(_hostName, port, "ActionIsland", 1, 8);
-                SetScreen(LobbyScreen.Lobby);
+                Plugin.Log?.LogInfo($"[MultiplayerMenu] Hosting started on port {port}. Players={Plugin.Instance?.Lobby?.PlayerCount}");
             });
             UIFactory.CreateNativeButton("BACK", _contentRoot.transform).onClick.AddListener(() => SetScreen(LobbyScreen.MainMenu));
         }
@@ -512,18 +574,22 @@ namespace TCAMultiplayer.UI
             if (isHost)
             {
                 var start = UIFactory.CreateNativeButton("START GAME", _contentRoot.transform);
-                start.interactable = lobby.AreAllPlayersReady;
+                start.interactable = lobby.AreAllPlayersReady && !lobby.GameLoading && !lobby.GameStarted;
                 start.onClick.AddListener(() => {
                     Plugin.Log?.LogInfo("[MultiplayerMenu] Starting game...");
-                    lobby.StartGame();
-                    Plugin.Instance.Lobby?.SendStartGame(lobby.MapName, lobby.SpawnType);
+                    bool started = lobby.StartGame();
+                    if (started)
+                    {
+                        Plugin.Instance.Lobby?.SendStartGame(lobby.MapName, lobby.SpawnType);
+                    }
                 });
             }
 
             UIFactory.CreateNativeButton("LEAVE", _contentRoot.transform).onClick.AddListener(() => {
-                Plugin.Instance?.GameState?.Disconnect();
                 Plugin.Instance?.Network?.Disconnect();
+                Plugin.Instance?.GameState?.Disconnect();
                 Plugin.Instance?.Discovery?.StopBroadcasting();
+                Plugin.Instance?.Discovery?.StopListening();
                 Plugin.Instance?.Lobby?.LeaveLobby();
                 SetScreen(LobbyScreen.MainMenu);
             });
@@ -535,10 +601,12 @@ namespace TCAMultiplayer.UI
             UIFactory.CreateLabelInputRow("IP:", _connectIP, _contentRoot.transform, v => {
                 _connectIP = v;
                 if (Plugin.ConfigLastIP != null) Plugin.ConfigLastIP.Value = v;
+                Plugin.Instance?.Config?.Save();
             });
             UIFactory.CreateLabelInputRow("Port:", _connectPort, _contentRoot.transform, v => {
                 _connectPort = v;
                 if (Plugin.ConfigLastPort != null) Plugin.ConfigLastPort.Value = v;
+                Plugin.Instance?.Config?.Save();
             });
 
             var spacer = new GameObject("Spacer", typeof(RectTransform), typeof(LayoutElement));
@@ -563,6 +631,8 @@ namespace TCAMultiplayer.UI
                     if (Plugin.Instance == null) return;
 
                     Plugin.Log?.LogInfo($"[MultiplayerMenu] Direct connect to {_connectIP}:{p}");
+                    // Ensure reconnect starts from a fresh transport instance state.
+                    Plugin.Instance.Network.Disconnect();
                     Plugin.Instance.GameState?.StartConnecting(_connectIP, p);
                     Plugin.Instance.Network.StartClient(_connectIP, p);
                     
@@ -638,6 +708,8 @@ namespace TCAMultiplayer.UI
                         }
                         
                         Plugin.Log?.LogInfo($"[MultiplayerMenu] LAN browse - joining game: {game.IPAddress}:{game.Port}");
+                        // Ensure reconnect starts from a fresh transport instance state.
+                        Plugin.Instance.Network.Disconnect();
                         Plugin.Instance.GameState?.StartConnecting(game.IPAddress, game.Port);
                         Plugin.Instance.Network.StartClient(game.IPAddress, game.Port);
                         

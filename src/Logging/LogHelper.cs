@@ -198,5 +198,14 @@ namespace TCAMultiplayer
             InstanceLogger.LogStateChange(fromState, toState);
             Plugin.Log?.LogInfo($"{InstanceLogger.GetPrefix()}STATE: {fromState} -> {toState}");
         }
+
+        /// <summary>
+        /// Clear throttle/sample caches to prevent unbounded growth over long sessions.
+        /// </summary>
+        public static void Cleanup()
+        {
+            LastLogTimes.Clear();
+            Counters.Clear();
+        }
     }
 }

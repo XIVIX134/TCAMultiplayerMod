@@ -56,7 +56,6 @@ namespace TCAMultiplayer.Player
 
             InitializeReflection();
         }
-
         private void InitializeReflection()
         {
             if (_reflectionInitialized) return;
@@ -418,6 +417,7 @@ namespace TCAMultiplayer.Player
             _lastCollisionTime.Clear();
             _localAircraft = null;
         }
+
 
         private void OnDestroy()
         {

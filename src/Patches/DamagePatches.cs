@@ -13,10 +13,11 @@ namespace TCAMultiplayer.Patches
     /// <summary>
     /// Patches for damage system to sync damage between players
     ///
-    /// Design: Shooter Authority
-    /// - When local player shoots and hits the remote aircraft clone, we detect the damage
-    /// - We send a damage packet to the remote player
-    /// - Remote player receives and applies damage to their real aircraft
+    /// Design: Victim-side authority
+    /// - Remote projectiles (bullets/missiles/bombs) are spawned on the victim's machine
+    /// - The game engine handles damage natively when those projectiles hit the local aircraft
+    /// - The attacker-side prefixes only BLOCK damage on clones (no packets sent)
+    /// - Kill credit is tracked via SourceTarget → RemoteAircraftController.PlayerId
     /// </summary>
     [HarmonyPatch]
     public static class DamagePatches
@@ -52,7 +53,7 @@ namespace TCAMultiplayer.Patches
         /// <summary>
         /// Get the local player's peer ID
         /// </summary>
-        private static ulong GetLocalPlayerId() => Plugin.Instance.Network.LocalPeerId;
+        private static ulong GetLocalPlayerId() => Plugin.Instance?.Network?.LocalPeerId ?? 0;
 
         /// <summary>
         /// Patch Damageable.ApplyDamageFromImpact to intercept damage on remote aircraft
@@ -79,89 +80,77 @@ namespace TCAMultiplayer.Patches
                     return false; // Skip damage - aircraft is dead
                 }
 
-                // This is damage on a REMOTE aircraft clone (the enemy we're shooting at)
-                // We need to send this damage to the remote player
-
-                Plugin.Log?.LogInfo($"[DamagePatches] Hit detected on remote aircraft! Damage: {damageSource.Damage}");
-                if (LogHelper.IsEnabled(LogCategory.Damage) &&
-                    LogHelper.ShouldSample("DamagePatches.ImpactDetails", LogHelper.HighFreqSampleRate))
-                {
-                    LogHelper.Info(LogCategory.Damage,
-                        $"[DamagePatches] Impact details weapon={damageSource.Weapon ?? "Unknown"} " +
-                        $"pen={damageSource.Penetration} hitPos={damageSource.HitPosition}");
-                }
-
-                // Convert hit position to ABSOLUTE coordinates for network sync
-                Vector3d absoluteHitPos = FloatingOriginHelper.LocalToAbsolute(damageSource.HitPosition);
-
-                Plugin.Log?.LogInfo($"[DamagePatches] Hit pos local={damageSource.HitPosition} absolute={absoluteHitPos}");
-
-                // Determine damage type based on weapon name
-                byte damageType = DAMAGE_TYPE_BULLET;
-                string weaponUpper = (damageSource.Weapon ?? "").ToUpperInvariant();
-                if (weaponUpper.Contains("AIM") || weaponUpper.Contains("MISSILE") ||
-                    weaponUpper.Contains("ROCKET") || weaponUpper.Contains("BOMB"))
-                {
-                    damageType = DAMAGE_TYPE_EXPLOSIVE;
-                }
-
-                // Build damage packet with ABSOLUTE coordinates
-                var packet = new DamagePacket
-                {
-                    VictimId = controller.PlayerId,
-                    AttackerId = GetLocalPlayerId(),
-                    Damage = damageSource.Damage,
-                    Penetration = damageSource.Penetration,
-                    DamageType = damageType,
-                    HitPosX = absoluteHitPos.x,
-                    HitPosY = absoluteHitPos.y,
-                    HitPosZ = absoluteHitPos.z,
-                    WeaponName = damageSource.Weapon ?? "Unknown"
-                };
-
-                // Send damage packet to remote player
-                byte[] data = PacketSerializer.SerializeDamage(packet);
-                Plugin.Instance.Network.SendPacket(PacketType.DamageDealt, data, reliable: true);
-
-                Plugin.Log?.LogInfo($"[DamagePatches] Sent damage packet: {packet.Damage} damage from {packet.WeaponName}");
-                if (LogHelper.IsEnabled(LogCategory.Damage) &&
-                    LogHelper.ShouldSample("DamagePatches.PacketDetails", LogHelper.HighFreqSampleRate))
-                {
-                    LogHelper.Info(LogCategory.Damage,
-                        $"[DamagePatches] Packet victim={packet.VictimId} attacker={packet.AttackerId} " +
-                        $"pos=({packet.HitPosX:F1},{packet.HitPosY:F1},{packet.HitPosZ:F1})");
-                }
-
-                // Also send impact packet for FX synchronization
-                // This ensures the victim sees the impact effect at the correct location
-                var impactPacket = new ProjectileImpactPacket
-                {
-                    AttackerId = GetLocalPlayerId(),
-                    VictimId = controller.PlayerId,
-                    ImpactType = damageType,
-                    EffectType = DetermineEffectType(damageSource.HitCollider),
-                    ImpactPosX = absoluteHitPos.x,
-                    ImpactPosY = absoluteHitPos.y,
-                    ImpactPosZ = absoluteHitPos.z,
-                    ImpactDirX = -damageSource.HitPosition.normalized.x,
-                    ImpactDirY = -damageSource.HitPosition.normalized.y,
-                    ImpactDirZ = -damageSource.HitPosition.normalized.z,
-                    Damage = damageSource.Damage,
-                    WeaponName = damageSource.Weapon ?? "Unknown"
-                };
-
-                byte[] impactData = PacketSerializer.SerializeProjectileImpact(impactPacket);
-                Plugin.Instance.Network.SendPacket(PacketType.ProjectileImpact, impactData, reliable: true);
-                Plugin.Log?.LogInfo($"[DamagePatches] Sent impact FX packet at ({absoluteHitPos.x:F1},{absoluteHitPos.y:F1},{absoluteHitPos.z:F1})");
-
-                // Don't apply damage locally to the clone - the remote player will handle their own HP
-                return false; // Skip original method - don't apply damage to clone
+                // DAMAGE AUTHORITY: Victim-side only.
+                // The remote player's machine spawns our bullets/missiles via SetRemoteGunFiring /
+                // HandleMissileLaunch. Those projectiles hit the victim's LOCAL aircraft and damage
+                // applies natively through the game engine. We do NOT send a DamagePacket because
+                // that would cause DOUBLE DAMAGE (native hit + packet hit on the receiver).
+                //
+                // We still block damage on the clone (return false) so the clone's HP doesn't
+                // desync or trigger false destruction effects on the attacker's side.
+                return false; // Block damage on clone — victim handles their own damage natively
             }
             catch (Exception ex)
             {
                 Plugin.Log?.LogError($"[DamagePatches] ApplyDamage error: {ex.Message}");
                 return true; // On error, let original proceed
             }
+        }
+
+        /// <summary>
+        /// Postfix on ApplyDamageFromImpact: track attacker identity when LOCAL aircraft
+        /// takes damage from a remote player's bullets (for kill credit).
+        /// </summary>
+        [HarmonyPatch(typeof(Damageable), "ApplyDamageFromImpact")]
+        [HarmonyPostfix]
+        public static void ApplyDamageFromImpact_Postfix(
+            Damageable __instance,
+            DamageSource damageSource)
+        {
+            TrackRemoteAttacker(__instance, damageSource);
+        }
+
+        /// <summary>
+        /// Postfix on ApplyDamageFromExplosion: track attacker identity when LOCAL aircraft
+        /// takes explosion damage from a remote player's missiles/bombs (for kill credit).
+        /// </summary>
+        [HarmonyPatch(typeof(Damageable), "ApplyDamageFromExplosion")]
+        [HarmonyPostfix]
+        public static void ApplyDamageFromExplosion_Postfix(
+            Damageable __instance,
+            DamageSource damageSource)
+        {
+            TrackRemoteAttacker(__instance, damageSource);
+        }
+
+        /// <summary>
+        /// If this damage was caused by a remote player's projectile, record their ID
+        /// for kill credit. The projectile's FiredFrom/Ownship Target has a
+        /// RemoteAircraftController with the attacker's PlayerId.
+        /// </summary>
+        private static void TrackRemoteAttacker(Damageable damageable, DamageSource damageSource)
+        {
+            try
+            {
+                if (Plugin.Instance == null || Plugin.Instance.Network == null) return;
+                if (!Plugin.Instance.Network.IsConnected) return;
+
+                // Only track on the LOCAL player's aircraft (not on clones)
+                var controller = damageable.GetComponentInParent<RemoteAircraftController>();
+                if (controller != null) return; // This is a clone, not our aircraft
+
+                // Check if the damage source has a SourceTarget from a remote player
+                if (damageSource.SourceTarget == null) return;
+
+                var attackerController = damageSource.SourceTarget.GetComponentInParent<RemoteAircraftController>();
+                if (attackerController == null) return; // Damage from AI or self, not a remote player
+
+                // Record the remote attacker for kill credit
+                LastAttackerId = attackerController.PlayerId;
+                LastAttackerWeapon = damageSource.Weapon ?? "Unknown";
+                LastDamageTime = UnityEngine.Time.time;
+            }
+            catch { } // Never let tracking errors break the damage pipeline
         }
 
         /// <summary>
@@ -189,73 +178,11 @@ namespace TCAMultiplayer.Patches
                     LogHelper.Info(LogCategory.Damage, "[DamagePatches] Remote aircraft already destroyed, ignoring explosion damage");
                     return false;
                 }
-
-                // DEBOUNCE: A single Explosion.Trigger() hits multiple Damageable children on the
-                // same aircraft in the same frame, producing 3+ damage packets. We send only the first
-                // one and aggregate damage, skipping subsequent hits within the debounce window.
-                ulong victimId = controller.PlayerId;
-                if (victimId == _lastExplosionVictimId &&
-                    Time.time - _lastExplosionTime < EXPLOSION_DEBOUNCE_SECONDS)
-                {
-                    // Duplicate explosion hit on same victim within debounce window — skip
-                    _lastExplosionDamage += damageSource.Damage;
-                    Plugin.Log?.LogInfo($"[DamagePatches] EXPLOSION debounced (accumulated {_lastExplosionDamage} total), skipping duplicate on victim {victimId}");
-                    return false; // Skip — first hit already sent
-                }
-
-                // First hit in a new explosion — record for debounce tracking
-                _lastExplosionVictimId = victimId;
-                _lastExplosionTime = Time.time;
-                _lastExplosionDamage = damageSource.Damage;
-
-                // This is EXPLOSION damage on a REMOTE aircraft clone (missile hit!)
-                Plugin.Log?.LogInfo($"[DamagePatches] EXPLOSION hit on remote aircraft! Damage: {damageSource.Damage}, Weapon: {damageSource.Weapon}");
-
-                // Convert hit position to ABSOLUTE coordinates for network sync
-                Vector3d absoluteHitPos = FloatingOriginHelper.LocalToAbsolute(damageSource.HitPosition);
-
-                // Build damage packet - mark as explosive
-                var packet = new DamagePacket
-                {
-                    VictimId = victimId,
-                    AttackerId = GetLocalPlayerId(),
-                    Damage = damageSource.Damage,
-                    Penetration = damageSource.Penetration,
-                    DamageType = 1, // 1 = missile/explosive
-                    HitPosX = absoluteHitPos.x,
-                    HitPosY = absoluteHitPos.y,
-                    HitPosZ = absoluteHitPos.z,
-                    WeaponName = damageSource.Weapon ?? "Explosion"
-                };
-
-                // Send damage packet
-                byte[] data = PacketSerializer.SerializeDamage(packet);
-                Plugin.Instance.Network.SendPacket(PacketType.DamageDealt, data, reliable: true);
-
-                Plugin.Log?.LogInfo($"[DamagePatches] Sent EXPLOSION damage packet: {packet.Damage} damage from {packet.WeaponName}");
-
-                // Send ONE impact packet for FX (not per sub-hit)
-                var impactPacket = new ProjectileImpactPacket
-                {
-                    AttackerId = GetLocalPlayerId(),
-                    VictimId = victimId,
-                    ImpactType = 1, // explosive
-                    EffectType = 2, // explosion effect
-                    ImpactPosX = absoluteHitPos.x,
-                    ImpactPosY = absoluteHitPos.y,
-                    ImpactPosZ = absoluteHitPos.z,
-                    ImpactDirX = 0,
-                    ImpactDirY = 1,
-                    ImpactDirZ = 0,
-                    Damage = damageSource.Damage,
-                    WeaponName = damageSource.Weapon ?? "Explosion"
-                };
-
-                byte[] impactData = PacketSerializer.SerializeProjectileImpact(impactPacket);
-                Plugin.Instance.Network.SendPacket(PacketType.ProjectileImpact, impactData, reliable: true);
-
-                // Don't apply damage locally to the clone
-                return false;
+                // DAMAGE AUTHORITY: Victim-side only.
+                // The remote player's machine spawns our missiles/bombs via HandleMissileLaunch /
+                // SpawnNetworkBomb. Those munitions hit the victim's LOCAL aircraft and damage
+                // applies natively. We do NOT send a DamagePacket — that would cause DOUBLE DAMAGE.
+                return false; // Block damage on clone — victim handles their own damage natively
             }
             catch (Exception ex)
             {
@@ -265,9 +192,9 @@ namespace TCAMultiplayer.Patches
         }
 
         /// <summary>
-        /// Handle received damage packet - apply damage to local player's aircraft
-        /// Called from NetworkManager when DamageDealt packet is received
-        /// Includes hit validation to prevent cheating
+        /// NOTE: With victim-side damage authority, DamagePackets are no longer sent by the
+        /// attacker (bullets/missiles are spawned on the victim's machine and hit natively).
+        /// This handler remains as a safety fallback in case any code path still sends damage.
         /// </summary>
         public static void HandleReceivedDamage(DamagePacket packet)
         {
@@ -490,6 +417,20 @@ namespace TCAMultiplayer.Patches
             {
                 Plugin.Log?.LogError($"[DamagePatches] HandleReceivedImpact error: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Reset static state between game sessions.
+        /// </summary>
+        public static void ResetState()
+        {
+            DestructionHandled = false;
+            LastAttackerId = 0;
+            LastAttackerWeapon = "";
+            LastDamageTime = 0f;
+            _lastExplosionVictimId = 0;
+            _lastExplosionTime = 0f;
+            _lastExplosionDamage = 0f;
         }
     }
 }

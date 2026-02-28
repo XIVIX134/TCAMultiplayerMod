@@ -279,9 +279,33 @@ namespace TCAMultiplayer.Game
 
             if (position == Vector3.zero)
             {
-                Plugin.Log?.LogError($"[SpawnManager] Could not get spawn point for airfield: {airfieldName}");
-                OnSpawnFailed?.Invoke();
-                return false;
+                Plugin.Log?.LogWarning($"[SpawnManager] Could not get spawn point for airfield: {airfieldName}. Trying fallback airfields...");
+                string[] fallbackAirfields = AirfieldHelper.GetAirfieldNames();
+                if (fallbackAirfields != null)
+                {
+                    for (int i = 0; i < fallbackAirfields.Length; i++)
+                    {
+                        string fallback = fallbackAirfields[i];
+                        if (string.IsNullOrWhiteSpace(fallback)) continue;
+                        if (string.Equals(fallback, airfieldName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                        var fallbackSpawn = AirfieldHelper.GetSpawnPoint(fallback, spawnType);
+                        if (fallbackSpawn.position == Vector3.zero) continue;
+
+                        Plugin.Log?.LogWarning($"[SpawnManager] Using fallback airfield '{fallback}' for spawn");
+                        airfieldName = fallback;
+                        position = fallbackSpawn.position;
+                        rotation = fallbackSpawn.rotation;
+                        break;
+                    }
+                }
+
+                if (position == Vector3.zero)
+                {
+                    Plugin.Log?.LogError($"[SpawnManager] Could not resolve any valid spawn point (selected airfield: {airfieldName})");
+                    OnSpawnFailed?.Invoke();
+                    return false;
+                }
             }
 
             SpawnedAirfield = airfieldName;
@@ -374,8 +398,16 @@ namespace TCAMultiplayer.Game
                 IsSpawned = true;
                 SpawnedType = spawnType;
 
-                // Initialize flight mode
-                InitializeFlightMode(flightGame, spawnType);
+                // Initialize flight mode only for the initial synchronized match start.
+                // During in-match respawn, calling StartFlight can reinitialize map/flight systems and create duplicates.
+                if (ShouldInitializeFlightMode())
+                {
+                    InitializeFlightMode(flightGame, spawnType);
+                }
+                else
+                {
+                    Plugin.Log?.LogInfo("[SpawnManager] Skipping StartFlight during in-match respawn");
+                }
 
                 // Fix Floating Origin: When we respawn, the base game doesn't properly re-assign
                 // the FloatingOrigin.ReferenceObject, which leads to massive floating point errors
@@ -434,6 +466,21 @@ namespace TCAMultiplayer.Game
             catch (Exception ex)
             {
                 Plugin.Log?.LogError($"[SpawnManager] StartFlight failed: {ex.Message}");
+            }
+        }
+
+        private static bool ShouldInitializeFlightMode()
+        {
+            var state = Plugin.Instance?.GameState?.CurrentState;
+            if (state == null) return true;
+
+            switch (state.Value)
+            {
+                case Networking.GameState.InGame:
+                case Networking.GameState.Respawning:
+                    return false;
+                default:
+                    return true;
             }
         }
 

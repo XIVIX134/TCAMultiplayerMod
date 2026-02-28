@@ -27,6 +27,7 @@ namespace TCAMultiplayer.Game
         // Cached airfield data
         private static Dictionary<string, object> _cachedAirfields = new Dictionary<string, object>();
         private static string[] _cachedAirfieldNames = new string[0];
+        private static string[] _lastKnownAirfieldNames = new string[0];
         private static float _lastCacheTime = 0f;
         // CACHE_DURATION now in NetworkConfig
         
@@ -113,35 +114,79 @@ namespace TCAMultiplayer.Game
                 if (_airfield2Type == null) return new string[0];
                 
                 // Find all Airfield2 objects in scene
-                var airfields = UnityEngine.Object.FindObjectsOfType(_airfield2Type) as Component[];
+                var airfields = FindAirfieldComponents(includeInactive: true);
                 if (LogHelper.ShouldLogInterval("AirfieldHelper.GetAirfieldNames", 10f))
                 {
                     Plugin.Log?.LogInfo($"[AirfieldHelper] Searching for airfields of type {_airfield2Type.Name}... Found: {airfields?.Length ?? 0}");
                 }
                 if (airfields == null || airfields.Length == 0)
                 {
+                    _cachedAirfields.Clear();
+                    if (_lastKnownAirfieldNames.Length > 0)
+                    {
+                        _cachedAirfieldNames = (string[])_lastKnownAirfieldNames.Clone();
+                        _lastCacheTime = Time.unscaledTime;
+                        Plugin.Log?.LogInfo($"[AirfieldHelper] No live airfields found; using {_cachedAirfieldNames.Length} cached lobby airfields");
+                        return _cachedAirfieldNames;
+                    }
+
+                    var lobbyFallbackNames = GetLobbyAirfieldFallbacks();
+                    if (lobbyFallbackNames.Length > 0)
+                    {
+                        _cachedAirfieldNames = (string[])lobbyFallbackNames.Clone();
+                        _lastKnownAirfieldNames = (string[])lobbyFallbackNames.Clone();
+                        _lastCacheTime = Time.unscaledTime;
+                        Plugin.Log?.LogInfo($"[AirfieldHelper] No live airfields found; using {_cachedAirfieldNames.Length} lobby-selected airfield(s)");
+                        return _cachedAirfieldNames;
+                    }
+
                     Plugin.Log?.LogWarning("[AirfieldHelper] No airfields found in scene");
                     return new string[0];
                 }
                 
                 var names = new List<string>();
                 _cachedAirfields.Clear();
-                var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                
+                var selectedAirfields = new Dictionary<string, Component>(StringComparer.OrdinalIgnoreCase);
+                int duplicateNameCount = 0;
+
                 foreach (var airfield in airfields)
                 {
                     string name = GetAirfieldDisplayName(airfield);
-                    if (!string.IsNullOrEmpty(name) && seenNames.Add(name))
+                    if (string.IsNullOrEmpty(name)) continue;
+
+                    if (selectedAirfields.TryGetValue(name, out var existing))
                     {
-                        names.Add(name);
-                        _cachedAirfields[name] = airfield;
+                        duplicateNameCount++;
+                        // Prefer the newest-loaded scene instance when duplicate airfield names exist.
+                        // This avoids stale spawn points when duplicate map scenes were left loaded.
+                        if (ShouldPreferAirfieldCandidate(existing, airfield))
+                        {
+                            selectedAirfields[name] = airfield;
+                        }
+                        continue;
                     }
+
+                    selectedAirfields[name] = airfield;
+                    names.Add(name);
+                }
+
+                foreach (var entry in selectedAirfields)
+                {
+                    _cachedAirfields[entry.Key] = entry.Value;
                 }
                 
                 _cachedAirfieldNames = names.ToArray();
+                if (_cachedAirfieldNames.Length > 0)
+                {
+                    _lastKnownAirfieldNames = (string[])_cachedAirfieldNames.Clone();
+                }
                 _lastCacheTime = Time.unscaledTime;
                 
                 Plugin.Log?.LogInfo($"[AirfieldHelper] Found {_cachedAirfieldNames.Length} airfields");
+                if (duplicateNameCount > 0)
+                {
+                    Plugin.Log?.LogWarning($"[AirfieldHelper] Detected {duplicateNameCount} duplicate airfield object(s); using newest scene instances");
+                }
                 
                 return _cachedAirfieldNames;
             }
@@ -149,6 +194,22 @@ namespace TCAMultiplayer.Game
             {
                 Plugin.Log?.LogError($"[AirfieldHelper] GetAirfieldNames error: {ex.Message}");
                 return new string[0];
+            }
+        }
+
+        private static Component[] FindAirfieldComponents(bool includeInactive)
+        {
+            if (_airfield2Type == null) return null;
+
+            try
+            {
+                // includeInactive=true is important during async scene load/spawn phases.
+                return UnityEngine.Object.FindObjectsOfType(_airfield2Type, includeInactive) as Component[];
+            }
+            catch
+            {
+                // Fallback for Unity variants without the includeInactive overload.
+                return UnityEngine.Object.FindObjectsOfType(_airfield2Type) as Component[];
             }
         }
         
@@ -176,6 +237,64 @@ namespace TCAMultiplayer.Game
                 return null;
             }
         }
+
+        private static bool ShouldPreferAirfieldCandidate(Component existing, Component candidate)
+        {
+            if (candidate == null) return false;
+            if (existing == null) return true;
+
+            try
+            {
+                int existingHandle = existing.gameObject.scene.handle;
+                int candidateHandle = candidate.gameObject.scene.handle;
+                if (candidateHandle != existingHandle)
+                {
+                    return candidateHandle > existingHandle;
+                }
+            }
+            catch
+            {
+                // Ignore and keep existing on comparison failure.
+            }
+
+            return false;
+        }
+
+        private static string[] GetLobbyAirfieldFallbacks()
+        {
+            try
+            {
+                var lobby = Plugin.Instance?.Lobby;
+                if (lobby == null) return new string[0];
+
+                var fallbackNames = new List<string>();
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                void AddFallback(string name)
+                {
+                    if (string.IsNullOrWhiteSpace(name)) return;
+                    var trimmed = name.Trim();
+                    if (trimmed.Length == 0) return;
+                    if (seen.Add(trimmed))
+                    {
+                        fallbackNames.Add(trimmed);
+                    }
+                }
+
+                AddFallback(lobby.LocalSelectedAirfield);
+                foreach (var kvp in lobby.Players)
+                {
+                    AddFallback(kvp.Value?.SelectedAirfield);
+                }
+
+                return fallbackNames.ToArray();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[AirfieldHelper] Lobby fallback lookup failed: {ex.Message}");
+                return new string[0];
+            }
+        }
         
         /// <summary>
         /// Get airfield by name
@@ -183,11 +302,17 @@ namespace TCAMultiplayer.Game
         public static object GetAirfield(string name)
         {
             Initialize();
+            if (string.IsNullOrWhiteSpace(name)) return null;
             
             // Check cache
             if (_cachedAirfields.TryGetValue(name, out var cached))
             {
-                return cached;
+                if (IsUnityObjectAlive(cached))
+                {
+                    return cached;
+                }
+
+                _cachedAirfields.Remove(name);
             }
             
             // Refresh cache
@@ -196,7 +321,73 @@ namespace TCAMultiplayer.Game
             // Try again
             if (_cachedAirfields.TryGetValue(name, out cached))
             {
-                return cached;
+                if (IsUnityObjectAlive(cached))
+                {
+                    return cached;
+                }
+
+                _cachedAirfields.Remove(name);
+            }
+
+            // Normalize-based cache match (handles variants like "Toramaru Airfield" vs "ToramaruAirfield")
+            string normalizedRequested = NormalizeAirfieldName(name);
+            foreach (var kvp in _cachedAirfields)
+            {
+                if (!IsUnityObjectAlive(kvp.Value)) continue;
+                if (NormalizeAirfieldName(kvp.Key) == normalizedRequested)
+                {
+                    _cachedAirfields[name] = kvp.Value;
+                    return kvp.Value;
+                }
+            }
+
+            // Direct scene scan fallback (independent from GameLogic map reflection).
+            try
+            {
+                var airfields = FindAirfieldComponents(includeInactive: true);
+                if (airfields != null)
+                {
+                    Component firstAlive = null;
+                    foreach (var airfieldComp in airfields)
+                    {
+                        if (airfieldComp == null || airfieldComp.gameObject == null) continue;
+                        if (firstAlive == null) firstAlive = airfieldComp;
+
+                        string displayName = GetAirfieldDisplayName(airfieldComp);
+                        string objectName = airfieldComp.gameObject.name;
+                        bool isMatch =
+                            string.Equals(displayName, name, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(objectName, name, StringComparison.OrdinalIgnoreCase) ||
+                            NormalizeAirfieldName(displayName) == normalizedRequested ||
+                            NormalizeAirfieldName(objectName) == normalizedRequested;
+
+                        if (!isMatch) continue;
+
+                        _cachedAirfields[name] = airfieldComp;
+                        if (!string.IsNullOrEmpty(displayName))
+                        {
+                            _cachedAirfields[displayName] = airfieldComp;
+                        }
+                        if (!string.IsNullOrEmpty(objectName))
+                        {
+                            _cachedAirfields[objectName] = airfieldComp;
+                        }
+                        return airfieldComp;
+                    }
+
+                    // As last resort, return first available airfield instead of hard-failing spawn.
+                    if (firstAlive != null)
+                    {
+                        string fallbackName = GetAirfieldDisplayName(firstAlive) ?? firstAlive.gameObject.name;
+                        Plugin.Log?.LogWarning($"[AirfieldHelper] Airfield '{name}' not found, falling back to '{fallbackName}'");
+                        _cachedAirfields[name] = firstAlive;
+                        return firstAlive;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogWarning($"[AirfieldHelper] Direct airfield scan error: {ex.Message}");
             }
             
             // Try via GameLogic.LoadedMap.GetAirfieldByMapName
@@ -223,6 +414,29 @@ namespace TCAMultiplayer.Game
             }
             
             return null;
+        }
+
+        private static string NormalizeAirfieldName(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+            var chars = new List<char>(value.Length);
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if (char.IsWhiteSpace(c) || c == '_' || c == '-') continue;
+                chars.Add(char.ToLowerInvariant(c));
+            }
+            return new string(chars.ToArray());
+        }
+
+        private static bool IsUnityObjectAlive(object value)
+        {
+            if (value == null) return false;
+            if (value is UnityEngine.Object unityObj)
+            {
+                return unityObj != null;
+            }
+            return true;
         }
         
         /// <summary>
@@ -336,9 +550,19 @@ namespace TCAMultiplayer.Game
             }
             
             // Fallback
-            if (airfield is Component comp2)
+            if (airfield is Component comp2 && comp2 != null)
             {
-                return (comp2.transform.position, comp2.transform.rotation);
+                try
+                {
+                    if (comp2.gameObject != null)
+                    {
+                        return (comp2.transform.position, comp2.transform.rotation);
+                    }
+                }
+                catch
+                {
+                    // Airfield component was destroyed; return zero so caller can handle gracefully.
+                }
             }
             
             return (Vector3.zero, Quaternion.identity);

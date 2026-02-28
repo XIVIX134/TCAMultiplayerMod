@@ -154,6 +154,10 @@ namespace TCAMultiplayer.Patches
                 // Poll for new missile launches (replaces broken Harmony Postfix)
                 WeaponPatches.PollMissileLaunches();
 
+                // Continuous missile position sync (~10Hz, unreliable)
+                WeaponPatches.PollMissilePositionSync();
+                WeaponPatches.PollMissileLaunches();
+
                 // Poll for new bomb drops (unguided munitions)
                 WeaponPatches.PollBombDrops();
 

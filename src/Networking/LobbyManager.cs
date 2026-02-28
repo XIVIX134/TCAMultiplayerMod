@@ -76,6 +76,11 @@ namespace TCAMultiplayer.Networking
         {
             Instance = this;
             LocalPlayerName = GenerateRandomName();
+
+            // Load saved player selections from config so they persist across sessions
+            LocalSelectedAircraft = Plugin.ConfigLocalAircraft?.Value ?? "AV8B";
+            LocalSelectedLoadout = Plugin.ConfigLocalLoadout?.Value ?? "Clean";
+            LocalSelectedAirfield = Plugin.ConfigLocalAirfield?.Value ?? "";
         }
 
         /// <summary>
@@ -116,6 +121,18 @@ namespace TCAMultiplayer.Networking
             HostName = hostName ?? LocalPlayerName;
             GameStarted = false;
             GameLoading = false;
+
+            // Load saved host settings from config so they persist across sessions.
+            // Clamp to valid enum ranges to guard against manually edited config files.
+            int spawnTypeRaw = Plugin.ConfigHostSpawnType?.Value ?? (int)LobbySpawnType.Runway;
+            SpawnType = Enum.IsDefined(typeof(LobbySpawnType), spawnTypeRaw)
+                ? (LobbySpawnType)spawnTypeRaw : LobbySpawnType.Runway;
+
+            int todRaw = Plugin.ConfigHostTimeOfDay?.Value ?? (int)TimeOfDay.Morning;
+            SelectedTimeOfDay = Enum.IsDefined(typeof(TimeOfDay), todRaw)
+                ? (TimeOfDay)todRaw : TimeOfDay.Morning;
+
+            AircraftCollisionsEnabled = Plugin.ConfigHostAircraftCollisions?.Value ?? true;
 
             _players.Clear();
 
@@ -256,6 +273,10 @@ namespace TCAMultiplayer.Networking
             Plugin.Log?.LogInfo($"[LobbyManager] Player joined: {playerName} ({peerId})");
             OnPlayerJoined?.Invoke(peerId, playerName);
             OnLobbyStateChanged?.Invoke();
+
+            // Force immediate broadcast so client sees all players without waiting for periodic broadcast
+            _lastBroadcastHash = 0;
+            BroadcastLobbyState();
         }
 
         /// <summary>
@@ -345,6 +366,8 @@ namespace TCAMultiplayer.Networking
         public void SetLocalAirfield(string airfieldName)
         {
             LocalSelectedAirfield = airfieldName;
+            if (Plugin.ConfigLocalAirfield != null) Plugin.ConfigLocalAirfield.Value = airfieldName;
+            Plugin.Instance?.Config?.Save();
 
             if (_players.ContainsKey(LocalPeerId))
             {
@@ -375,6 +398,7 @@ namespace TCAMultiplayer.Networking
         {
             LocalSelectedAircraft = aircraftName;
             if (Plugin.ConfigLocalAircraft != null) Plugin.ConfigLocalAircraft.Value = aircraftName;
+            Plugin.Instance?.Config?.Save();
 
             if (_players.ContainsKey(LocalPeerId))
             {
@@ -392,6 +416,7 @@ namespace TCAMultiplayer.Networking
         {
             LocalSelectedLoadout = loadoutName;
             if (Plugin.ConfigLocalLoadout != null) Plugin.ConfigLocalLoadout.Value = loadoutName;
+            Plugin.Instance?.Config?.Save();
 
             if (_players.ContainsKey(LocalPeerId))
             {
@@ -437,6 +462,7 @@ namespace TCAMultiplayer.Networking
 
             SpawnType = spawnType;
             if (Plugin.ConfigHostSpawnType != null) Plugin.ConfigHostSpawnType.Value = (int)spawnType;
+            Plugin.Instance?.Config?.Save();
 
             if (!string.IsNullOrEmpty(mapName))
             {
@@ -457,6 +483,7 @@ namespace TCAMultiplayer.Networking
 
             AircraftCollisionsEnabled = enabled;
             if (Plugin.ConfigHostAircraftCollisions != null) Plugin.ConfigHostAircraftCollisions.Value = enabled;
+            Plugin.Instance?.Config?.Save();
 
             Plugin.Log?.LogInfo($"[LobbyManager] Aircraft collisions: {enabled}");
             OnLobbyStateChanged?.Invoke();
@@ -468,6 +495,7 @@ namespace TCAMultiplayer.Networking
 
             SelectedTimeOfDay = timeOfDay;
             if (Plugin.ConfigHostTimeOfDay != null) Plugin.ConfigHostTimeOfDay.Value = (int)timeOfDay;
+            Plugin.Instance?.Config?.Save();
 
             Plugin.Log?.LogInfo($"[LobbyManager] Time of day: {timeOfDay}");
             OnLobbyStateChanged?.Invoke();
@@ -476,25 +504,40 @@ namespace TCAMultiplayer.Networking
         /// <summary>
         /// Start the game (host only)
         /// </summary>
-        public void StartGame()
+        public bool StartGame()
         {
             if (!IsHost)
             {
                 Plugin.Log?.LogWarning("[LobbyManager] Only host can start game");
-                return;
+                return false;
+            }
+
+            if (GameLoading || GameStarted)
+            {
+                Plugin.Log?.LogWarning($"[LobbyManager] StartGame ignored (GameLoading={GameLoading}, GameStarted={GameStarted})");
+                return false;
             }
 
             // Check all players ready
             if (!_players.Values.All(p => p.IsReady))
             {
                 Plugin.Log?.LogWarning("[LobbyManager] Not all players ready");
-                return;
+                return false;
             }
 
+            // Reset loaded flags for the new match.
+            LocalIsLoaded = false;
+            foreach (var player in _players.Values)
+            {
+                player.IsLoaded = false;
+            }
+
+            GameStarted = false;
             GameLoading = true;
             Plugin.Log?.LogInfo("[LobbyManager] Starting game...");
             OnGameStarting?.Invoke();
             OnLobbyStateChanged?.Invoke();
+            return true;
         }
 
         /// <summary>
@@ -502,8 +545,19 @@ namespace TCAMultiplayer.Networking
         /// </summary>
         public void HandleGameStart(string mapName, LobbySpawnType spawnType)
         {
+            if (GameLoading || GameStarted)
+            {
+                Plugin.Log?.LogWarning($"[LobbyManager] Duplicate HandleGameStart ignored (GameLoading={GameLoading}, GameStarted={GameStarted})");
+                return;
+            }
+
             MapName = mapName;
             SpawnType = spawnType;
+            LocalIsLoaded = false;
+            if (_players.ContainsKey(LocalPeerId))
+            {
+                _players[LocalPeerId].IsLoaded = false;
+            }
             GameLoading = true;
 
             Plugin.Log?.LogInfo($"[LobbyManager] Game starting: {mapName}, spawn: {spawnType}");
@@ -636,6 +690,7 @@ namespace TCAMultiplayer.Networking
         {
             GameStarted = false;
             GameLoading = false;
+            LocalIsReady = false;
             LocalIsLoaded = false;
 
             foreach (var player in _players.Values)

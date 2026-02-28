@@ -40,11 +40,19 @@ namespace TCAMultiplayer.UI
 
         /// <summary>
         /// Show the respawn screen overlay.
-        /// Creates the Canvas fresh each time (destroyed on hide).
+        /// Reuses existing Canvas when possible (toggle visibility) to avoid GC pressure.
         /// </summary>
         public void Show()
         {
-            if (_canvas != null) return; // Already visible
+            // If canvas exists, just re-show it with refreshed data
+            if (_canvas != null)
+            {
+                _canvas.SetActive(true);
+                RefreshSelections();
+                Cursor.lockState = CursorLockMode.None;
+                Cursor.visible = true;
+                return;
+            }
 
             Plugin.Log?.LogInfo("[RespawnScreen] Showing native respawn screen");
 
@@ -52,6 +60,15 @@ namespace TCAMultiplayer.UI
             Cursor.lockState = CursorLockMode.None;
             Cursor.visible = true;
 
+            RefreshSelections();
+            BuildUI();
+        }
+
+        /// <summary>
+        /// Refresh airfield/loadout selections from current lobby state.
+        /// </summary>
+        private void RefreshSelections()
+        {
             // Refresh airfield list
             _airfieldNames = AirfieldHelper.GetAirfieldNames();
             if (_airfieldNames == null) _airfieldNames = new string[0];
@@ -71,12 +88,10 @@ namespace TCAMultiplayer.UI
                     }
                 }
             }
-
-            BuildUI();
         }
 
         /// <summary>
-        /// Hide and destroy the respawn screen overlay.
+        /// Hide the respawn screen. Destroys the Canvas to rebuild cleanly on next Show().
         /// </summary>
         public void Hide()
         {
@@ -109,11 +124,28 @@ namespace TCAMultiplayer.UI
                 Cursor.visible = true;
             }
 
-            // R key = respawn shortcut
-            if (Input.GetKeyDown(KeyCode.R))
+            // Respawn shortcut: keyboard R or controller submit (Xbox A / PlayStation X).
+            if (IsRespawnInputPressed())
             {
                 DoRespawn();
             }
+        }
+
+        private static bool IsRespawnInputPressed()
+        {
+            if (Input.GetKeyDown(KeyCode.R)) return true;
+
+            // Legacy Unity mapping: JoystickButton0 is controller submit on common layouts.
+            if (Input.GetKeyDown(KeyCode.JoystickButton0)) return true;
+
+            // Fallback to Input Manager "Submit" binding if available.
+            try
+            {
+                if (Input.GetButtonDown("Submit")) return true;
+            }
+            catch { }
+
+            return false;
         }
 
         private void OnDestroy()
@@ -265,7 +297,7 @@ namespace TCAMultiplayer.UI
             CreateSpacer(_contentRoot.transform, 15);
 
             // Respawn button (big, green)
-            var respawnBtn = UIFactory.CreateNativeButton("RESPAWN  (R)", _contentRoot.transform, 60);
+            var respawnBtn = UIFactory.CreateNativeButton("RESPAWN  (R / A / X)", _contentRoot.transform, 60);
             if (respawnBtn != null)
             {
                 var img = respawnBtn.GetComponent<Image>();
@@ -308,7 +340,15 @@ namespace TCAMultiplayer.UI
                 if (success)
                 {
                     Hide();
-                    Plugin.Instance?.GameState?.OnSpawnComplete();
+                    var gsm = Plugin.Instance?.GameState;
+                    if (gsm?.CurrentState == Networking.GameState.Respawning)
+                    {
+                        gsm.OnRespawned();
+                    }
+                    else if (gsm?.CurrentState == Networking.GameState.Spawning)
+                    {
+                        gsm.OnSpawnComplete();
+                    }
                 }
                 else
                 {
