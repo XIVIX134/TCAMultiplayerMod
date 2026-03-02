@@ -347,6 +347,16 @@ Status verified in this workspace:
 - uploads DLL artifact
 - on `v*` tags, zips DLL and creates GitHub release
 
+`.github/workflows/mini-swe-agent.yml`:
+
+- triggered by `issue_comment` events on **issues** (not PRs) that contain `/mini-swe-fix`
+- installs [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) (Python package) and runs it against the issue URL
+- uses Anthropic provider (`anthropic/claude-opus-4-6`); secrets: `LLM_API_KEY` → `ANTHROPIC_API_KEY`, optional `LLM_BASE_URL` → `ANTHROPIC_BASE_URL`
+- commits any resulting changes to a new branch `mini-swe-fix/issue-<number>` and opens a ready-for-review PR targeting `main`; exits silently if the agent produces no changes
+- requires `PAT_TOKEN` (repo-scoped personal access token) and `PAT_USERNAME` for git authorship and PR creation
+- PRs are never auto-merged; all changes require human review before merging
+- see the [README.md "Automated Issue Fixing" section](README.md#automated-issue-fixing-mini-swe-agent) for full usage instructions and troubleshooting
+
 
 ## 15) Important notes and drift observed
 
