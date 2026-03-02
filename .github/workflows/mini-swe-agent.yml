@@ -3,6 +3,8 @@ name: AI Issue Pipeline
 on:
   issue_comment:
     types: [created]
+  issues:
+    types: [opened]
 
 permissions:
   contents: write
