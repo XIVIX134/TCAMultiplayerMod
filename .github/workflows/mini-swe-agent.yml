@@ -35,13 +35,11 @@ jobs:
         id: issue-context
         env:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-          ISSUE_TITLE: ${{ github.event.issue.title }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
           BRANCH_NAME="mini-swe-fix/issue-${ISSUE_NUMBER}"
           echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
+          echo "issue_url=https://github.com/${{ github.repository }}/issues/${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: Configure git
         run: |
@@ -58,9 +56,10 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          mini-swe-agent \
+          mini-extra github-issue \
+            --issue-url "${{ steps.issue-context.outputs.issue_url }}" \
             --model anthropic/claude-opus-4-6 \
-            --issue "https://github.com/${{ github.repository }}/issues/${{ steps.issue-context.outputs.issue_number }}"
+            --yolo
 
       - name: Commit and push changes
         id: push
