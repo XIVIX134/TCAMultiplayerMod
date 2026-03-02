@@ -10,7 +10,7 @@ permissions:
   issues: write
 jobs:
   resolve-issue:
-    uses: All-Hands-AI/OpenHands/.github/workflows/openhands-resolver.yml@main
+    uses: OpenHands/OpenHands/.github/workflows/openhands-resolver.yml@main
     with:
       LLM_MODEL: 'anthropic/claude-opus-4-6'
       max_iterations: 50
