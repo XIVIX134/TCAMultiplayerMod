@@ -12,24 +12,22 @@ permissions:
   issues: write
 
 jobs:
-  # ─────────────────────────────────────────────────────────────
-  # /analyse  →  Stage 1 (Analyst) + Stage 2 (Reviewer) only
-  # /fix      →  All 3 stages: Analyst + Reviewer + Builder + PR
-  # ─────────────────────────────────────────────────────────────
-
   analyse:
     name: "Analyse Issue"
     if: |
       github.event.issue.pull_request == null &&
-      github.event.comment.user.login == github.repository_owner &&
+      github.event.sender.login == github.repository_owner &&
       (
         startsWith(github.event.comment.body, '/analyse') ||
-        startsWith(github.event.comment.body, '/fix')
+        startsWith(github.event.comment.body, '/fix') ||
+        startsWith(github.event.issue.body, '/analyse') ||
+        startsWith(github.event.issue.body, '/fix')
       )
     runs-on: ubuntu-latest
     outputs:
       issue_number: ${{ steps.ctx.outputs.issue_number }}
       branch_name: ${{ steps.ctx.outputs.branch_name }}
+      trigger_body: ${{ steps.ctx.outputs.trigger_body }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,9 +61,18 @@ jobs:
         id: ctx
         env:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          # For issue_comment events, use comment body. For issues events, use issue body.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "branch_name=mini-swe-fix/issue-${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+          if [ "${EVENT_NAME}" = "issue_comment" ]; then
+            echo "trigger_body=${COMMENT_BODY}" >> "$GITHUB_OUTPUT"
+          else
+            echo "trigger_body=${ISSUE_BODY}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Configure git
         run: |
@@ -239,7 +246,7 @@ jobs:
           - That implementation is starting now
           Be specific. Reference actual file names and function names. 4-8 sentences." || true
 
-  # ──────────────────────────────────────────────���──────────────
+  # ─────────────────────────────────────────────────────────────
   # BUILD JOB — only runs for /fix, depends on analyse job
   # ─────────────────────────────────────────────────────────────
   build:
@@ -247,8 +254,11 @@ jobs:
     needs: analyse
     if: |
       github.event.issue.pull_request == null &&
-      github.event.comment.user.login == github.repository_owner &&
-      startsWith(github.event.comment.body, '/fix')
+      github.event.sender.login == github.repository_owner &&
+      (
+        startsWith(github.event.comment.body, '/fix') ||
+        startsWith(github.event.issue.body, '/fix')
+      )
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -378,7 +388,7 @@ jobs:
             --head "${{ needs.analyse.outputs.branch_name }}" \
             --title "fix: resolve issue #${{ needs.analyse.outputs.issue_number }}" \
             --body "Automated fix for #${{ needs.analyse.outputs.issue_number }} via 3-stage mini-swe-agent pipeline (Analyst → Reviewer → Builder).
-          Triggered by: ${{ github.event.comment.html_url }}")
+          Triggered by: ${{ github.event.html_url }}")
           echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
 
       - name: Builder posts PR comment
