@@ -33,11 +33,11 @@ namespace TCAMultiplayer.Networking
         public bool ClockOffsetInitialized { get; set; } = false;
 
         // Asymmetric EMA clock offset tracking.
-        // Fast-down (tau=0.1s): quickly adapts when genuine faster path appears,
+        // Fast-down (tau=1.0s): adapts when genuine faster path appears,
         //   keeps render point close to minimum latency = maximum buffer.
         // Slow-up (tau=3s): filters stutter-induced high offsets that would
         //   push render point backward and waste buffer.
-        private const float CLOCK_TAU_DOWN = 0.1f;
+        private const float CLOCK_TAU_DOWN = 1.0f;
         private const float CLOCK_TAU_UP = 3.0f;
 
         public void RecordClockSample(float instantOffset, float localTime)
@@ -75,6 +75,10 @@ namespace TCAMultiplayer.Networking
         public bool WasExtrapolating { get; set; }
         public bool HasAppliedPose { get; set; }
         public Vector3 LastAppliedPosition { get; set; } = Vector3.zero;
+        // Velocity smoothing for jitter reduction
+        public Vector3 SmoothedSteeringVelocity { get; set; } = Vector3.zero;
+        public Vector3 SmoothedSteeringAngVelocity { get; set; } = Vector3.zero;
+        public bool HasSmoothedSteering { get; set; } = false;
         public Quaternion LastAppliedRotation { get; set; } = Quaternion.identity;
 
         // Clone state
@@ -425,23 +429,35 @@ namespace TCAMultiplayer.Networking
                     rb.angularVelocity = Vector3.zero;
                     state.Aircraft.transform.position = targetPos;
                     state.Aircraft.transform.rotation = targetRot;
+                    state.HasSmoothedSteering = false; // Reset smoothing on teleport
                 }
                 else
                 {
                     // VELOCITY STEERING: set velocity so rigidbody arrives at target
                     // over the next FixedUpdate step. Unity physics integrates this,
                     // and RigidbodyInterpolation.Interpolate smoothly renders between steps.
-                    rb.velocity = (targetPos - rb.position) / dt;
+                    Vector3 rawSteeringVel = (targetPos - rb.position) / dt;
 
                     // Data-driven velocity bound: use the synced packet velocity magnitude as reference.
                     // The aircraft's actual speed comes from the game engine — no hardcoded limits.
                     float packetSpeed = state.LastVelocity.magnitude;
-                    float steeringSpeed = rb.velocity.magnitude;
+                    float steeringSpeed = rawSteeringVel.magnitude;
                     float maxReasonableSpeed = Mathf.Max(packetSpeed * 2f, packetSpeed + 10f);
                     if (maxReasonableSpeed > 0.1f && steeringSpeed > maxReasonableSpeed)
                     {
-                        rb.velocity = rb.velocity * (maxReasonableSpeed / steeringSpeed);
+                        rawSteeringVel = rawSteeringVel * (maxReasonableSpeed / steeringSpeed);
                     }
+
+                    // Smooth the steering velocity to dampen jitter from interpolation
+                    // discontinuities. EMA with alpha ~0.35 at 50Hz FixedUpdate provides
+                    // a good balance between responsiveness and smoothness.
+                    const float velocitySmoothingFactor = 0.35f;
+                    if (state.HasSmoothedSteering)
+                    {
+                        rawSteeringVel = Vector3.Lerp(state.SmoothedSteeringVelocity, rawSteeringVel, velocitySmoothingFactor);
+                    }
+                    state.SmoothedSteeringVelocity = rawSteeringVel;
+                    rb.velocity = rawSteeringVel;
 
                     // Angular velocity steering: compute the shortest rotation and convert to angular velocity
                     Quaternion deltaRot = targetRot * Quaternion.Inverse(rb.rotation);
@@ -454,27 +470,37 @@ namespace TCAMultiplayer.Networking
                         deltaRot.w = -deltaRot.w;
                     }
                     deltaRot.ToAngleAxis(out float angle, out Vector3 axis);
+                    Vector3 rawAngVel;
                     if (angle > 0.001f && axis.sqrMagnitude > 0.001f)
                     {
-                        rb.angularVelocity = axis.normalized * (angle * Mathf.Deg2Rad / dt);
+                        rawAngVel = axis.normalized * (angle * Mathf.Deg2Rad / dt);
 
                         // Data-driven angular velocity bound using packet data
                         var newest = state.Buffer.GetNewestSnapshot();
                         if (newest.IsValid)
                         {
                             float packetAngSpeed = newest.AngularVelocity.magnitude;
-                            float steeringAngSpeed = rb.angularVelocity.magnitude;
+                            float steeringAngSpeed = rawAngVel.magnitude;
                             float maxReasonableAngSpeed = Mathf.Max(packetAngSpeed * 2f, packetAngSpeed + 1f);
                             if (maxReasonableAngSpeed > 0.01f && steeringAngSpeed > maxReasonableAngSpeed)
                             {
-                                rb.angularVelocity = rb.angularVelocity * (maxReasonableAngSpeed / steeringAngSpeed);
+                                rawAngVel = rawAngVel * (maxReasonableAngSpeed / steeringAngSpeed);
                             }
                         }
                     }
                     else
                     {
-                        rb.angularVelocity = Vector3.zero;
+                        rawAngVel = Vector3.zero;
                     }
+
+                    // Smooth angular velocity too
+                    if (state.HasSmoothedSteering)
+                    {
+                        rawAngVel = Vector3.Lerp(state.SmoothedSteeringAngVelocity, rawAngVel, velocitySmoothingFactor);
+                    }
+                    state.SmoothedSteeringAngVelocity = rawAngVel;
+                    state.HasSmoothedSteering = true;
+                    rb.angularVelocity = rawAngVel;
                 }
 
                 state.HasAppliedPose = true;

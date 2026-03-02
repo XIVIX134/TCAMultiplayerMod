@@ -143,10 +143,10 @@ namespace TCAMultiplayer.Networking
                 }
                 else
                 {
-                    // Gentle correction: adjust rate by up to ±5% of deltaTime.
+                    // Gentle correction: adjust rate by up to +/-2% of deltaTime.
                     // This converges over several seconds without any per-frame jitter.
-                    // At 0.05 * deltaTime, a 0.1s error takes ~2 seconds to correct.
-                    float maxCorrection = 0.05f * Time.deltaTime;
+                    // At 0.02 * deltaTime, a 0.1s error takes ~5 seconds to correct.
+                    float maxCorrection = 0.02f * Time.deltaTime;
                     float correction = Mathf.Clamp(error, -maxCorrection, maxCorrection);
                     _renderClock += correction;
                 }
