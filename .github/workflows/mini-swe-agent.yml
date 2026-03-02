@@ -60,7 +60,7 @@ jobs:
         run: |
           mini-swe-agent \
             --model anthropic/claude-opus-4-6 \
-            --issue-url "https://github.com/${{ github.repository }}/issues/${{ steps.issue-context.outputs.issue_number }}"
+            --issue "https://github.com/${{ github.repository }}/issues/${{ steps.issue-context.outputs.issue_number }}"
 
       - name: Commit and push changes
         id: push
