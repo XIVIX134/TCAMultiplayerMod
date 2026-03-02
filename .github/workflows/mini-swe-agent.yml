@@ -37,9 +37,11 @@ jobs:
         run: |
           mkdir -p ~/.config/mini-swe-agent
           cat > ~/.config/mini-swe-agent/.env << EOF
+          MSWEA_MODEL_NAME=anthropic/claude-opus-4-6
+          MSWEA_CONFIGURED=true
+          MSWEA_NONINTERACTIVE=1
           ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
           ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
-          MINI_SWE_AGENT_MODEL=anthropic/claude-opus-4-6
           EOF
 
       - name: Prepare issue context
@@ -71,6 +73,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          MSWEA_NONINTERACTIVE: "1"
         run: |
           mini \
             --model anthropic/claude-opus-4-6 \
