@@ -27,7 +27,6 @@ jobs:
     outputs:
       issue_number: ${{ steps.ctx.outputs.issue_number }}
       branch_name: ${{ steps.ctx.outputs.branch_name }}
-      trigger_body: ${{ steps.ctx.outputs.trigger_body }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,18 +60,9 @@ jobs:
         id: ctx
         env:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
-          # For issue_comment events, use comment body. For issues events, use issue body.
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          ISSUE_BODY: ${{ github.event.issue.body }}
-          EVENT_NAME: ${{ github.event_name }}
         run: |
           echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "branch_name=mini-swe-fix/issue-${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
-          if [ "${EVENT_NAME}" = "issue_comment" ]; then
-            echo "trigger_body=${COMMENT_BODY}" >> "$GITHUB_OUTPUT"
-          else
-            echo "trigger_body=${ISSUE_BODY}" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Configure git
         run: |
