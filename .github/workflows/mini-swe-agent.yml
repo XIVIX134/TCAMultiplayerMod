@@ -74,6 +74,7 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           MSWEA_NONINTERACTIVE: "1"
+          MSWEA_CONFIGURED: "true"
         run: |
           mini \
             --model anthropic/claude-opus-4-6 \
