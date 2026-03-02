@@ -52,7 +52,7 @@ namespace TCAMultiplayer.Networking
         /// <summary>
         /// How far behind real-time to render (in seconds).
         /// </summary>
-        public float InterpolationDelay { get; set; } = 0.15f;
+        public float InterpolationDelay { get; set; } = 0.20f;
         
         /// <summary>
         /// Clock offset between local and remote time (local - remote).
@@ -273,9 +273,18 @@ namespace TCAMultiplayer.Networking
             }
             else if (before.IsValid)
             {
-                // Only have "before" — hold position (no extrapolation)
-                rawAbsolutePosition = before.AbsolutePosition;
+                // Extrapolate using velocity from the last known snapshot
+                // This prevents freeze-then-jump jitter when the buffer runs dry
+                float extrapolateTime = (float)(remoteRenderTime - before.RemoteTime);
+                // Cap extrapolation to prevent runaway (max 0.25s beyond last known data)
+                extrapolateTime = Mathf.Min(extrapolateTime, 0.25f);
+                
+                rawAbsolutePosition = new Vector3d(
+                    before.AbsolutePosition.x + before.Velocity.x * extrapolateTime,
+                    before.AbsolutePosition.y + before.Velocity.y * extrapolateTime,
+                    before.AbsolutePosition.z + before.Velocity.z * extrapolateTime);
                 rawRotation = before.Rotation;
+                isExtrapolating = true;
             }
             else if (after.IsValid)
             {

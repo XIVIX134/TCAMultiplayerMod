@@ -433,15 +433,10 @@ namespace TCAMultiplayer.Networking
                     // and RigidbodyInterpolation.Interpolate smoothly renders between steps.
                     rb.velocity = (targetPos - rb.position) / dt;
 
-                    // Data-driven velocity bound: use the synced packet velocity magnitude as reference.
-                    // The aircraft's actual speed comes from the game engine — no hardcoded limits.
-                    float packetSpeed = state.LastVelocity.magnitude;
-                    float steeringSpeed = rb.velocity.magnitude;
-                    float maxReasonableSpeed = Mathf.Max(packetSpeed * 2f, packetSpeed + 10f);
-                    if (maxReasonableSpeed > 0.1f && steeringSpeed > maxReasonableSpeed)
-                    {
-                        rb.velocity = rb.velocity * (maxReasonableSpeed / steeringSpeed);
-                    }
+                    // No velocity clamping — the velocity-steering value is the exact velocity needed
+                    // to reach the interpolated target in one FixedUpdate step. Clamping prevents
+                    // the rigidbody from reaching the target, causing accumulated error and jitter.
+                    // The interpolation buffer already ensures smooth, bounded target positions.
 
                     // Angular velocity steering: compute the shortest rotation and convert to angular velocity
                     Quaternion deltaRot = targetRot * Quaternion.Inverse(rb.rotation);
@@ -458,18 +453,9 @@ namespace TCAMultiplayer.Networking
                     {
                         rb.angularVelocity = axis.normalized * (angle * Mathf.Deg2Rad / dt);
 
-                        // Data-driven angular velocity bound using packet data
-                        var newest = state.Buffer.GetNewestSnapshot();
-                        if (newest.IsValid)
-                        {
-                            float packetAngSpeed = newest.AngularVelocity.magnitude;
-                            float steeringAngSpeed = rb.angularVelocity.magnitude;
-                            float maxReasonableAngSpeed = Mathf.Max(packetAngSpeed * 2f, packetAngSpeed + 1f);
-                            if (maxReasonableAngSpeed > 0.01f && steeringAngSpeed > maxReasonableAngSpeed)
-                            {
-                                rb.angularVelocity = rb.angularVelocity * (maxReasonableAngSpeed / steeringAngSpeed);
-                            }
-                        }
+                        // No angular velocity clamping — same reasoning as linear velocity.
+                        // The angular velocity is computed to reach the target rotation in one step.
+                        // Clamping causes rotational lag and wobble.
                     }
                     else
                     {
