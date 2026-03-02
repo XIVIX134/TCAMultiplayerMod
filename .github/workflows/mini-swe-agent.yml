@@ -7,7 +7,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  issues: read
+  issues: write
 
 jobs:
   fix-issue:
@@ -52,40 +52,190 @@ jobs:
           ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
           echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
-          BRANCH_NAME="mini-swe-fix/issue-${ISSUE_NUMBER}"
-          echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
-          TASK="Fix the following GitHub issue in this repository.\n\nTitle: ${ISSUE_TITLE}\n\nDescription:\n${ISSUE_BODY}\n\nPlease make the necessary code changes to resolve this issue."
-          echo "task<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$TASK" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "branch_name=mini-swe-fix/issue-${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: Configure git
         run: |
           git config user.name "${{ secrets.PAT_USERNAME }}"
           git config user.email "${{ secrets.PAT_USERNAME }}@users.noreply.github.com"
 
-      - name: Create and checkout fix branch
-        run: |
-          git checkout -b "${{ steps.issue-context.outputs.branch_name }}"
-
-      - name: Run mini-swe-agent
+      # ─────────────────────────────────────────────
+      # STAGE 1: ANALYST
+      # ─────────────────────────────────────────────
+      - name: "Stage 1: Analyst"
         env:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           MSWEA_NONINTERACTIVE: "1"
           MSWEA_CONFIGURED: "true"
-        # Pipe a newline to answer the "press Enter to quit" prompt at the end
+          ISSUE_NUMBER: ${{ steps.issue-context.outputs.issue_number }}
+          REPO: ${{ github.repository }}
         run: |
           echo "" | mini \
             --model anthropic/claude-opus-4-6 \
             --yolo \
-            --task "${{ steps.issue-context.outputs.task }}" || true
+            --task "You are the ANALYST agent in a 3-stage automated issue resolution pipeline.
+
+          ISSUE #${ISSUE_NUMBER}
+          Title: ${{ github.event.issue.title }}
+          Description:
+          ${{ github.event.issue.body }}
+
+          == YOUR RESPONSIBILITIES ==
+
+          == STEP 1: POST A STARTING COMMENT ==
+          Post a comment to the issue saying you are starting your analysis. Use the GitHub CLI:
+            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<your message>\"
+          Write naturally in first person as an engineer picking up the ticket. Mention what you are about to do. Keep it brief (2-4 sentences).
+
+          == STEP 2: EXPLORE THE CODEBASE ==
+          Thoroughly read all relevant source files. Do NOT make any code changes. Understand:
+          - The full call stack and data flow related to the issue
+          - The exact line(s) where the bug originates
+          - Why the current code produces the reported behaviour
+          - All files and functions involved
+
+          == STEP 3: WRITE ANALYSIS.md ==
+          Write a file called ANALYSIS.md to the repo root with these sections:
+          ## Issue Summary
+          ## Root Cause Analysis
+          (Specific files, functions, line numbers and explanation of why the bug occurs)
+          ## Affected Files
+          (List every file that needs to change with its path)
+          ## Implementation Plan
+          (Concrete step-by-step code changes - be specific, include what the old code is and what it should become)
+          ## Risks & Edge Cases
+
+          == STEP 4: POST A COMPLETION COMMENT ==
+          Post a comment to the issue with your full analysis. Use the GitHub CLI.
+          Write naturally - summarise your findings, explain the root cause in plain English, outline what you plan to fix. This is for the repo owner to read so make it clear and useful. Include the key details but write them as a natural engineering summary. End by saying the plan is being sent for independent review." || true
+
+      # ─────────────────────────────────────────────
+      # STAGE 2: REVIEWER
+      # ─────────────────────────────────────────────
+      - name: "Stage 2: Reviewer"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          MSWEA_NONINTERACTIVE: "1"
+          MSWEA_CONFIGURED: "true"
+          ISSUE_NUMBER: ${{ steps.issue-context.outputs.issue_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "" | mini \
+            --model anthropic/claude-opus-4-6 \
+            --yolo \
+            --task "You are the REVIEWER agent in a 3-stage automated issue resolution pipeline.
+
+          ISSUE #${ISSUE_NUMBER}
+          Title: ${{ github.event.issue.title }}
+          Description:
+          ${{ github.event.issue.body }}
+
+          == CONTEXT ==
+          Another agent (the Analyst) has already explored the codebase and written an analysis and implementation plan.
+          It is saved in ANALYSIS.md in the repo root. Read it carefully before doing anything else.
+
+          == YOUR RESPONSIBILITIES ==
+
+          == STEP 1: POST A STARTING COMMENT ==
+          Post a comment to the issue saying you are reviewing the analysis. Use the GitHub CLI:
+            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<your message>\"
+          Write naturally in first person. Say you are a second pair of eyes reviewing the plan before implementation. Keep it brief.
+
+          == STEP 2: READ AND CRITICALLY REVIEW THE ANALYSIS ==
+          Read ANALYSIS.md. Then explore the codebase yourself to verify the Analyst's findings. Ask yourself:
+          - Is the root cause correct? Is there a deeper cause being missed?
+          - Is the implementation plan complete? Are any affected files missing?
+          - Are the proposed code changes correct and safe?
+          - Are there any edge cases or risks not accounted for?
+          - Is the plan minimal and focused, or does it change too much?
+          - Could the proposed fix introduce new bugs?
+
+          == STEP 3: REWRITE ANALYSIS.md ==
+          Overwrite ANALYSIS.md with an improved, consolidated version. Keep the same sections but:
+          - Correct any mistakes in the root cause analysis
+          - Add any missing affected files
+          - Improve or rewrite the implementation plan to be more precise and safe
+          - Expand the risks section based on your review
+          - Add a new section: ## Reviewer Notes (what you changed and why)
+
+          == STEP 4: POST A COMPLETION COMMENT ==
+          Post a comment to the issue with your review findings. Use the GitHub CLI.
+          Write naturally - tell the repo owner what you checked, whether you agreed with the original analysis, what you changed or improved, and confirm the final plan is ready for implementation. Be specific about any corrections you made." || true
+
+      # ─────────────────────────────────────────────
+      # STAGE 3: BUILDER
+      # ─────────────────────────────────────────────
+      - name: Create and checkout fix branch
+        run: |
+          git checkout -b "${{ steps.issue-context.outputs.branch_name }}"
+
+      - name: "Stage 3: Builder"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          MSWEA_NONINTERACTIVE: "1"
+          MSWEA_CONFIGURED: "true"
+          ISSUE_NUMBER: ${{ steps.issue-context.outputs.issue_number }}
+          REPO: ${{ github.repository }}
+          BRANCH_NAME: ${{ steps.issue-context.outputs.branch_name }}
+        run: |
+          echo "" | mini \
+            --model anthropic/claude-opus-4-6 \
+            --yolo \
+            --task "You are the BUILDER agent in a 3-stage automated issue resolution pipeline.
+
+          ISSUE #${ISSUE_NUMBER}
+          Title: ${{ github.event.issue.title }}
+          Description:
+          ${{ github.event.issue.body }}
+
+          == CONTEXT ==
+          Two agents before you (an Analyst and a Reviewer) have thoroughly analysed this issue and produced a reviewed, approved implementation plan.
+          It is saved in ANALYSIS.md in the repo root. Read it carefully - this is your specification.
+
+          == YOUR RESPONSIBILITIES ==
+
+          == STEP 1: POST A STARTING COMMENT ==
+          Post a comment to the issue saying you are starting the implementation. Use the GitHub CLI:
+            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<your message>\"
+          Write naturally in first person. Say you have read the reviewed plan and are now implementing the fix. Be brief.
+
+          == STEP 2: READ THE PLAN ==
+          Read ANALYSIS.md thoroughly. Understand every change you need to make before touching any source file.
+
+          == STEP 3: IMPLEMENT THE FIX ==
+          Make exactly the changes described in the implementation plan. Rules:
+          - Follow the plan precisely - do not invent additional changes
+          - Do not refactor unrelated code
+          - Do not change code style outside of modified lines
+          - Do not add new dependencies unless the plan says to
+          - After editing each file, re-read it to verify your change is correct
+          - If you discover the plan is wrong mid-implementation, fix it correctly and note it in your final comment
+
+          == STEP 4: DELETE ANALYSIS.md ==
+          Delete ANALYSIS.md so it does not get committed:
+            rm -f ANALYSIS.md
+
+          == STEP 5: POST A COMPLETION COMMENT ==
+          Post a comment to the issue summarising what you implemented. Use the GitHub CLI.
+          Write naturally - tell the repo owner exactly what files you changed and what you changed in each one. Explain why each change fixes the issue.
+
+          == STEP 6: CREATE THE PULL REQUEST AND POST THE LINK ==
+          First create the pull request using the GitHub CLI. The branch is already pushed.
+          Wait - do NOT create the PR yourself. The workflow will handle the git push and PR creation after you finish.
+          Instead, end your final comment by telling the user that a pull request will be opened momentarily for their review." || true
 
       - name: Commit and push changes
         id: push
         run: |
           git add -A
+          git reset ANALYSIS.md 2>/dev/null || true
+          git rm --cached ANALYSIS.md 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           else
@@ -94,17 +244,67 @@ jobs:
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open pull request
+      - name: Open pull request and post link
         if: steps.push.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          MSWEA_NONINTERACTIVE: "1"
+          MSWEA_CONFIGURED: "true"
+          ISSUE_NUMBER: ${{ steps.issue-context.outputs.issue_number }}
+          REPO: ${{ github.repository }}
+          BRANCH_NAME: ${{ steps.issue-context.outputs.branch_name }}
         run: |
-          gh pr create \
+          PR_URL=$(gh pr create \
             --base main \
             --head "${{ steps.issue-context.outputs.branch_name }}" \
             --title "fix: resolve issue #${{ steps.issue-context.outputs.issue_number }}" \
             --body "Automated fix for #${{ steps.issue-context.outputs.issue_number }} produced by mini-swe-agent.
+          Triggered by: ${{ github.event.comment.html_url }}")
+          
+          echo "" | mini \
+            --model anthropic/claude-opus-4-6 \
+            --yolo \
+            --task "You are the BUILDER agent wrapping up an automated fix pipeline.
 
-          Triggered by comment: ${{ github.event.comment.html_url }}
+          ISSUE #${ISSUE_NUMBER} in repo ${REPO} has just been fixed and a pull request has been opened.
+          The pull request URL is: ${PR_URL}
 
-          Please review the changes before merging."
+          Post one final comment to the issue using the GitHub CLI:
+            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<your message>\"
+
+          The comment should:
+          - Confirm the pull request has been created and link to it: ${PR_URL}
+          - Tell the repo owner to review the changes before merging
+          - Remind them they can comment /mini-swe-fix again with more detail if the fix is wrong or incomplete
+          - Write naturally in first person, keep it concise" || true
+
+      - name: Post no-changes comment
+        if: steps.push.outputs.has_changes == 'false'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          MSWEA_NONINTERACTIVE: "1"
+          MSWEA_CONFIGURED: "true"
+          ISSUE_NUMBER: ${{ steps.issue-context.outputs.issue_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "" | mini \
+            --model anthropic/claude-opus-4-6 \
+            --yolo \
+            --task "You are the BUILDER agent in an automated fix pipeline. You have just completed your implementation stage but produced no code changes.
+
+          ISSUE #${ISSUE_NUMBER} in repo ${REPO}.
+          Issue title: ${{ github.event.issue.title }}
+          Issue description: ${{ github.event.issue.body }}
+
+          Post a comment to the issue using the GitHub CLI:
+            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<your message>\"
+
+          The comment should:
+          - Honestly explain that no code changes were produced after the full 3-stage pipeline ran
+          - Give your best explanation of why (already fixed, too vague to act on, requires infra/config changes, etc.)
+          - Tell the repo owner how to help: suggest they provide more specific details about where in the code the problem is and try again with /mini-swe-fix
+          - Write naturally in first person" || true
