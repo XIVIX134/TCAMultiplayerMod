@@ -1,0 +1,90 @@
+name: Fix Issue with mini-swe-agent
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: read
+
+jobs:
+  fix-issue:
+    # Only run on issue comments (not PR comments) containing the trigger command
+    if: |
+      github.event.issue.pull_request == null &&
+      contains(github.event.comment.body, '/mini-swe-fix')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install mini-swe-agent
+        run: pip install mini-swe-agent
+
+      - name: Prepare issue context
+        id: issue-context
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+          BRANCH_NAME="mini-swe-fix/issue-${ISSUE_NUMBER}"
+          echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure git
+        run: |
+          git config user.name "${{ secrets.PAT_USERNAME }}"
+          git config user.email "${{ secrets.PAT_USERNAME }}@users.noreply.github.com"
+
+      - name: Create and checkout fix branch
+        run: |
+          git checkout -b "${{ steps.issue-context.outputs.branch_name }}"
+
+      - name: Run mini-swe-agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
+          ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          mini-swe-agent \
+            --model anthropic/claude-opus-4-6 \
+            --issue-url "https://github.com/${{ github.repository }}/issues/${{ steps.issue-context.outputs.issue_number }}"
+
+      - name: Commit and push changes
+        id: push
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "fix: address issue #${{ steps.issue-context.outputs.issue_number }} via mini-swe-agent"
+            git push origin "${{ steps.issue-context.outputs.branch_name }}"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open pull request
+        if: steps.push.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          gh pr create \
+            --base main \
+            --head "${{ steps.issue-context.outputs.branch_name }}" \
+            --title "fix: resolve issue #${{ steps.issue-context.outputs.issue_number }}" \
+            --body "Automated fix for #${{ steps.issue-context.outputs.issue_number }} produced by mini-swe-agent.
+
+          Triggered by comment: ${{ github.event.comment.html_url }}
+
+          Please review the changes before merging."
