@@ -75,11 +75,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           MSWEA_NONINTERACTIVE: "1"
           MSWEA_CONFIGURED: "true"
+        # mini exits with code 1 on the submit action in non-interactive mode
+        # even after successfully making changes — we catch that and continue
         run: |
           mini \
             --model anthropic/claude-opus-4-6 \
             --yolo \
-            --task "${{ steps.issue-context.outputs.task }}"
+            --task "${{ steps.issue-context.outputs.task }}" || true
 
       - name: Commit and push changes
         id: push
