@@ -35,11 +35,17 @@ jobs:
         id: issue-context
         env:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
           echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
           BRANCH_NAME="mini-swe-fix/issue-${ISSUE_NUMBER}"
           echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
-          echo "issue_url=https://github.com/${{ github.repository }}/issues/${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+          # Build the task prompt from issue title + body
+          TASK="Fix the following GitHub issue in this repository.\n\nTitle: ${ISSUE_TITLE}\n\nDescription:\n${ISSUE_BODY}\n\nPlease make the necessary code changes to resolve this issue."
+          echo "task<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$TASK" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Configure git
         run: |
@@ -56,10 +62,10 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          mini-extra github-issue \
-            --issue-url "${{ steps.issue-context.outputs.issue_url }}" \
+          mini \
             --model anthropic/claude-opus-4-6 \
-            --yolo
+            --yolo \
+            --task "${{ steps.issue-context.outputs.task }}"
 
       - name: Commit and push changes
         id: push
