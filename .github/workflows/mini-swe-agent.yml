@@ -170,12 +170,16 @@ jobs:
           printenv ISSUE_BODY > /tmp/issue_body.txt
 
       # ── STAGE 1: ANALYST ──────────────────────────────────────
+      # IMPORTANT: Agent steps use github.token (not PAT_TOKEN) for GITHUB_TOKEN.
+      # This ensures agent comments (gh issue comment) don't trigger new workflow
+      # runs — only PAT-based actions trigger workflows. PAT_TOKEN is used only
+      # for git push and PR creation steps that need elevated permissions.
       - name: "Stage 1: Analyst"
         timeout-minutes: ${{ fromJSON(vars.AGENT_TIMEOUT || '15') }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           MSWEA_NONINTERACTIVE: "1"
           MSWEA_CONFIGURED: "true"
           ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
@@ -277,7 +281,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           MSWEA_NONINTERACTIVE: "1"
           MSWEA_CONFIGURED: "true"
           ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
@@ -439,7 +443,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
           MSWEA_NONINTERACTIVE: "1"
           MSWEA_CONFIGURED: "true"
           ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
