@@ -28,6 +28,7 @@ namespace TCAMultiplayer.UI
         private string _connectionError = "";
         private bool _isRefreshing = false;
         private bool _refreshPending = false;
+        private bool _isManuallyDisconnecting = false;
 
         public static async UniTask CreateAndRun()
         {
@@ -93,14 +94,16 @@ namespace TCAMultiplayer.UI
                 // Host stays in lobby, just refresh UI to update player list
                 RefreshUI();
             }
-            else if (_currentScreen == LobbyScreen.Lobby)
+            else if (_currentScreen == LobbyScreen.Lobby && !_isManuallyDisconnecting)
             {
                 SetScreen(LobbyScreen.MainMenu);
             }
-            else
+            else if (!_isManuallyDisconnecting)
             {
                 RefreshUI();
             }
+            // Reset the flag after handling the disconnect
+            _isManuallyDisconnecting = false;
         }
 
         private void OnSpawnPlayers()
@@ -586,6 +589,7 @@ namespace TCAMultiplayer.UI
             }
 
             UIFactory.CreateNativeButton("LEAVE", _contentRoot.transform).onClick.AddListener(() => {
+                _isManuallyDisconnecting = true;
                 Plugin.Instance?.Network?.Disconnect();
                 Plugin.Instance?.GameState?.Disconnect();
                 Plugin.Instance?.Discovery?.StopBroadcasting();
