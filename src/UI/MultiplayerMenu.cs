@@ -95,7 +95,7 @@ namespace TCAMultiplayer.UI
             }
             else if (_currentScreen == LobbyScreen.Lobby)
             {
-                SetScreen(LobbyScreen.MainMenu);
+                Close();
             }
             else
             {
