@@ -366,7 +366,7 @@ jobs:
       - name: Post failure comment
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
           REPO: ${{ github.repository }}
         run: |
@@ -557,7 +557,7 @@ jobs:
       - name: Post PR comment
         if: steps.push.outputs.has_changes == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
           REPO: ${{ github.repository }}
           PR_URL: ${{ steps.pr.outputs.pr_url }}
@@ -572,7 +572,7 @@ jobs:
       - name: Post no-changes comment
         if: steps.push.outputs.has_changes == 'false'
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
           REPO: ${{ github.repository }}
         run: |
@@ -588,7 +588,7 @@ jobs:
       - name: Post failure comment
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
           REPO: ${{ github.repository }}
         run: |
