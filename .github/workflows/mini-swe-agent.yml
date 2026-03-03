@@ -305,13 +305,17 @@ jobs:
 
           == ABSOLUTE RULES ==
           You MUST follow these rules without exception:
-          1. Do NOT modify any source files
+          1. Do NOT modify any source files — not even to "test" or "verify" your analysis
           2. Do NOT run git add, git commit, git push, or git checkout
           3. Do NOT close, edit, label, or assign the issue
           4. Do NOT create branches or PRs
           5. The ONLY gh CLI command you may run is: gh issue comment
           6. You may only overwrite: ANALYSIS.md in the repo root
-          Violating any rule corrupts the pipeline for the builder after you.
+          7. Do NOT create any files (test scripts, validation scripts, etc.) — only ANALYSIS.md
+          CRITICAL: You are a REVIEWER, not an implementer. A separate Builder agent will
+          implement the fixes after you. If you modify source files, your changes will be
+          reverted by the pipeline and the Builder will start from clean source. Your ONLY
+          job is to verify the analysis, correct ANALYSIS.md, and post comments.
 
           == STEP 1 — POST STARTING COMMENT ==
           Post a comment to the issue.
@@ -321,6 +325,8 @@ jobs:
           Read ANALYSIS.md to understand the Analyst's findings.
           Then independently verify every claim by reading the actual source files yourself.
           Do not take the Analyst's word for anything — check the code directly.
+          IMPORTANT: You are ONLY reading files to verify claims. Do NOT edit, patch, or
+          apply any changes. Do NOT create test scripts or validation files. Just read and judge.
           For each claim, answer:
           - Is the identified root cause actually present at the stated location?
           - Is the proposed fix mechanically correct — will it actually eliminate the cause?
@@ -351,7 +357,6 @@ jobs:
 
           TASK=$(cat /tmp/reviewer_task.txt)
           echo "" | mini --model "$MODEL" --yolo --task "$TASK"
-
       # Upload ANALYSIS.md for the build job
       - name: Upload analysis artifact
         if: success()
