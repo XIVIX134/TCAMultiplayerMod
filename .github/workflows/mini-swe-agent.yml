@@ -1,3 +1,29 @@
+# ─────────────────────────────────────────────────────────────
+# AI Issue Pipeline — Universal 3-Stage Fix Workflow
+#
+# Triggers on:
+#   /analyse — runs analysis + review only (no code changes)
+#   /fix     — runs analysis + review + build + PR
+#
+# Must be in the issue body (new issues) or a comment.
+# Only allowed users (repo owner or configured via ALLOWED_ACTORS)
+# can trigger the pipeline.
+#
+# Required secrets:
+#   PAT_TOKEN      — GitHub PAT with contents/issues/PRs write
+#   PAT_USERNAME   — GitHub username for the PAT
+#   LLM_API_KEY    — Anthropic API key
+#
+# Optional secrets:
+#   LLM_BASE_URL   — API proxy URL (if using one)
+#
+# Optional variables:
+#   ALLOWED_ACTORS  — Comma-separated GitHub logins allowed to trigger
+#                     (defaults to repo owner if not set)
+#   LLM_MODEL       — Model to use (default: anthropic/claude-sonnet-4-20250514)
+#   AGENT_TIMEOUT   — Minutes per AI stage (default: 15)
+# ─────────────────────────────────────────────────────────────
+
 name: AI Issue Pipeline
 
 on:
@@ -11,39 +37,104 @@ permissions:
   pull-requests: write
   issues: write
 
+# Prevent parallel runs on the same issue
+concurrency:
+  group: ai-pipeline-issue-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
 jobs:
-  analyse:
-    name: "Analyse Issue"
-    if: |
-      github.event.issue.pull_request == null &&
-      (
-        (
-          github.event_name == 'issue_comment' &&
-          github.event.sender.login == github.repository_owner &&
-          (
-            startsWith(github.event.comment.body, '/analyse') ||
-            startsWith(github.event.comment.body, '/fix')
-          )
-        ) ||
-        (
-          github.event_name == 'issues' &&
-          github.event.sender.login == github.repository_owner &&
-          (
-            startsWith(github.event.issue.body, '/analyse') ||
-            startsWith(github.event.issue.body, '/fix')
-          )
-        )
-      )
+  # ─────────────────────────────────────────────────────────────
+  # GATE — validate trigger conditions once, share with all jobs
+  # ─────────────────────────────────────────────────────────────
+  gate:
+    name: "Validate Trigger"
+    if: github.event.issue.pull_request == null
     runs-on: ubuntu-latest
     outputs:
-      issue_number: ${{ steps.ctx.outputs.issue_number }}
-      branch_name: ${{ steps.ctx.outputs.branch_name }}
+      should_analyse: ${{ steps.check.outputs.should_analyse }}
+      should_build: ${{ steps.check.outputs.should_build }}
+      issue_number: ${{ github.event.issue.number }}
+      branch_name: ${{ steps.check.outputs.branch_name }}
+    steps:
+      - name: Check trigger conditions
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SENDER_LOGIN: ${{ github.event.sender.login }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          ALLOWED_ACTORS: ${{ vars.ALLOWED_ACTORS }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          # Determine the trigger text (comment body or issue body)
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            TRIGGER_TEXT="$COMMENT_BODY"
+          else
+            TRIGGER_TEXT="$ISSUE_BODY"
+          fi
+
+          # Check if trigger text starts with /analyse or /fix
+          HAS_ANALYSE=false
+          HAS_FIX=false
+          case "$TRIGGER_TEXT" in
+            /analyse*) HAS_ANALYSE=true ;;
+            /fix*)     HAS_FIX=true ; HAS_ANALYSE=true ;;
+          esac
+
+          if [ "$HAS_ANALYSE" = "false" ]; then
+            echo "No /analyse or /fix trigger found"
+            echo "should_analyse=false" >> "$GITHUB_OUTPUT"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Check if sender is allowed
+          ALLOWED=false
+
+          # Always allow repo owner
+          if [ "$SENDER_LOGIN" = "$REPO_OWNER" ]; then
+            ALLOWED=true
+          fi
+
+          # Check ALLOWED_ACTORS variable (comma-separated logins)
+          if [ -n "$ALLOWED_ACTORS" ]; then
+            IFS=',' read -ra ACTORS <<< "$ALLOWED_ACTORS"
+            for actor in "${ACTORS[@]}"; do
+              actor="$(echo "$actor" | xargs)"  # trim whitespace
+              if [ "$SENDER_LOGIN" = "$actor" ]; then
+                ALLOWED=true
+              fi
+            done
+          fi
+
+          if [ "$ALLOWED" = "false" ]; then
+            echo "Sender $SENDER_LOGIN is not in allowed list"
+            echo "should_analyse=false" >> "$GITHUB_OUTPUT"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_analyse=$HAS_ANALYSE" >> "$GITHUB_OUTPUT"
+          echo "should_build=$HAS_FIX" >> "$GITHUB_OUTPUT"
+          echo "branch_name=ai-fix/issue-${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+
+  # ─────────────────────────────────────────────────────────────
+  # ANALYSE — Stage 1 (Analyst) + Stage 2 (Reviewer)
+  # ─────────────────────────────────────────────────────────────
+  analyse:
+    name: "Analyse Issue"
+    needs: gate
+    if: needs.gate.outputs.should_analyse == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      issue_number: ${{ needs.gate.outputs.issue_number }}
+      branch_name: ${{ needs.gate.outputs.branch_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT_TOKEN }}
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -53,60 +144,58 @@ jobs:
       - name: Install mini-swe-agent
         run: pip install mini-swe-agent
 
-      - name: Write global config
+      - name: Write agent config
         env:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
+          MODEL="${LLM_MODEL:-anthropic/claude-sonnet-4-20250514}"
           mkdir -p ~/.config/mini-swe-agent
           cat > ~/.config/mini-swe-agent/.env << EOF
-          MSWEA_MODEL_NAME=anthropic/claude-opus-4-6
+          MSWEA_MODEL_NAME=${MODEL}
           MSWEA_CONFIGURED=true
           MSWEA_NONINTERACTIVE=1
           ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
           ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
           EOF
 
-      - name: Set context
-        id: ctx
+      # Write untrusted input to files (safe — no shell interpolation)
+      - name: Write issue context to files
         env:
-          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
         run: |
-          echo "issue_number=${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
-          echo "branch_name=mini-swe-fix/issue-${ISSUE_NUMBER}" >> "$GITHUB_OUTPUT"
+          printenv ISSUE_TITLE > /tmp/issue_title.txt
+          printenv ISSUE_BODY > /tmp/issue_body.txt
 
-      - name: Configure git
-        run: |
-          git config user.name "${{ secrets.PAT_USERNAME }}"
-          git config user.email "${{ secrets.PAT_USERNAME }}@users.noreply.github.com"
-
-      - name: Clean up stale analysis
-        run: |
-          if [ -f ANALYSIS.md ]; then
-            git rm -f ANALYSIS.md 2>/dev/null || rm -f ANALYSIS.md
-          fi
-
-      # ── STAGE 1: ANALYST ─────────────���────────────────────────
+      # ── STAGE 1: ANALYST ──────────────────────────────────────
       - name: "Stage 1: Analyst"
+        timeout-minutes: ${{ fromJSON(vars.AGENT_TIMEOUT || '15') }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           MSWEA_NONINTERACTIVE: "1"
           MSWEA_CONFIGURED: "true"
-          ISSUE_NUMBER: ${{ steps.ctx.outputs.issue_number }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
           REPO: ${{ github.repository }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
-          echo "" | mini \
-            --model anthropic/claude-opus-4-6 \
-            --yolo \
-            --task "You are the ANALYST — the first agent in a 3-stage automated engineering pipeline.
+          MODEL="${LLM_MODEL:-anthropic/claude-sonnet-4-20250514}"
+          TITLE=$(cat /tmp/issue_title.txt)
+          BODY=$(cat /tmp/issue_body.txt)
+
+          cat > /tmp/analyst_task.txt << 'TASKEOF'
+          You are the ANALYST — the first agent in a 3-stage automated engineering pipeline.
 
           == YOUR ISSUE ==
-          Issue #${ISSUE_NUMBER} in ${REPO}
-          Title: ${{ github.event.issue.title }}
-          Description:
-          ${{ github.event.issue.body }}
+          TASKEOF
+          echo "Issue #${ISSUE_NUMBER} in ${REPO}" >> /tmp/analyst_task.txt
+          echo "Title: ${TITLE}" >> /tmp/analyst_task.txt
+          echo "Description:" >> /tmp/analyst_task.txt
+          echo "${BODY}" >> /tmp/analyst_task.txt
+          cat >> /tmp/analyst_task.txt << 'TASKEOF'
 
           == ORIENTATION ==
           You have just checked out the repository. Start by orienting yourself:
@@ -127,7 +216,8 @@ jobs:
 
           == STEP 1 — POST STARTING COMMENT ==
           Post a comment to the issue immediately:
-            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<message>\"
+            gh issue comment <issue_number> --repo <repo> --body "<message>"
+          (Use the issue number and repo from YOUR ISSUE above.)
           Write as a senior engineer who just picked up the ticket. Mention which systems or files you expect to investigate based on the issue description. Natural tone, 3-5 sentences.
 
           == STEP 2 — DEEP INVESTIGATION ==
@@ -169,36 +259,45 @@ jobs:
           Specific scenarios to verify the fix works.
 
           == STEP 4 — POST COMPLETION COMMENT ==
-          Post a second comment to the issue:
-            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<message>\"
+          Post a second comment to the issue.
           Write as the engineer reporting findings. Cover:
           - What root cause(s) you found and exactly where in the code
           - What your proposed fix does mechanically
           - Any risks or things to watch out for
           - That you are sending it for independent review
-          Be specific and technical. Reference actual file names and function names. 4-10 sentences." || true
+          Be specific and technical. Reference actual file names and function names. 4-10 sentences.
+          TASKEOF
 
-      # ── STAGE 2: REVIEWER ─────────────────────────────────────
+          TASK=$(cat /tmp/analyst_task.txt)
+          echo "" | mini --model "$MODEL" --yolo --task "$TASK"
+
+      # ── STAGE 2: REVIEWER ──────────────────────────────────────
       - name: "Stage 2: Reviewer"
+        timeout-minutes: ${{ fromJSON(vars.AGENT_TIMEOUT || '15') }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           MSWEA_NONINTERACTIVE: "1"
           MSWEA_CONFIGURED: "true"
-          ISSUE_NUMBER: ${{ steps.ctx.outputs.issue_number }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
           REPO: ${{ github.repository }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
-          echo "" | mini \
-            --model anthropic/claude-opus-4-6 \
-            --yolo \
-            --task "You are the REVIEWER — the second agent in a 3-stage automated engineering pipeline.
+          MODEL="${LLM_MODEL:-anthropic/claude-sonnet-4-20250514}"
+          TITLE=$(cat /tmp/issue_title.txt)
+          BODY=$(cat /tmp/issue_body.txt)
+
+          cat > /tmp/reviewer_task.txt << 'TASKEOF'
+          You are the REVIEWER — the second agent in a 3-stage automated engineering pipeline.
 
           == YOUR ISSUE ==
-          Issue #${ISSUE_NUMBER} in ${REPO}
-          Title: ${{ github.event.issue.title }}
-          Description:
-          ${{ github.event.issue.body }}
+          TASKEOF
+          echo "Issue #${ISSUE_NUMBER} in ${REPO}" >> /tmp/reviewer_task.txt
+          echo "Title: ${TITLE}" >> /tmp/reviewer_task.txt
+          echo "Description:" >> /tmp/reviewer_task.txt
+          echo "${BODY}" >> /tmp/reviewer_task.txt
+          cat >> /tmp/reviewer_task.txt << 'TASKEOF'
 
           == ABSOLUTE RULES ==
           You MUST follow these rules without exception:
@@ -211,8 +310,7 @@ jobs:
           Violating any rule corrupts the pipeline for the builder after you.
 
           == STEP 1 — POST STARTING COMMENT ==
-          Post a comment to the issue:
-            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<message>\"
+          Post a comment to the issue.
           Write as a second senior engineer doing an independent review before implementation. Say what you are going to verify. Natural tone, 2-4 sentences.
 
           == STEP 2 — INDEPENDENT VERIFICATION ==
@@ -238,42 +336,52 @@ jobs:
           - Add a ## Reviewer Notes section: bullet points listing every correction you made and why
 
           == STEP 4 — POST COMPLETION COMMENT ==
-          Post a comment to the issue:
-            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<message>\"
+          Post a comment to the issue.
           Write as the reviewing engineer reporting back. Cover:
           - Whether you agreed with the root cause analysis and what (if anything) you corrected
           - Any additional risks or edge cases you found
           - Confirmation that the implementation plan is verified, precise, and safe to execute
           - That implementation is starting now
-          Be specific. Reference actual file names and function names. 4-8 sentences." || true
+          Be specific. Reference actual file names and function names. 4-8 sentences.
+          TASKEOF
+
+          TASK=$(cat /tmp/reviewer_task.txt)
+          echo "" | mini --model "$MODEL" --yolo --task "$TASK"
+
+      # Upload ANALYSIS.md for the build job
+      - name: Upload analysis artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-${{ needs.gate.outputs.issue_number }}
+          path: ANALYSIS.md
+          retention-days: 1
+          if-no-files-found: error
+
+      # Post failure comment if analysis pipeline fails
+      - name: Post failure comment
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body \
+            "⚠️ The analysis pipeline encountered an error and could not complete. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details. You can retry by commenting \`/fix\` again with more detail about the issue."
 
   # ─────────────────────────────────────────────────────────────
-  # BUILD JOB — only runs for /fix, depends on analyse job
+  # BUILD — Stage 3 (Builder) + PR creation. Only for /fix.
   # ─────────────────────────────────────────────────────────────
   build:
     name: "Build & PR"
-    needs: analyse
-    if: |
-      github.event.issue.pull_request == null &&
-      (
-        (
-          github.event_name == 'issue_comment' &&
-          github.event.sender.login == github.repository_owner &&
-          startsWith(github.event.comment.body, '/fix')
-        ) ||
-        (
-          github.event_name == 'issues' &&
-          github.event.sender.login == github.repository_owner &&
-          startsWith(github.event.issue.body, '/fix')
-        )
-      )
+    needs: [gate, analyse]
+    if: needs.gate.outputs.should_build == 'true' && needs.analyse.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT_TOKEN }}
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -283,19 +391,35 @@ jobs:
       - name: Install mini-swe-agent
         run: pip install mini-swe-agent
 
-      - name: Write global config
+      - name: Write agent config
         env:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
+          MODEL="${LLM_MODEL:-anthropic/claude-sonnet-4-20250514}"
           mkdir -p ~/.config/mini-swe-agent
           cat > ~/.config/mini-swe-agent/.env << EOF
-          MSWEA_MODEL_NAME=anthropic/claude-opus-4-6
+          MSWEA_MODEL_NAME=${MODEL}
           MSWEA_CONFIGURED=true
           MSWEA_NONINTERACTIVE=1
           ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
           ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
           EOF
+
+      - name: Write issue context to files
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          printenv ISSUE_TITLE > /tmp/issue_title.txt
+          printenv ISSUE_BODY > /tmp/issue_body.txt
+
+      - name: Download analysis artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: analysis-${{ needs.gate.outputs.issue_number }}
+          path: .
 
       - name: Configure git
         run: |
@@ -303,33 +427,42 @@ jobs:
           git config user.email "${{ secrets.PAT_USERNAME }}@users.noreply.github.com"
 
       - name: Create fix branch
+        env:
+          BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
         run: |
-          git checkout -b "${{ needs.analyse.outputs.branch_name }}"
+          # -B force-creates (overwrites if exists from a previous run)
+          git checkout -B "$BRANCH_NAME"
 
       # ── STAGE 3: BUILDER ──────────────────────────────────────
       - name: "Stage 3: Builder"
+        timeout-minutes: ${{ fromJSON(vars.AGENT_TIMEOUT || '15') }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
           ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
           MSWEA_NONINTERACTIVE: "1"
           MSWEA_CONFIGURED: "true"
-          ISSUE_NUMBER: ${{ needs.analyse.outputs.issue_number }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
           REPO: ${{ github.repository }}
-          BRANCH_NAME: ${{ needs.analyse.outputs.branch_name }}
+          BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
         run: |
-          echo "" | mini \
-            --model anthropic/claude-opus-4-6 \
-            --yolo \
-            --task "You are the BUILDER — the third and final agent in a 3-stage automated engineering pipeline.
+          MODEL="${LLM_MODEL:-anthropic/claude-sonnet-4-20250514}"
+          TITLE=$(cat /tmp/issue_title.txt)
+          BODY=$(cat /tmp/issue_body.txt)
+
+          cat > /tmp/builder_task.txt << 'TASKEOF'
+          You are the BUILDER — the third and final agent in a 3-stage automated engineering pipeline.
 
           == YOUR ISSUE ==
-          Issue #${ISSUE_NUMBER} in ${REPO}
-          Title: ${{ github.event.issue.title }}
-          Description:
-          ${{ github.event.issue.body }}
-
-          You are on branch: ${BRANCH_NAME}
+          TASKEOF
+          echo "Issue #${ISSUE_NUMBER} in ${REPO}" >> /tmp/builder_task.txt
+          echo "Title: ${TITLE}" >> /tmp/builder_task.txt
+          echo "Description:" >> /tmp/builder_task.txt
+          echo "${BODY}" >> /tmp/builder_task.txt
+          echo "" >> /tmp/builder_task.txt
+          echo "You are on branch: ${BRANCH_NAME}" >> /tmp/builder_task.txt
+          cat >> /tmp/builder_task.txt << 'TASKEOF'
 
           == ABSOLUTE RULES ==
           You MUST follow these rules without exception:
@@ -342,8 +475,7 @@ jobs:
           Violating any rule will break the pipeline.
 
           == STEP 1 — POST STARTING COMMENT ==
-          Post a comment to the issue:
-            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<message>\"
+          Post a comment to the issue.
           Write as the implementing engineer who has read the reviewed plan and is now starting the work. Name the specific files you are about to change and briefly describe what you will do to each. Natural tone, 3-5 sentences.
 
           == STEP 2 — READ THE PLAN ==
@@ -362,98 +494,99 @@ jobs:
           This file must not be committed to the repository.
 
           == STEP 5 — POST COMPLETION COMMENT ==
-          Post a comment to the issue:
-            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<message>\"
+          Post a comment to the issue.
           Write as the implementing engineer who just finished. For each file you changed:
           - State the file name
           - Describe exactly what you changed and why it fixes the root cause
           If you had to deviate from the plan, explain why.
           Tell the repo owner a pull request will be opened momentarily for their review.
-          Be specific and technical. 5-12 sentences total." || true
+          Be specific and technical. 5-12 sentences total.
+          TASKEOF
+
+          TASK=$(cat /tmp/builder_task.txt)
+          echo "" | mini --model "$MODEL" --yolo --task "$TASK"
 
       - name: Commit and push
         id: push
+        env:
+          BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
         run: |
           git add -A
+          # Ensure ANALYSIS.md is not committed
           git reset ANALYSIS.md 2>/dev/null || true
           git rm --cached ANALYSIS.md 2>/dev/null || true
+
           if git diff --cached --quiet; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           else
-            git commit -m "fix: address issue #${{ needs.analyse.outputs.issue_number }} via mini-swe-agent"
-            git push origin "${{ needs.analyse.outputs.branch_name }}"
+            git commit -m "fix: address issue #${ISSUE_NUMBER}"
+            git push --force-with-lease origin "$BRANCH_NAME"
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Open pull request
+      - name: Open or update pull request
         if: steps.push.outputs.has_changes == 'true'
         id: pr
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          BRANCH_NAME: ${{ needs.gate.outputs.branch_name }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
         run: |
-          PR_URL=$(gh pr create \
-            --base main \
-            --head "${{ needs.analyse.outputs.branch_name }}" \
-            --title "fix: resolve issue #${{ needs.analyse.outputs.issue_number }}" \
-            --body "Automated fix for #${{ needs.analyse.outputs.issue_number }} via 3-stage mini-swe-agent pipeline (Analyst → Reviewer → Builder).
-          Triggered by: ${{ github.event.html_url }}")
-          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          # Check if a PR already exists for this branch
+          EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --json url --jq '.[0].url' 2>/dev/null || echo "")
 
-      - name: Builder posts PR comment
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR already exists: $EXISTING_PR"
+            echo "pr_url=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+          else
+            PR_URL=$(gh pr create \
+              --base main \
+              --head "$BRANCH_NAME" \
+              --title "fix: resolve issue #${ISSUE_NUMBER}" \
+              --body "Automated fix for #${ISSUE_NUMBER} via 3-stage AI pipeline (Analyst → Reviewer → Builder).
+
+          Triggered by: ${{ github.event.html_url }}")
+            echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post PR comment
         if: steps.push.outputs.has_changes == 'true'
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
-          ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-          MSWEA_NONINTERACTIVE: "1"
-          MSWEA_CONFIGURED: "true"
-          ISSUE_NUMBER: ${{ needs.analyse.outputs.issue_number }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
           REPO: ${{ github.repository }}
           PR_URL: ${{ steps.pr.outputs.pr_url }}
         run: |
-          echo "" | mini \
-            --model anthropic/claude-opus-4-6 \
-            --yolo \
-            --task "You are the BUILDER agent wrapping up. A pull request has just been opened.
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body \
+            "A pull request has been opened: ${PR_URL}
 
-          PR URL: ${PR_URL}
-          Issue #${ISSUE_NUMBER} in ${REPO}
+          This fix went through a 3-stage pipeline: analysis, independent review, then implementation. Please review the changed files and merge if the fix looks correct.
 
-          Post one final comment to the issue:
-            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<message>\"
+          If anything needs adjusting, comment \`/fix\` again with details about what's wrong."
 
-          The comment should:
-          - Confirm the pull request is open and link to it directly
-          - Tell the owner what to look for when reviewing (the key changed lines/logic)
-          - Mention the fix went through a 3-stage pipeline: analysis, independent review, then implementation
-          - Tell them to comment /fix again with more detail if anything needs adjusting
-          Natural tone, concise, 3-5 sentences." || true
-
-      - name: Builder posts no-changes comment
+      - name: Post no-changes comment
         if: steps.push.outputs.has_changes == 'false'
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.LLM_API_KEY }}
-          ANTHROPIC_BASE_URL: ${{ secrets.LLM_BASE_URL }}
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-          MSWEA_NONINTERACTIVE: "1"
-          MSWEA_CONFIGURED: "true"
-          ISSUE_NUMBER: ${{ needs.analyse.outputs.issue_number }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
           REPO: ${{ github.repository }}
         run: |
-          echo "" | mini \
-            --model anthropic/claude-opus-4-6 \
-            --yolo \
-            --task "You are the BUILDER agent. The full 3-stage pipeline ran but you produced no code changes.
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body \
+            "The AI pipeline completed all 3 stages but produced no code changes. This can happen when:
+          - The issue is too vague to locate in code
+          - The fix requires configuration, infrastructure, or dependency changes
+          - The code was already patched
 
-          Issue #${ISSUE_NUMBER} in ${REPO}
-          Title: ${{ github.event.issue.title }}
-          Description: ${{ github.event.issue.body }}
+          Please add more detail (specific symptoms, steps to reproduce, or which files you suspect) and comment \`/fix\` again."
 
-          Post a comment to the issue:
-            gh issue comment ${ISSUE_NUMBER} --repo ${REPO} --body \"<message>\"
-
-          Be honest. Explain the pipeline completed but produced no changes.
-          Give your genuine assessment of why (code already fixed, issue too vague to locate in code, requires config or infra change, etc.).
-          Tell the owner what additional information would help: specific symptoms, steps to reproduce, or which files/functions they suspect.
-          Suggest they try /fix again after adding more detail to the issue.
-          Natural tone, 4-6 sentences." || true
+      # Post failure comment if build pipeline fails
+      - name: Post failure comment
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          ISSUE_NUMBER: ${{ needs.gate.outputs.issue_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body \
+            "⚠️ The build pipeline encountered an error and could not complete. Check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details. You can retry by commenting \`/fix\` again with more detail about the issue."
