@@ -112,7 +112,21 @@ namespace TCAMultiplayer.UI
 
         public static Button CreateNativeButton(string label, Transform parent, float height = 50)
         {
-            if (_buttonPrefab == null) return null;
+            if (_buttonPrefab == null)
+            {
+                // Try to re-initialize if prefabs were lost during scene transitions
+                var mainMenu = UnityEngine.Object.FindFirstObjectByType<Falcon.Game2.MainMenu>();
+                if (mainMenu != null)
+                {
+                    Initialize(mainMenu);
+                }
+                
+                if (_buttonPrefab == null)
+                {
+                    Plugin.Log?.LogError("[UIFactory] Unable to create button - no prefab available");
+                    return null;
+                }
+            }
 
             var go = UnityEngine.Object.Instantiate(_buttonPrefab.gameObject, parent);
             go.name = label + " Button";

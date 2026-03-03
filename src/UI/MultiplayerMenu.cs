@@ -244,16 +244,31 @@ namespace TCAMultiplayer.UI
                 Destroy(go);                     // Clean up at end of frame
             }
 
-            switch (_currentScreen)
+            try
             {
-                case LobbyScreen.MainMenu: DrawMainMenu(); break;
-                case LobbyScreen.HostSetup: DrawHostSetup(); break;
-                case LobbyScreen.Browse: DrawBrowse(); break;
-                case LobbyScreen.DirectConnect: DrawDirectConnect(); break;
-                case LobbyScreen.Lobby: DrawLobby(); break;
+                switch (_currentScreen)
+                {
+                    case LobbyScreen.MainMenu: DrawMainMenu(); break;
+                    case LobbyScreen.HostSetup: DrawHostSetup(); break;
+                    case LobbyScreen.Browse: DrawBrowse(); break;
+                    case LobbyScreen.DirectConnect: DrawDirectConnect(); break;
+                    case LobbyScreen.Lobby: DrawLobby(); break;
+                }
             }
-
-            _isRefreshing = false;
+            catch (Exception ex)
+            {
+                Plugin.Log?.LogError($"[MultiplayerMenu] RefreshUI draw error: {ex.Message}");
+                // Re-initialize UIFactory in case prefabs were invalidated
+                var mainMenu = UnityEngine.Object.FindFirstObjectByType<Falcon.Game2.MainMenu>();
+                if (mainMenu != null)
+                {
+                    UIFactory.Initialize(mainMenu);
+                }
+            }
+            finally
+            {
+                _isRefreshing = false;
+            }
 
             // If a refresh was requested while we were drawing, do it now
             if (_refreshPending)
