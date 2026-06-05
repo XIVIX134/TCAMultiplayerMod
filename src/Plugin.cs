@@ -110,6 +110,9 @@ namespace TCAMultiplayer
         private bool _liveReadySet;
         private bool _liveStartRequested;
         private float _liveNextActionTime;
+        private float _liveNextGearToggleTime;
+        private float _liveNextLockToggleTime;
+        private bool _liveLockEngaged;
 
         // ── Startup ─────────────────────────────────────────────────────
 
@@ -176,6 +179,8 @@ namespace TCAMultiplayer
         {
             _connection?.Update(Time.deltaTime);
             DriveLiveTest();
+            DriveLiveGearCycle();
+            DriveLiveLockCycle();
 
             if (_activeSession == null) return;
 
@@ -264,6 +269,113 @@ namespace TCAMultiplayer
                 _lobby.StartGame();
                 _liveStartRequested = true;
                 Log.Info("LIVE-TEST", "Requested game start");
+            }
+        }
+
+        /// <summary>
+        /// Live-test helper: periodically toggles the local plane's landing gear so a
+        /// 2-instance auto-flight test exercises the gear sync chain end-to-end.
+        /// Enabled with --tca-live-gear-cycle=&lt;seconds&gt;.
+        /// </summary>
+        private void DriveLiveGearCycle()
+        {
+            if (_liveTest == null || !_liveTest.Enabled || _liveTest.GearCycleSeconds <= 0f)
+                return;
+            if (_activeSession == null)
+                return;
+
+            var player = UniAircraft.Player;
+            if (player == null || player.LandingGear == null)
+                return;
+
+            if (_liveNextGearToggleTime <= 0f)
+            {
+                // First toggle one full cycle after entering flight.
+                _liveNextGearToggleTime = Time.time + _liveTest.GearCycleSeconds;
+                return;
+            }
+
+            if (Time.time < _liveNextGearToggleTime)
+                return;
+
+            _liveNextGearToggleTime = Time.time + _liveTest.GearCycleSeconds;
+            try
+            {
+                player.LandingGear.ToggleGear();
+                Log.Info("LIVE-TEST", $"Toggled local gear -> lowered={player.LandingGear.IsGearLowered}");
+            }
+            catch (Exception ex)
+            {
+                Log.Warning("LIVE-TEST", $"Gear toggle failed: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Live-test helper: alternately locks/unlocks the local radar onto the first
+        /// remote clone, so a 2-instance test exercises radar lock + RWR warning sync.
+        /// Enabled with --tca-live-lock-cycle=&lt;seconds&gt;.
+        /// </summary>
+        private void DriveLiveLockCycle()
+        {
+            if (_liveTest == null || !_liveTest.Enabled || _liveTest.LockCycleSeconds <= 0f)
+                return;
+            if (_activeSession == null || _remoteManager == null)
+                return;
+
+            var player = UniAircraft.Player;
+            if (player == null || player.Radar == null)
+                return;
+
+            if (_liveNextLockToggleTime <= 0f)
+            {
+                // First action one full cycle after entering flight.
+                _liveNextLockToggleTime = Time.time + _liveTest.LockCycleSeconds;
+                return;
+            }
+
+            try
+            {
+                // While engaged, re-assert the lock if the native radar dropped it
+                // (target died/respawned). Keeps the victim's RWR warning observable.
+                if (_liveLockEngaged && player.Radar.LockedTarget == null)
+                    TryLiveLockFirstRemote(player, "re-assert");
+
+                if (Time.time < _liveNextLockToggleTime)
+                    return;
+
+                _liveNextLockToggleTime = Time.time + _liveTest.LockCycleSeconds;
+                if (_liveLockEngaged)
+                {
+                    player.Radar.UnlockTarget();
+                    _liveLockEngaged = false;
+                    Log.Info("LIVE-TEST", "Radar unlocked");
+                }
+                else
+                {
+                    TryLiveLockFirstRemote(player, "cycle");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning("LIVE-TEST", $"Lock cycle failed: {ex.Message}");
+            }
+        }
+
+        private void TryLiveLockFirstRemote(UniAircraft player, string reason)
+        {
+            foreach (var peerId in _remoteManager.GetAllPeerIds())
+            {
+                var aircraft = _remoteManager.GetAircraft(peerId);
+                if (aircraft == null) continue;
+                var target = aircraft.GetComponentInChildren<Falcon.Targeting.Target>();
+                if (target == null || !target.IsTargetable) continue;
+
+                if (!player.Radar.IsActive)
+                    player.Radar.SetActive(true);
+                bool locked = player.Radar.LockTarget(target, false);
+                _liveLockEngaged = locked;
+                Log.Info("LIVE-TEST", $"Radar lock ({reason}) onto peer {peerId} clone: success={locked}");
+                break;
             }
         }
 
@@ -421,10 +533,22 @@ namespace TCAMultiplayer
 
             _lastStateSendTime = Time.time;
             var statePacket = _stateReader.ReadState(localAircraft, _activeSession.LocalPeerId, Time.fixedTime);
+
+            // Gear flag edges are rare and important — log them so sender-side flag
+            // corruption (the cause of remote gear cycling on its own) is visible.
+            if (statePacket.GearDown != _lastSentGearDown)
+            {
+                _lastSentGearDown = statePacket.GearDown;
+                Log.Info(Tag, $"[STATE-SEND] GearDown flag -> {statePacket.GearDown} " +
+                              $"(native={localAircraft.LandingGear?.IsGearLowered.ToString() ?? "<null>"})");
+            }
+
             var payload = PacketSerializer.SerializeAircraftState(statePacket);
             var frame = PacketSerializer.Serialize(PacketType.AircraftState, payload);
             _transport.Broadcast(frame, reliable: false);
         }
+
+        private bool _lastSentGearDown = true;
 
         // ── Session lifecycle ───────────────────────────────────────────
 
@@ -1129,6 +1253,13 @@ namespace TCAMultiplayer
             public string Address = "127.0.0.1";
             public int Port = 7777;
             public float StartDelaySeconds = 2f;
+            // When > 0, toggles the local plane's landing gear every N seconds in
+            // flight, so a 2-instance test exercises the gear sync chain end-to-end.
+            public float GearCycleSeconds;
+            // When > 0, alternately locks/unlocks the local radar onto the first remote
+            // clone every N seconds, so a 2-instance test exercises the radar lock /
+            // RWR threat warning sync chain end-to-end.
+            public float LockCycleSeconds;
 
             public static LiveTestOptions FromCommandLine()
             {
@@ -1166,6 +1297,16 @@ namespace TCAMultiplayer
                     {
                         if (float.TryParse(delayText, out float delay) && delay >= 0f)
                             options.StartDelaySeconds = delay;
+                    }
+                    else if (TryGetValue(arg, "--tca-live-gear-cycle", out var gearCycleText))
+                    {
+                        if (float.TryParse(gearCycleText, out float gearCycle) && gearCycle > 0f)
+                            options.GearCycleSeconds = gearCycle;
+                    }
+                    else if (TryGetValue(arg, "--tca-live-lock-cycle", out var lockCycleText))
+                    {
+                        if (float.TryParse(lockCycleText, out float lockCycle) && lockCycle > 0f)
+                            options.LockCycleSeconds = lockCycle;
                     }
                 }
 

@@ -4,6 +4,7 @@ using System.Reflection;
 using UnityEngine;
 using Falcon.UniversalAircraft;
 using Falcon.Weapons;
+using TCAMultiplayer.Core;
 using TCAMultiplayer.Protocol;
 using TCAMultiplayer.Game;
 
@@ -90,11 +91,12 @@ namespace TCAMultiplayer.Sync
         private FieldInfo _vtolNozzleAngleField;
         private PropertyInfo _nozzleAnalogProp;
 
-        // Cached sub-object references (refreshed as needed)
+        // Cached sub-object references (refreshed when the aircraft instance changes)
         private object _cachedFlightInput;
         private object _cachedLandingGear;
         private object _cachedFlightStats;
         private Gun2 _cachedGun;
+        private int _cachedAircraftInstanceId;
 
         public LocalAircraftStateReader(FloatingOriginService originService)
         {
@@ -112,8 +114,22 @@ namespace TCAMultiplayer.Sync
 
         public AircraftStatePacket ReadState(UniAircraft aircraft, ulong localPeerId, float timestamp)
         {
+            // Auto-reset cached component references when the aircraft instance changes
+            // (death + respawn creates a brand-new aircraft). Stale caches silently read
+            // frozen state from the destroyed plane — remote players would see this
+            // player's gear/flaps/speed locked at their pre-death values forever.
+            int instanceId = aircraft.GetInstanceID();
+            if (_reflectionInitialized && instanceId != _cachedAircraftInstanceId)
+            {
+                Log.Info("STATE-READ", "Aircraft instance changed (respawn) — refreshing reflection caches");
+                ResetForNewAircraft();
+            }
+
             if (!_reflectionInitialized)
+            {
                 InitializeReflection(aircraft);
+                _cachedAircraftInstanceId = instanceId;
+            }
 
             var rb = aircraft.GetComponent<Rigidbody>();
             var packet = new AircraftStatePacket();
@@ -147,20 +163,16 @@ namespace TCAMultiplayer.Sync
                 packet.AngVelZ = angVel.z;
             }
 
-            // ── Reflection-based reads (wrapped for resilience) ──
-            try
-            {
-                ReadThrottleAndAfterburner(aircraft, ref packet);
-                ReadControlInputs(aircraft, ref packet);
-                ReadSpeedAndBrake(aircraft, ref packet);
-                ReadNozzleAngle(aircraft, ref packet);
-                ReadFlags(aircraft, ref packet);
-            }
-            catch (Exception)
-            {
-                // Partial packet is better than no packet.
-                // Individual methods have their own try/catch for finer-grained resilience.
-            }
+            // ── Reflection-based reads ──
+            // Each reader is isolated: one intermittently-failing read must NEVER blank
+            // out the others. (A shared try/catch here once caused remote landing gear to
+            // oscillate: any throw before ReadFlags left the flags byte at its default 0
+            // = "gear up", so packets alternated between real and default flag values.)
+            TryRead(ReadThrottleAndAfterburner, aircraft, ref packet, "throttle");
+            TryRead(ReadControlInputs, aircraft, ref packet, "controls");
+            TryRead(ReadSpeedAndBrake, aircraft, ref packet, "speed");
+            TryRead(ReadNozzleAngle, aircraft, ref packet, "nozzle");
+            TryRead(ReadFlags, aircraft, ref packet, "flags");
 
             return packet;
         }
@@ -173,6 +185,34 @@ namespace TCAMultiplayer.Sync
             _cachedLandingGear = null;
             _cachedFlightStats = null;
             _cachedGun = null;
+        }
+
+        private delegate void StateReader(UniAircraft aircraft, ref AircraftStatePacket packet);
+
+        private float _lastReadErrorLogTime;
+
+        /// <summary>
+        /// Runs one state reader in isolation so a failure can't prevent later readers
+        /// from filling their part of the packet. Failures are logged (throttled) —
+        /// silent failures here are how sync bugs hide.
+        /// </summary>
+        private void TryRead(StateReader reader, UniAircraft aircraft, ref AircraftStatePacket packet, string name)
+        {
+            try
+            {
+                reader(aircraft, ref packet);
+            }
+            catch (Exception ex)
+            {
+                if (Time.time - _lastReadErrorLogTime > 10f)
+                {
+                    _lastReadErrorLogTime = Time.time;
+                    var inner = ex is TargetInvocationException tie && tie.InnerException != null
+                        ? tie.InnerException
+                        : ex;
+                    Log.Warning("STATE-READ", $"Reader '{name}' failed: {inner.GetType().Name}: {inner.Message}");
+                }
+            }
         }
 
         // ════════════════════════════════════════════════════════════════

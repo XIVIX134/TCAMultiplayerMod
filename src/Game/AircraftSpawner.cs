@@ -287,8 +287,9 @@ namespace TCAMultiplayer.Game
 
         /// <summary>
         /// Configure a spawned aircraft for remote control.
-        /// Makes it kinematic, sets enemy faction, disables AI/input/flight model.
-        /// Keeps: Target (radar), Damageable (damage), Signature (IR/RCS), visual renderers.
+        /// Makes it a dynamic network puppet, sets enemy faction, disables AI/input/flight model.
+        /// Keeps: Target (radar), Damageable (damage), Signature (IR/RCS), visual renderers,
+        /// gear animation, and all visual effects (trails, smoke, damage FX).
         /// </summary>
         private void ConfigureForRemoteControl(ulong peerId, UniAircraft aircraft)
         {
@@ -299,7 +300,6 @@ namespace TCAMultiplayer.Game
             ConfigureDamageable(go);
             DisableGameplayComponents(go);
             DisableRemoteMotionAndVisibilityComponents(go);
-            DisableRemoteWorldSpaceEffects(go);
             DisableCockpitCam(go);
             ConfigureAnimators(go);
 
@@ -319,19 +319,33 @@ namespace TCAMultiplayer.Game
         }
 
         /// <summary>
-        /// Set rigidbody kinematic — we control position via network interpolation.
+        /// Configure the rigidbody as a DYNAMIC network puppet.
+        ///
+        /// The body must stay non-kinematic so velocity writes are legal — native
+        /// systems read Rigidbody.velocity directly (Target.Velocity drives missile
+        /// proportional navigation, Viewable drives cameras, FreeWheel/WheelAudio/
+        /// GearSlip read it too) and a kinematic body always reads zero velocity
+        /// (Unity rejects writes on kinematic bodies). Nothing fights our control:
+        /// UniAircraft (the only force source) is disabled on clones, gravity is off,
+        /// and RemoteAircraftController re-asserts the full pose + velocity every
+        /// FixedUpdate, so physics integration between corrections simply continues
+        /// the networked motion.
         /// </summary>
         private static void ConfigurePhysics(GameObject go)
         {
             var rb = go.GetComponent<Rigidbody>();
             if (rb != null)
             {
-                rb.isKinematic = true;
+                rb.isKinematic = false;
                 rb.useGravity = false;
-                rb.interpolation = RigidbodyInterpolation.None;
-                rb.detectCollisions = true;
+                rb.drag = 0f;
+                rb.angularDrag = 0f;
                 rb.velocity = Vector3.zero;
                 rb.angularVelocity = Vector3.zero;
+                // Interpolation must stay OFF to match native aircraft — TCA renders
+                // its whole world on the physics timeline.
+                rb.interpolation = RigidbodyInterpolation.None;
+                rb.detectCollisions = true;
             }
         }
 
@@ -414,7 +428,12 @@ namespace TCAMultiplayer.Game
         /// </summary>
         private static void DisableGameplayComponents(GameObject go)
         {
-            // Components to explicitly disable
+            // Components to explicitly disable: AI, input, and the flight model (anything
+            // that could apply forces or fight the network controller).
+            // Visual effects (trails, smoke, gear animation, damage FX) and audio
+            // (engine, flyby) stay ENABLED — they read FlightStats/Rigidbody.velocity,
+            // which RemoteAircraftController feeds with network state every FixedUpdate,
+            // so they behave exactly like they do on native AI aircraft.
             string[] disableNames =
             {
                 "UniPilot",     // May appear as a MonoBehaviour wrapper
@@ -424,22 +443,9 @@ namespace TCAMultiplayer.Game
                 "UniFlight",
                 "StickAndRudder",
                 "VehicleLauncher",
-                "ReallySimpleWing",
+                "ReallySimpleWing",     // aero forces — would push the dynamic puppet
                 "WingCollisionHandler",
-                "CollisionEffects",
-                "FlybyAudio",
-                "FlyoverSurfaceFX",
-                "PixelPerfectMinParticleSize",
-                "DamageEffectsByHP",
-                "StudioEventEmitter",
-                "FalconTrailEngine",
-                "FalconTrail",
-                "FalconWingtipTrail",
-                "PixelPerfectLine",
-                "JetEngineAudio",
-                "FreeWheel",
-                "GearTouchdown",
-                "MissileMotorFX"
+                "CollisionEffects"
             };
 
             // Components to keep enabled for combat and visuals
@@ -506,8 +512,11 @@ namespace TCAMultiplayer.Game
 
         private static void DisableRemoteMotionAndVisibilityComponents(GameObject go)
         {
+            // Gear components (FreeWheel/GearTouchdown) stay ENABLED — FreeWheel owns
+            // the gear retract/extend animation (lerps retractPercent + drives the
+            // Animator). Its wheel physics forces only apply when grounded, on a body
+            // whose pose is re-asserted every FixedUpdate anyway.
             int disabledSmartScaling = 0;
-            int disabledWheelPhysics = 0;
             bool disableSmartScaling = ModConfig.DisableRemoteSmartScaling?.Value ?? true;
 
             foreach (var comp in go.GetComponentsInChildren<MonoBehaviour>(true))
@@ -521,72 +530,10 @@ namespace TCAMultiplayer.Game
                     comp.enabled = false;
                     disabledSmartScaling++;
                 }
-                else if ((typeName == "FreeWheel" || typeName == "GearTouchdown") && comp.enabled)
-                {
-                    comp.enabled = false;
-                    disabledWheelPhysics++;
-                }
             }
 
             Log.Info(Tag, $"Disabled remote native visual/motion helpers: " +
-                          $"smartScaling={disabledSmartScaling}, wheelPhysics={disabledWheelPhysics}");
-        }
-
-        private static void DisableRemoteWorldSpaceEffects(GameObject go)
-        {
-            int disabledRenderers = 0;
-            foreach (var trail in go.GetComponentsInChildren<TrailRenderer>(true))
-            {
-                if (trail == null) continue;
-                trail.Clear();
-                trail.enabled = false;
-                disabledRenderers++;
-            }
-
-            foreach (var line in go.GetComponentsInChildren<LineRenderer>(true))
-            {
-                if (line == null) continue;
-                line.enabled = false;
-                disabledRenderers++;
-            }
-
-            int disabledParticles = 0;
-            foreach (var ps in go.GetComponentsInChildren<ParticleSystem>(true))
-            {
-                if (ps == null || !ShouldDisableRemoteParticleSystem(ps))
-                    continue;
-
-                ps.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
-                var renderer = ps.GetComponent<ParticleSystemRenderer>();
-                if (renderer != null)
-                    renderer.enabled = false;
-                disabledParticles++;
-            }
-
-            Log.Info(Tag, $"Disabled remote world-space FX: renderers={disabledRenderers}, particles={disabledParticles}");
-        }
-
-        private static bool ShouldDisableRemoteParticleSystem(ParticleSystem ps)
-        {
-            var main = ps.main;
-            if (main.simulationSpace == ParticleSystemSimulationSpace.World)
-                return true;
-
-            string name = ps.gameObject.name.ToLowerInvariant();
-            string parent = ps.transform.parent != null ? ps.transform.parent.name.ToLowerInvariant() : "";
-            return IsLongLivedRemoteFxName(name) || IsLongLivedRemoteFxName(parent);
-        }
-
-        private static bool IsLongLivedRemoteFxName(string name)
-        {
-            return name.Contains("trail")
-                || name.Contains("contrail")
-                || name.Contains("vapor")
-                || name.Contains("smoke")
-                || name.Contains("dust")
-                || name.Contains("flyover")
-                || name.Contains("surface")
-                || name.Contains("wake");
+                          $"smartScaling={disabledSmartScaling}");
         }
 
         /// <summary>

@@ -15,6 +15,7 @@ BepInEx/
 TinyCombatArena\[Host\]/
 TinyCombatArena\[Client\]/
 Decompiled/
+.decompiled/
 
 # Local-only reference assemblies. These must be copied from the developer's
 # own Tiny Combat Arena/BepInEx install and must not be redistributed here.

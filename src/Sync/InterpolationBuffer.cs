@@ -45,29 +45,41 @@ namespace TCAMultiplayer.Sync
 
     /// <summary>
     /// Interpolation buffer with snapshot interpolation and a smooth render clock.
-    /// 
+    ///
     /// DESIGN:
     /// - Samples stored in ABSOLUTE double-precision coordinates (immune to FloatingOrigin).
-    /// - A smooth "render clock" advances at real-time rate with slow drift correction,
-    ///   so ClockOffset EMA updates have ZERO frame-to-frame jitter.
+    /// - Sampled from FixedUpdate with Time.fixedTime: TCA renders its world on the physics
+    ///   timeline (cameras + native aircraft only move on physics steps), so the remote pose
+    ///   must step on that same timeline or it appears to oscillate relative to the camera.
     /// - Linear position interpolation between bracketing samples. Fast aircraft expose
     ///   tiny snapshot noise, and cubic curves can turn that into visible micro-wobble.
     /// - Slerp for quaternion rotation.
     /// - Conversion to local Unity space happens ONLY at the caller (FloatingOriginService).
     /// - Pre-allocated circular buffer — zero GC allocations on the hot path.
-    /// 
-    /// CLOCK OFFSET:
-    /// Asymmetric EMA — fast tracking when network worsens (offset increases),
-    /// slow tracking when improving (could be transient jitter, not real improvement).
+    ///
+    /// RENDER CLOCK:
+    /// The clock follows the rate at which remote data actually ARRIVES, via a PI controller
+    /// on the buffered lead (newest remote timestamp - render clock). Sender and receiver
+    /// game clocks routinely run at different rates — a background-throttled instance runs
+    /// its whole game (and therefore its send timestamps) in slow motion — so any scheme
+    /// that models a fixed clock offset will starve or overrun the buffer. Tracking the
+    /// data rate keeps the lead pinned at the interpolation delay regardless:
+    /// - Integral term: learns sustained rate mismatch (throttling, slow-motion physics,
+    ///   clock drift) so steady-state error is zero.
+    /// - Proportional term: recovers transient lead changes, active only outside a deadband
+    ///   that hides per-frame packet-burst sawtooth (inside it the clock advances at exactly
+    ///   the local rate → perfectly smooth motion).
     /// </summary>
     public class InterpolationBuffer
     {
         private const float MaxExtrapolationSeconds = 0.10f;
-        private const float MaxRenderLagOverDelaySeconds = 0.25f;
-        private const float MaxRenderClockForwardSnapSeconds = 0.08f;
-        private const float SmallClockCorrectionRate = 0.05f;
-        private const float LargeClockCorrectionRate = 0.25f;
-        private const float LargeClockErrorSeconds = 0.50f;
+        private const float LeadErrorDeadbandSeconds = 0.040f;
+        private const float ProportionalGain = 1.0f;
+        private const float MaxProportionalRate = 0.10f;
+        private const float IntegralGain = 0.5f;
+        private const float MaxIntegralRate = 0.30f;
+        private const float SnapErrorSeconds = 1.0f;
+        private const float OffsetWindowSeconds = 3f;
 
         private readonly InterpolationSample[] _buffer; // circular buffer
         private int _head;
@@ -75,17 +87,22 @@ namespace TCAMultiplayer.Sync
         private readonly int _capacity;
         private float _interpolationDelay;
 
-        // Clock offset tracking (asymmetric EMA)
+        // Clock offset tracking (sliding-window minimum, two-bucket technique).
+        // Diagnostic only — the render clock no longer depends on it.
         private float _clockOffset;
         private bool _clockInitialized;
+        private float _offsetWindowMinA;
+        private float _offsetWindowMinB;
+        private float _offsetWindowStartTime;
 
         private int _droppedOutOfOrderSamples;
         private int _droppedInvalidSamples;
 
-        // Smooth render clock
+        // Smooth render clock (PI rate controller on buffered lead)
         private float _renderClock;
         private bool _renderClockInitialized;
         private float _lastLocalTime;
+        private float _rateIntegral;
 
         // Last known state for empty-buffer edge case
         private InterpolationSample _lastKnownSample;
@@ -104,6 +121,7 @@ namespace TCAMultiplayer.Sync
         public float LastRenderClockDelta { get; private set; }
         public float LastRenderClockError { get; private set; }
         public float LastRenderClockCorrection { get; private set; }
+        public float LastRenderClockRate { get; private set; } = 1f;
         public bool LastRenderClockLargeError { get; private set; }
         public bool LastRenderClockClampedBackward { get; private set; }
         public float LastEffectiveInterpolationDelay => _interpolationDelay;
@@ -148,7 +166,7 @@ namespace TCAMultiplayer.Sync
 
             }
 
-            // Update clock offset via asymmetric EMA
+            // Update clock-offset diagnostic (not used by the render clock)
             UpdateClockOffset(sample.LocalReceiveTime, sample.RemoteTimestamp);
 
             // Write to circular buffer
@@ -252,15 +270,20 @@ namespace TCAMultiplayer.Sync
             _head = 0;
             _count = 0;
             _clockInitialized = false;
+            _offsetWindowMinA = 0f;
+            _offsetWindowMinB = 0f;
+            _offsetWindowStartTime = 0f;
             _renderClockInitialized = false;
             _hasLastKnownSample = false;
             _loggedEmpty = false;
             _loggedFull = false;
             _lastLocalTime = 0f;
+            _rateIntegral = 0f;
             LastTargetRenderTime = 0f;
             LastRenderClockDelta = 0f;
             LastRenderClockError = 0f;
             LastRenderClockCorrection = 0f;
+            LastRenderClockRate = 1f;
             LastRenderClockLargeError = false;
             LastRenderClockClampedBackward = false;
             LastBufferedLeadSeconds = 0f;
@@ -361,14 +384,28 @@ namespace TCAMultiplayer.Sync
             {
                 _clockOffset = offset;
                 _clockInitialized = true;
+                _offsetWindowMinA = offset;
+                _offsetWindowMinB = offset;
+                _offsetWindowStartTime = localReceiveTime;
                 return;
             }
 
-            // Asymmetric EMA:
-            //  - Fast (alpha=0.15) when offset increases → network getting worse, track quickly
-            //  - Slow (alpha=0.03) when offset decreases → could be jitter, not real improvement
-            float alpha = (offset > _clockOffset) ? 0.15f : 0.03f;
-            _clockOffset += alpha * (offset - _clockOffset);
+            // Two-bucket sliding minimum: minA covers the current window, minB the previous
+            // one, so the reported minimum always spans 1-2 windows of history. The minimum
+            // tracks the fastest packet (least queuing + least frame-quantization noise) and
+            // is stable frame-to-frame; per-packet noise never moves it.
+            if (localReceiveTime - _offsetWindowStartTime > OffsetWindowSeconds)
+            {
+                _offsetWindowMinB = _offsetWindowMinA;
+                _offsetWindowMinA = offset;
+                _offsetWindowStartTime = localReceiveTime;
+            }
+            else if (offset < _offsetWindowMinA)
+            {
+                _offsetWindowMinA = offset;
+            }
+
+            _clockOffset = Math.Min(_offsetWindowMinA, _offsetWindowMinB);
         }
 
         // ════════════════════════════════════════════════════════════════
@@ -377,16 +414,20 @@ namespace TCAMultiplayer.Sync
 
         /// <summary>
         /// Advances the smooth render clock and returns the remote-timeline render time.
-        /// The clock advances by real-time delta each frame plus a small bounded correction,
-        /// so ClockOffset EMA changes have ZERO frame-to-frame effect.
+        /// PI rate controller: the clock advances at the local time rate scaled to track
+        /// the rate at which remote data arrives, keeping the buffered lead pinned at the
+        /// interpolation delay even when the sender's game clock runs slower or faster
+        /// than ours (background throttling, slow-motion physics, clock drift).
         /// </summary>
         private float ComputeRenderTime(float localTime)
         {
-            float targetRenderTime = localTime - _clockOffset - _interpolationDelay;
+            float newestRemoteTime = GetNewestRemoteTime();
+            float targetRenderTime = newestRemoteTime - _interpolationDelay;
             LastTargetRenderTime = targetRenderTime;
             LastRenderClockDelta = 0f;
             LastRenderClockError = 0f;
             LastRenderClockCorrection = 0f;
+            LastRenderClockRate = 1f;
             LastRenderClockLargeError = false;
             LastRenderClockClampedBackward = false;
 
@@ -395,11 +436,12 @@ namespace TCAMultiplayer.Sync
                 _renderClock = targetRenderTime;
                 _renderClockInitialized = true;
                 _lastLocalTime = localTime;
-                LastBufferedLeadSeconds = GetNewestRemoteTime() - _renderClock;
-                return targetRenderTime;
+                _rateIntegral = 0f;
+                LastBufferedLeadSeconds = newestRemoteTime - _renderClock;
+                return _renderClock;
             }
 
-            // Compute frame delta from local time progression
+            // Compute step delta from local time progression
             float deltaTime = localTime - _lastLocalTime;
             _lastLocalTime = localTime;
 
@@ -409,44 +451,53 @@ namespace TCAMultiplayer.Sync
                 // Unity time should not run backwards in normal play, but if it
                 // does, never rewind the remote render timeline. Rewinding a jet
                 // is perceived as forward/back oscillation along velocity.
-                LastBufferedLeadSeconds = GetNewestRemoteTime() - _renderClock;
+                LastBufferedLeadSeconds = newestRemoteTime - _renderClock;
                 return _renderClock;
             }
 
             float previousRenderClock = _renderClock;
-            float newestRemoteTime = GetNewestRemoteTime();
-
-            // Advance at real-time rate
-            _renderClock += deltaTime;
-            LastRenderClockDelta = deltaTime;
-
-            // Drift correction
             float error = targetRenderTime - _renderClock;
             LastRenderClockError = error;
+            LastRenderClockLargeError = Math.Abs(error) > SnapErrorSeconds;
 
-            // Do not snap to target once playback has begun. A clock snap can
-            // move the sampled aircraft tens of meters in one rendered frame,
-            // or worse, move it backward along its path when offset estimates
-            // recover. Instead, slew the timeline smoothly.
-            LastRenderClockLargeError = Math.Abs(error) > LargeClockErrorSeconds;
-            float correctionRate = LastRenderClockLargeError
-                ? LargeClockCorrectionRate
-                : SmallClockCorrectionRate;
-            float maxCorrection = correctionRate * deltaTime;
-            if (maxCorrection < 0.00001f) maxCorrection = 0.00001f;
-            float correction = Math.Max(-maxCorrection, Math.Min(maxCorrection, error));
-            _renderClock += correction;
-            LastRenderClockCorrection = correction;
-
-            float maxAllowedLag = _interpolationDelay + MaxRenderLagOverDelaySeconds;
-            float oldestAllowedRenderTime = newestRemoteTime - maxAllowedLag;
-            if (_renderClock < oldestAllowedRenderTime)
+            // Hard resync only for huge errors (level-load stall, long disconnect).
+            // Forward only — never rewind the timeline.
+            if (LastRenderClockLargeError)
             {
-                float snapLimit = Math.Max(MaxRenderClockForwardSnapSeconds, deltaTime * 4f);
-                float clampedRenderTime = Math.Min(oldestAllowedRenderTime, previousRenderClock + snapLimit);
-                if (clampedRenderTime > _renderClock)
-                    _renderClock = clampedRenderTime;
+                if (error > 0f)
+                {
+                    _renderClock = targetRenderTime;
+                    LastRenderClockCorrection = error;
+                }
+                _rateIntegral = 0f;
+                LastBufferedLeadSeconds = newestRemoteTime - _renderClock;
+                return _renderClock;
             }
+
+            // Integral: learns sustained data-rate mismatch → zero steady-state error.
+            // Always active; inside the deadband the error is tiny and self-cancelling.
+            _rateIntegral += error * IntegralGain * deltaTime;
+            _rateIntegral = Math.Max(-MaxIntegralRate, Math.Min(MaxIntegralRate, _rateIntegral));
+
+            // Proportional: recovers transient lead changes. Only the excess beyond the
+            // deadband contributes — the deadband hides the per-frame packet-burst
+            // sawtooth so normal operation runs at exactly rate 1.0 (perfectly smooth).
+            float proportional = 0f;
+            if (Math.Abs(error) > LeadErrorDeadbandSeconds)
+            {
+                float excess = error > 0f
+                    ? error - LeadErrorDeadbandSeconds
+                    : error + LeadErrorDeadbandSeconds;
+                proportional = Math.Max(-MaxProportionalRate,
+                    Math.Min(MaxProportionalRate, excess * ProportionalGain));
+            }
+
+            float rate = 1f + _rateIntegral + proportional;
+            if (rate < 0f) rate = 0f;
+            _renderClock += deltaTime * rate;
+            LastRenderClockRate = rate;
+            LastRenderClockDelta = deltaTime * rate;
+            LastRenderClockCorrection = deltaTime * (rate - 1f);
 
             if (_renderClock < previousRenderClock)
             {

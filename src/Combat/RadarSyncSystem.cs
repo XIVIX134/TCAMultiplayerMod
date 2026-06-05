@@ -61,12 +61,22 @@ namespace TCAMultiplayer.Combat
             if (Time.time < _nextCheckTime) return;
             _nextCheckTime = Time.time + RadarCheckInterval;
 
-            if (!IsRadarAlive(_localRadar))
+            // Re-resolve the local radar EVERY check. Caching it until the reference
+            // "dies" is unsafe: a destroyed plane's Radar object never throws, so after
+            // a death + respawn the cached reference silently points at the dead plane's
+            // radar forever — and new locks are never detected or synced. (Same stale-
+            // reference-after-respawn pattern that froze gear sync.)
+            var currentRadar = FindLocalRadar();
+            if (!ReferenceEquals(_localRadar, currentRadar))
             {
-                _localRadar = FindLocalRadar();
+                _localRadar = currentRadar;
                 if (_localRadar == null) return;
                 _lastRadarActive = _localRadar.IsActive;
+                _lastLockedTarget = null;
+                _lastLockedPeerId = 0;
+                Log.Info(Tag, "Local radar (re)acquired — monitoring for locks");
             }
+            if (_localRadar == null) return;
 
             CheckRadarActiveState();
             if (!_lastRadarActive) return;
@@ -98,18 +108,24 @@ namespace TCAMultiplayer.Combat
                 if (targetPeerId != 0)
                 {
                     SendRadarLockPacket(targetPeerId, true);
-                    Log.Info(Tag, $"Locked peer {targetPeerId}");
+                    Log.Info(Tag, $"Locked peer {targetPeerId} — lock packet sent");
                 }
-                else if (_lastLockedPeerId != 0)
+                else
                 {
-                    SendRadarLockPacket(0, false);
-                    Log.Info(Tag, "Lock moved off peer, sent unlock");
+                    if (_lastLockedPeerId != 0)
+                    {
+                        SendRadarLockPacket(0, false);
+                        Log.Info(Tag, "Lock moved off peer, sent unlock");
+                    }
+                    // Always log non-peer locks: if a player locks another player and THIS
+                    // line appears instead of "Locked peer", peer resolution is the bug.
+                    Log.Info(Tag, $"Local radar locked non-peer target '{currentTarget.name}' (not synced)");
                 }
             }
             else if (_lastLockedTarget != null)
             {
                 SendRadarLockPacket(0, false);
-                Log.Info(Tag, "Lock lost");
+                Log.Info(Tag, "Lock released, sent unlock");
             }
 
             _lastLockedTarget = currentTarget;
@@ -322,9 +338,22 @@ namespace TCAMultiplayer.Combat
         }
 
 
-        /// <summary>Find local player's radar, excluding remote peer radars.</summary>
+        /// <summary>Find local player's radar.</summary>
         private Radar FindLocalRadar()
         {
+            // The player's radar is directly available on their aircraft — use it.
+            // NEVER rely on scanning Radar.ActiveRadars for this: that static list
+            // contains every radar in the scene (AI planes, SAM sites, clones) ordered
+            // by spawn time, so "first non-clone radar" silently grabs a ground radar
+            // on missions that have them — and then player locks are never detected.
+            var localAircraft = FindLocalPlayerAircraft();
+            if (localAircraft != null && localAircraft.Radar != null
+                && localAircraft.Radar.OwnTarget != null)
+            {
+                return localAircraft.Radar;
+            }
+
+            // Fallback only if the aircraft's own radar is unavailable.
             var activeRadars = Radar.ActiveRadars;
             if (activeRadars == null || activeRadars.Count == 0) return null;
 
@@ -334,6 +363,8 @@ namespace TCAMultiplayer.Combat
                 if (radar == null || !radar.IsActive) continue;
                 if (IsRemoteRadar(radar)) continue;
                 if (radar.OwnTarget != null && IsRemoteCloneTarget(radar.OwnTarget)) continue;
+                Log.Warning(Tag, "Using fallback ActiveRadars scan for local radar — " +
+                                 "lock detection may be unreliable");
                 return radar;
             }
 
@@ -416,6 +447,7 @@ namespace TCAMultiplayer.Combat
             _forcedLocalThreatTargets[lockerId] = target;
             RefreshLocalThreatWarning();
             EnsureLocalThreatState(radar, target);
+            LogRwrState($"lock-applied by peer {lockerId}");
         }
 
         private void MaintainForcedLocalThreats()
@@ -465,6 +497,84 @@ namespace TCAMultiplayer.Combat
 
             localAircraft.ThreatWarning.IsActive = true;
             localAircraft.ThreatWarning.Threats.Add(radar);
+
+            // Periodic deep diagnostic while a forced threat is active — this is the
+            // exact data the HUD warning depends on, so any break in the chain shows here.
+            if (Time.time - _lastRwrDiagnosticTime > 5f)
+            {
+                _lastRwrDiagnosticTime = Time.time;
+                LogRwrState("maintain");
+            }
+        }
+
+        private float _lastRwrDiagnosticTime;
+
+        /// <summary>
+        /// Dumps the complete chain the HUD's RWR warning depends on:
+        /// UniAircraft.Player identity, ThreatWarning contents, lock matches,
+        /// and the native visibility check inputs.
+        /// </summary>
+        private void LogRwrState(string context)
+        {
+            try
+            {
+                var localAircraft = FindLocalPlayerAircraft();
+                var hudAircraft = UniAircraft.Player;
+                var sb = new System.Text.StringBuilder(512);
+                sb.Append($"[RWR-DBG] {context}: ");
+
+                if (localAircraft == null)
+                {
+                    Log.Info(Tag, sb.Append("no local aircraft").ToString());
+                    return;
+                }
+
+                // The HUD reads UniAircraft.Player.ThreatWarning — if that's a different
+                // aircraft than the one we populate, the warning can never show.
+                sb.Append($"sameAircraftAsHud={ReferenceEquals(localAircraft, hudAircraft)} ");
+
+                var tw = localAircraft.ThreatWarning;
+                if (tw == null)
+                {
+                    Log.Info(Tag, sb.Append("ThreatWarning=NULL").ToString());
+                    return;
+                }
+
+                var ownTarget = tw.OwnRadar != null ? tw.OwnRadar.OwnTarget : null;
+                sb.Append($"twActive={tw.IsActive} threats={tw.Threats.Count} ")
+                  .Append($"lockedThreats={tw.GetNumberOfLockedThreats()} ")
+                  .Append($"ownTarget={(ownTarget != null ? ownTarget.name : "<null>")} ");
+
+                foreach (var threat in tw.Threats)
+                {
+                    if (threat == null) { sb.Append("| <null radar> "); continue; }
+                    string lockedName = threat.LockedTarget != null ? threat.LockedTarget.name : "<none>";
+                    bool matchesOwn = ownTarget != null && ReferenceEquals(threat.LockedTarget, ownTarget);
+                    string distance = "?";
+                    string visRange = "?";
+                    try
+                    {
+                        if (threat.Transform != null && tw.OwnRadar != null && tw.OwnRadar.Transform != null)
+                        {
+                            float dist = Vector3.Distance(threat.Position, tw.OwnRadar.Position);
+                            float angle = Vector3.Angle(tw.OwnRadar.Position - threat.Position, threat.Forward);
+                            bool inCone = angle < threat.Data.FieldOfView * 0.6f;
+                            float range = threat.Data.EffectiveRange * threat.Data.Detectability * (inCone ? 2f : 0.5f);
+                            distance = dist.ToString("F0");
+                            visRange = $"{range:F0}(cone={inCone})";
+                        }
+                    }
+                    catch { }
+                    sb.Append($"| threat: invalid={threat.IsInvalid} active={threat.IsActive} ")
+                      .Append($"locked={lockedName} matchesOwn={matchesOwn} dist={distance} visRange={visRange} ");
+                }
+
+                Log.Info(Tag, sb.ToString());
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"[RWR-DBG] failed: {ex.Message}");
+            }
         }
 
         private void ClearForcedLocalThreat(

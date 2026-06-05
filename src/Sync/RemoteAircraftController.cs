@@ -58,6 +58,13 @@ namespace TCAMultiplayer.Sync
         private bool _hasSmoothedPose;
         private Vector3 _lastSampleVelocity;
         private float _lastPresentationUpdateTime;
+        private Vector3 _lastCameraRelativePosition;
+        private bool _hasCameraRelativePosition;
+        private float _lastCameraRelativeAlongVelocity;
+        private int _cameraRelativeSignFlips;
+        private float _maxCameraRelativeStep;
+        private Vector3 _lastNativeStateVelocity;
+        private float _lastNativeStateErrorTime;
         private Transform[] _visualSmoothingTransforms;
         private Vector3[] _visualSmoothingBaseLocalPositions;
         private Quaternion[] _visualSmoothingBaseLocalRotations;
@@ -98,8 +105,13 @@ namespace TCAMultiplayer.Sync
         private static MethodInfo _swInitMethod, _swUpdateMethod;
         private object _swingWingsComponent;
 
-        private Component _landingGearComponent;
-        private MethodInfo _gearSetLoweredMethod;
+        private const float GearDebounceSeconds = 0.4f;
+        private bool _hasAppliedGearState;
+        private bool _hasReceivedGearFlag;
+        private bool _pendingGearDown = true;
+        private float _pendingGearDownSince;
+        private float _lastGearErrorTime;
+        private float _lastGearDiagnosticTime;
 
         private readonly List<ParticleSystem> _muzzleFlashSystems = new List<ParticleSystem>();
         private bool _wasFiringPrevFrame;
@@ -120,8 +132,18 @@ namespace TCAMultiplayer.Sync
             _aircraft = GetComponentInParent<UniAircraft>() ?? GetComponentInChildren<UniAircraft>(true);
             if (_rb != null)
             {
-                _rb.isKinematic = true;
+                // DYNAMIC network puppet: velocity writes must be legal because native
+                // systems read Rigidbody.velocity (Target → missile guidance, Viewable →
+                // cameras, FreeWheel/WheelAudio/GearSlip). A kinematic body always reads
+                // zero. Nothing fights our control — UniAircraft is disabled on clones
+                // and the full pose + velocity is re-asserted every FixedUpdate.
+                _rb.isKinematic = false;
                 _rb.useGravity = false;
+                _rb.drag = 0f;
+                _rb.angularDrag = 0f;
+                // Interpolation must stay OFF to match native aircraft (the game never
+                // enables it). Render-rate smoothing of this body would make it jitter
+                // against TCA's FixedUpdate-stepping cameras and world.
                 _rb.interpolation = RigidbodyInterpolation.None;
                 _rb.detectCollisions = true;
             }
@@ -168,12 +190,54 @@ namespace TCAMultiplayer.Sync
 
         private void FixedUpdate()
         {
-            if (_rb == null || _rb.isKinematic)
+            // The pose MUST be driven on the physics timeline. TCA renders its whole
+            // world on that timeline: every camera moves in FixedUpdate (FalconChaseCam,
+            // FalconCockpitCamera, ...) and native aircraft are force-driven rigidbodies
+            // with interpolation off, so everything the player sees only moves when a
+            // physics step runs. A remote pose that advances smoothly every render frame
+            // sweeps forward and snaps back relative to that stepping camera — a sawtooth
+            // of (speed x fixedDeltaTime) meters along the velocity axis, perceived as
+            // severe fore/aft jitter even though its world-space motion is perfectly smooth.
+            UpdateInterpolatedPose(Time.fixedTime);
+            UpdateNativeFlightState();
+        }
+
+        /// <summary>
+        /// Feeds native flight state that the disabled UniAircraft would normally update.
+        /// Wingtip vortices, flyover dust, gauges, gear logic, and the chase camera all
+        /// read FlightStats/Viewable — without this they see zeros and never trigger.
+        /// </summary>
+        private void UpdateNativeFlightState()
+        {
+            if (_aircraft == null || _rb == null)
                 return;
 
-            var sample = _buffer?.GetInterpolatedState(Time.fixedTime) ?? default;
-            _rb.velocity = new Vector3(sample.VelX, sample.VelY, sample.VelZ);
-            _rb.angularVelocity = new Vector3(sample.AngVelX, sample.AngVelY, sample.AngVelZ);
+            try
+            {
+                // FlightStats reads transform + rigidbody (velocity is correct now that
+                // the body is dynamic). Null environment = no wind, which is fine for
+                // display purposes.
+                _aircraft.FlightStats?.UpdateFlightStats(transform, _rb, null, Time.fixedDeltaTime);
+
+                // Viewable feeds the external/chase cameras and view switching.
+                var viewable = _aircraft.Viewable;
+                if (viewable != null)
+                {
+                    Vector3 velocity = _rb.velocity;
+                    Vector3 acceleration = (velocity - _lastNativeStateVelocity) / Time.fixedDeltaTime;
+                    _lastNativeStateVelocity = velocity;
+                    viewable.UpdateStats(transform.position, velocity, acceleration,
+                        _aircraft.FlightStats?.PitchGSmooth ?? 1f);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Time.time - _lastNativeStateErrorTime > 30f)
+                {
+                    _lastNativeStateErrorTime = Time.time;
+                    Log.Warning(Tag, $"Native flight state update failed: {ex.Message}");
+                }
+            }
         }
 
         private void Update()
@@ -186,7 +250,10 @@ namespace TCAMultiplayer.Sync
         {
             RemoteMotionDebug.Poll();
             DiagnoseExternalTransformDrift();
-            UpdateInterpolatedPose(Time.time);
+            // Camera-relative motion is what the player actually perceives — track it
+            // at render rate. World-space smoothness metrics cannot see this.
+            if (RemoteMotionDebug.Enabled)
+                TrackCameraRelativeMotion();
 
             // UniAircraft.Update resets pilot-bypassed controls. Re-apply after it
             // so engine state, afterburners, and VTOL visuals match the remote owner.
@@ -224,14 +291,12 @@ namespace TCAMultiplayer.Sync
             {
                 _rb.position = localPos;
                 _rb.rotation = rotation;
-                if (_rb.isKinematic)
-                {
-                    // Kinematic keeps physics from integrating the puppet, but
-                    // Target/Viewable/native helpers still read these velocities.
-                    _rb.velocity = sampleVelocity;
-                    _rb.angularVelocity = sampleAngularVelocity;
-                }
-                else
+                // The body is dynamic (see Initialize), so these writes are legal and
+                // native readers (Target, Viewable, FlightStats, wheel/audio helpers)
+                // see the real networked velocity. Physics integration between our
+                // FixedUpdate corrections continues this motion, which is exactly the
+                // networked trajectory.
+                if (!_rb.isKinematic)
                 {
                     _rb.velocity = sampleVelocity;
                     _rb.angularVelocity = sampleAngularVelocity;
@@ -256,7 +321,10 @@ namespace TCAMultiplayer.Sync
 
             TrackAppliedStep(localPos, sampleVelocity, presentationDeltaTime, smoothedPosition);
             TrackAppliedRotation(rotation);
-            TrackRendererMotion(localPos);
+            // Renderer-bounds tracking iterates every renderer on the aircraft —
+            // too expensive to run per frame outside of motion debugging.
+            if (RemoteMotionDebug.Enabled)
+                TrackRendererMotion(localPos);
             _lastAppliedPosition = localPos;
             _lastAppliedRotation = rotation;
             _hasAppliedPose = true;
@@ -594,18 +662,58 @@ namespace TCAMultiplayer.Sync
             return true;
         }
 
+        /// <summary>
+        /// Tracks the remote aircraft's position relative to the active camera at render
+        /// rate. The player perceives motion relative to the camera — which TCA moves on
+        /// the physics timeline — so fore/aft sign flips of this relative motion ARE the
+        /// jitter the player sees, regardless of how smooth world-space motion is.
+        /// </summary>
+        private void TrackCameraRelativeMotion()
+        {
+            var camera = Camera.main;
+            if (camera == null)
+            {
+                _hasCameraRelativePosition = false;
+                return;
+            }
+
+            Vector3 relative = transform.position - camera.transform.position;
+            if (_hasCameraRelativePosition)
+            {
+                Vector3 delta = relative - _lastCameraRelativePosition;
+                float step = delta.magnitude;
+                if (step > _maxCameraRelativeStep)
+                    _maxCameraRelativeStep = step;
+
+                Vector3 axis = _lastSampleVelocity.sqrMagnitude > 0.01f
+                    ? _lastSampleVelocity.normalized
+                    : transform.forward;
+                float along = Vector3.Dot(delta, axis);
+                TrackVelocityAxisOscillation(along, ref _lastCameraRelativeAlongVelocity, ref _cameraRelativeSignFlips);
+            }
+
+            _lastCameraRelativePosition = relative;
+            _hasCameraRelativePosition = true;
+        }
+
         private void DiagnoseExternalTransformDrift()
         {
             if (!_hasAppliedPose || Time.time - _lastDriftDiagnosticTime < 1f)
                 return;
 
-            float drift = Vector3.Distance(transform.position, _lastAppliedPosition);
+            // The body is dynamic: after each pose write, physics integrates the applied
+            // velocity for one step, so the transform is EXPECTED to sit ahead of the last
+            // applied position by velocity * fixedDeltaTime. Only flag drift beyond that
+            // (collision shoves, external movers) — small transients self-correct at the
+            // next FixedUpdate anyway.
+            Vector3 expectedPosition = _lastAppliedPosition + _lastSampleVelocity * Time.fixedDeltaTime;
+            float drift = Vector3.Distance(transform.position, expectedPosition);
             float angleDrift = Quaternion.Angle(transform.rotation, _lastAppliedRotation);
-            if (drift > 0.05f || angleDrift > 0.5f)
+            if (drift > 2f || angleDrift > 10f)
             {
                 _lastDriftDiagnosticTime = Time.time;
                 Log.Warning(Tag, $"External transform drift before LateUpdate: pos={drift:F3}m rot={angleDrift:F2}deg " +
-                                 $"current={transform.position} lastApplied={_lastAppliedPosition}");
+                                 $"current={transform.position} expected={expectedPosition}");
             }
         }
 
@@ -635,7 +743,7 @@ namespace TCAMultiplayer.Sync
         {
             // Bit 0:Afterburner 1:GearDown 2:FlapsDown 3:IsFiring 4:Flare 5:Chaff
             bool ab = (flags & (1 << 0)) != 0 && HasAfterburner();
-            bool gear = (flags & (1 << 1)) != 0;
+            bool gearDown  = (flags & (1 << 1)) != 0;
             _flapsDown     = (flags & (1 << 2)) != 0;
             _isFiring      = (flags & (1 << 3)) != 0;
             _isFlareFiring = (flags & (1 << 4)) != 0;
@@ -643,11 +751,127 @@ namespace TCAMultiplayer.Sync
             _isWeightOnWheels = (flags & (1 << 7)) != 0;
 
             if (ab != _afterburnerActive) { _afterburnerActive = ab; SetAfterburnerState(ab); }
-            if (gear != _gearDown) { _gearDown = gear; SetGearState(gear); }
+
+            // First flags packet: adopt the gear state directly — it's the initial
+            // state, not a change, and must not be debounced (or the clone would
+            // briefly snap to the wrong default at spawn).
+            if (!_hasReceivedGearFlag)
+            {
+                _hasReceivedGearFlag = true;
+                _gearDown = gearDown;
+                _pendingGearDown = gearDown;
+            }
+            // Debounce subsequent gear changes: only commit after the incoming flag has
+            // held the new value for a short window. Real gear changes are slow (3s
+            // animation), so this is imperceptible — but it filters transient flag
+            // corruption (e.g. packets whose flag byte was left at default by a failed
+            // sender read), which otherwise makes the clone's gear cycle on its own.
+            else if (gearDown != _pendingGearDown)
+            {
+                _pendingGearDown = gearDown;
+                _pendingGearDownSince = Time.time;
+            }
+            else if (_pendingGearDown != _gearDown
+                && Time.time - _pendingGearDownSince >= GearDebounceSeconds)
+            {
+                bool previous = _gearDown;
+                _gearDown = _pendingGearDown;
+                Log.Info(Tag, $"Synced gear flag changed {previous} -> {_gearDown}");
+            }
+
+            ReconcileGearState();
+        }
+
+        /// <summary>
+        /// Continuously reconciles the native gear state with the synced flag.
+        /// Edge-triggering alone is unsafe: LandingGear.SetGearLowered silently ignores
+        /// requests while weight-on-wheels, which would permanently eat an edge-triggered
+        /// command. Reconciling every frame retries until the native state matches.
+        /// </summary>
+        private void ReconcileGearState()
+        {
+            var gear = _aircraft != null ? _aircraft.LandingGear : null;
+            if (gear == null)
+                return;
+
+            if (gear.IsGearLowered == _gearDown)
+            {
+                _hasAppliedGearState = true;
+                return;
+            }
+
+            try
+            {
+                if (!_hasAppliedGearState)
+                {
+                    // First application snaps to the synced state — an airborne clone
+                    // shouldn't spawn gear-down and slowly retract.
+                    gear.ForceGearLowered(_gearDown);
+                }
+                else
+                {
+                    // Animated change via the native path (FreeWheel lerps retractPercent
+                    // and drives the gear Animator). Ignored while WoW; retried next frame.
+                    gear.SetGearLowered(_gearDown);
+                }
+                _hasAppliedGearState = true;
+                LogGearDiagnostics($"apply gearDown={_gearDown}");
+            }
+            catch (Exception ex)
+            {
+                if (Time.time - _lastGearErrorTime > 30f)
+                {
+                    _lastGearErrorTime = Time.time;
+                    Log.Warning(Tag, $"Gear reconcile failed: {ex.Message}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Dumps the full gear animation chain state (motion-debug only). Identifies
+        /// exactly where gear animation breaks: wheel enabled state, useAnimation flag,
+        /// retract progress, and Animator/controller wiring.
+        /// </summary>
+        private void LogGearDiagnostics(string context)
+        {
+            if (!RemoteMotionDebug.Enabled)
+                return;
+
+            var gear = _aircraft != null ? _aircraft.LandingGear : null;
+            if (gear == null)
+            {
+                Log.Info(Tag, $"[GEAR-DBG] {context}: no LandingGear");
+                return;
+            }
+
+            var sb = new System.Text.StringBuilder(256);
+            sb.Append($"[GEAR-DBG] {context}: lowered={gear.IsGearLowered} WoW={gear.IsWeightOnWheels} ")
+              .Append($"avgState={gear.GetAverageGearState():F2} moving={gear.IsGearMoving} synced={_gearDown}");
+
+            foreach (var wheel in GetComponentsInChildren<Falcon.Vehicles.FreeWheel>(true))
+            {
+                if (wheel == null) continue;
+                var animator = wheel.AircraftAnimator;
+                string animatorState = animator == null ? "NULL"
+                    : !animator.enabled ? "DISABLED"
+                    : animator.runtimeAnimatorController == null ? "NO-CONTROLLER"
+                    : animator.runtimeAnimatorController.name;
+                sb.Append($" | {wheel.name}: en={wheel.enabled} useAnim={wheel.useAnimation} ")
+                  .Append($"retract={wheel.RetractedState:F2} param={wheel.GearUpAnimationName} animator={animatorState}");
+            }
+
+            Log.Info(Tag, sb.ToString());
         }
 
         private void LogInterpolationDiagnostics(Vector3 localPos, InterpolationSample sample)
         {
+            // Periodic gear-chain dump (motion-debug only, every 5s)
+            if (RemoteMotionDebug.Enabled && Time.time - _lastGearDiagnosticTime > 5f)
+            {
+                _lastGearDiagnosticTime = Time.time;
+                LogGearDiagnostics("periodic");
+            }
+
             if (Time.time - _lastInterpDiagnosticTime < 5f)
                 return;
             _lastInterpDiagnosticTime = Time.time;
@@ -670,8 +894,9 @@ namespace TCAMultiplayer.Sync
 
             if (count < 3 || sampleRate < 45f || localSpan - remoteSpan > 0.25f
                 || newestAge > 0.15f || _buffer.LastMode != InterpolationMode.Interpolate
-                || _maxAppliedStep > 4f || _maxAppliedAngleStep > 10f
-                || _maxJitterError > 3f || _maxRendererOffsetChange > 1f || _maxRendererSizeChange > 10f)
+                || _maxAppliedStep > _maxExpectedStep * 2f + 2f || _maxAppliedAngleStep > 10f
+                || _maxJitterError > 3f || _maxRendererOffsetChange > 1f || _maxRendererSizeChange > 10f
+                || _cameraRelativeSignFlips > 2)
             {
                 Log.Warning(Tag, $"Motion diag: mode={_buffer.LastMode} count={count} recvHz={sampleRate:F1} " +
                                  $"remoteSpan={remoteSpan:F2}s localSpan={localSpan:F2}s newestAge={newestAge * 1000f:F0}ms " +
@@ -685,11 +910,14 @@ namespace TCAMultiplayer.Sync
                                  $"maxAlongErr={_maxAlongVelocityError:F2}m maxLatErr={_maxLateralError:F2}m " +
                                  $"avgSmoothCorr={avgSmoothingCorrection:F2}m maxSmoothCorr={_maxSmoothingCorrection:F2}m " +
                                  $"clockErr={_buffer.LastRenderClockError * 1000f:F0}ms clockCorr={_buffer.LastRenderClockCorrection * 1000f:F1}ms " +
+                                 $"clockRate={_buffer.LastRenderClockRate:F3} " +
                                  $"clockLarge={_buffer.LastRenderClockLargeError} clockClampBack={_buffer.LastRenderClockClampedBackward} " +
                                  $"droppedOld={_buffer.DroppedOutOfOrderSamples} droppedBad={_buffer.DroppedInvalidSamples} " +
                                  $"avgRot={avgAngleStep:F2}deg maxRot={_maxAppliedAngleStep:F2}deg " +
                                  $"maxRendererStep={_maxRendererStep:F2}m maxRendererOffset={_maxRendererOffsetChange:F2}m " +
-                                 $"maxRendererSize={_maxRendererSizeChange:F2}m pos={localPos} remoteTime={sample.RemoteTimestamp:F2}");
+                                 $"maxRendererSize={_maxRendererSizeChange:F2}m " +
+                                 $"camRelFlips={_cameraRelativeSignFlips} maxCamRelStep={_maxCameraRelativeStep:F2}m " +
+                                 $"pos={localPos} remoteTime={sample.RemoteTimestamp:F2}");
             }
 
             _maxAppliedStep = 0f;
@@ -709,6 +937,8 @@ namespace TCAMultiplayer.Sync
             _maxRendererStep = 0f;
             _maxRendererOffsetChange = 0f;
             _maxRendererSizeChange = 0f;
+            _cameraRelativeSignFlips = 0;
+            _maxCameraRelativeStep = 0f;
         }
 
         private void UpdateDebugDiagnostics(
@@ -779,10 +1009,12 @@ namespace TCAMultiplayer.Sync
                 $"rotDrift={rotationDrift:F2}deg appliedStep={appliedStep.magnitude:F3}m appliedAlongVel={appliedAlongVelocity:F3}m " +
                 $"expectedStep={sampleVelocity.magnitude * Time.deltaTime:F3}m visualCorrection={visualCorrection:F3}m " +
                 $"clockErr={_buffer?.LastRenderClockError * 1000f ?? 0f:F0}ms clockCorr={_buffer?.LastRenderClockCorrection * 1000f ?? 0f:F1}ms " +
+                $"clockRate={_buffer?.LastRenderClockRate ?? 1f:F3} " +
                 $"vel={sampleVelocity.magnitude:F1}m/s rbVelBefore={rbVelocityBefore.magnitude:F1}m/s " +
                 $"rbAngVelBefore={rbAngularVelocityBefore.magnitude:F2}rad/s rbPoseDrift={rbPoseDrift:F3}m " +
                 $"rendererOffset={_lastRendererOffset.magnitude:F3}m rendererSize={_lastRendererSize} " +
                 $"axisFlips=applied:{_appliedVelocityAxisSignFlips},external:{_externalVelocityAxisSignFlips} " +
+                $"camRelFlips={_cameraRelativeSignFlips} maxCamRelStep={_maxCameraRelativeStep:F2}m " +
                 $"root={appliedPosition} pre={prePosePosition}");
 
             _appliedVelocityAxisSignFlips = 0;
@@ -947,12 +1179,6 @@ namespace TCAMultiplayer.Sync
             return _flapAngle;
         }
 
-        private void SetGearState(bool down)
-        {
-            if (_landingGearComponent == null || _gearSetLoweredMethod == null) return;
-            try { _gearSetLoweredMethod.Invoke(_landingGearComponent, new object[] { down }); }
-            catch (Exception ex) { Log.Warning(Tag, $"SetGearState: {ex.Message}"); }
-        }
         private void UpdateControlSurfaces()
         {
             if (_animatedParts.Count > 0 && _animPartUpdateAuto != null)
@@ -1145,14 +1371,8 @@ namespace TCAMultiplayer.Sync
         {
             var f = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
 
-            // Landing gear
-            var lgType = Type.GetType("Falcon.Vehicles.LandingGear, Assembly-CSharp");
-            if (lgType != null)
-            {
-                _landingGearComponent = GetComponentInParent(lgType);
-                if (_landingGearComponent != null)
-                    _gearSetLoweredMethod = lgType.GetMethod("SetGearLowered", BindingFlags.Public | BindingFlags.Instance);
-            }
+            // Landing gear is accessed via the direct UniAircraft.LandingGear API
+            // (see ReconcileGearState) — no reflection needed.
 
             // UniAnimatedPart — build from UniAircraftData (UniAircraft.Start() hasn't run)
             object data = null;
@@ -1220,7 +1440,7 @@ namespace TCAMultiplayer.Sync
                 }
             }
 
-            Log.Debug(Tag, $"Anim: {_animatedParts.Count} parts, Gear={_landingGearComponent != null}, SW={_swingWingsComponent != null}");
+            Log.Debug(Tag, $"Anim: {_animatedParts.Count} parts, Gear={_aircraft?.LandingGear != null}, SW={_swingWingsComponent != null}");
         }
 
         private void LogVisualDiagnostics()
