@@ -383,8 +383,9 @@ namespace TCAMultiplayer.UI
             var buttons = UIFactory.CreateHorizontalGroup(shell.transform, 12);
             buttons.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = true;
 
+            bool gameInProgress = _lobby?.HostGameInProgress ?? false;
             bool localReady = session?.GetLocalPlayer()?.IsReady ?? false;
-            bool canReady = CanReady(session);
+            bool canReady = CanReady(session) && !gameInProgress;
             var ready = Track(UIFactory.CreateNativeButton(localReady ? "NOT READY" : "READY", buttons.transform, 50));
             if (ready != null)
             {
@@ -413,7 +414,14 @@ namespace TCAMultiplayer.UI
                     CloseMenu();
                 });
 
-            if (!canReady)
+            if (gameInProgress)
+            {
+                var banner = UIFactory.CreateNativeText(
+                    $"<color={Green}>GAME IN PROGRESS — WAITING FOR HOST TO RETURN TO LOBBY.</color>",
+                    shell.transform, 16, TextAlignmentOptions.Center);
+                banner.GetComponent<LayoutElement>().preferredHeight = 26f;
+            }
+            else if (!canReady)
             {
                 string warningText = ShowTeamSelection(session)
                     ? "SELECT AIRCRAFT, AIRFIELD, AND TEAM BEFORE READYING."

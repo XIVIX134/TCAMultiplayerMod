@@ -155,6 +155,7 @@ namespace TCAMultiplayer.Combat
             _originService.LocalToAbsolute(aircraft.transform.position,
                 out double absX, out double absY, out double absZ);
             Quaternion rot = aircraft.transform.rotation;
+            Vector3 vel = aircraft.Rigidbody != null ? aircraft.Rigidbody.velocity : Vector3.zero;
             var packet = new AircraftDestructionVfxPacket
             {
                 VictimId = _session.LocalPeerId,
@@ -165,12 +166,46 @@ namespace TCAMultiplayer.Combat
                 RotY = rot.y,
                 RotZ = rot.z,
                 RotW = rot.w,
-                DestructionReason = GetAircraftDestructionReason(aircraft)
+                DestructionReason = GetAircraftDestructionReason(aircraft),
+                VelX = vel.x,
+                VelY = vel.y,
+                VelZ = vel.z
             };
+
+            BroadcastDestructionVfxDeferred(aircraft, packet).Forget();
+        }
+
+        /// <summary>
+        /// OnAircraftDestroyed fires both when the aircraft goes critical
+        /// (burning, HP > 0) and when it fully explodes (HP 0 → native
+        /// DestroyAircraft with gibs + explosion). EjectPilots() also raises it
+        /// before setting ArePilotsEjected. All three can only be told apart
+        /// after the current call stack unwinds, so defer one frame and tag the
+        /// packet with what actually happened:
+        ///   0-3 = fully exploded (native reason), 4 = ejected, 5 = burning.
+        /// </summary>
+        private async Cysharp.Threading.Tasks.UniTaskVoid BroadcastDestructionVfxDeferred(
+            UniAircraft aircraft, AircraftDestructionVfxPacket packet)
+        {
+            await Cysharp.Threading.Tasks.UniTask.Yield();
+            if (_disposed || !_connection.HasSession) return;
+
+            if (aircraft != null && aircraft.ArePilotsEjected)
+            {
+                packet.DestructionReason = AircraftDestructionVfxPacket.ReasonPilotsEjected;
+            }
+            else if (aircraft != null && aircraft.Damage != null && !aircraft.Damage.IsDestroyed)
+            {
+                // Still in the critical burn phase — clones burn and fall.
+                // (A destroyed aircraft is gone by now: FinalDestroyAircraft
+                // destroys the GameObject, making the reference compare null.)
+                packet.DestructionReason = AircraftDestructionVfxPacket.ReasonCriticalBurning;
+            }
 
             var payload = PacketSerializer.SerializeAircraftDestructionVfx(packet);
             _connection.BroadcastReliable(PacketSerializer.Serialize(PacketType.AircraftDestructionVfx, payload));
-            Log.Debug(Tag, $"Broadcast aircraft destruction VFX for peer {_session.LocalPeerId}");
+            Log.Debug(Tag, $"Broadcast aircraft destruction VFX for peer {_session.LocalPeerId} " +
+                           $"reason={packet.DestructionReason}");
         }
 
         // ── Remote Packet Handlers ───────────────────────────────────────
@@ -232,7 +267,8 @@ namespace TCAMultiplayer.Combat
             }
             var localPos = _originService.AbsoluteToLocal(packet.PosX, packet.PosY, packet.PosZ);
             var rotation = new Quaternion(packet.RotX, packet.RotY, packet.RotZ, packet.RotW);
-            _remoteManager.PlayPeerDeath(packet.VictimId, localPos, rotation, packet.DestructionReason);
+            var velocity = new Vector3(packet.VelX, packet.VelY, packet.VelZ);
+            _remoteManager.PlayPeerDeath(packet.VictimId, localPos, rotation, packet.DestructionReason, velocity);
             Log.Debug(Tag, $"Destruction VFX for {packet.VictimId} from {fromPeerId}");
         }
 

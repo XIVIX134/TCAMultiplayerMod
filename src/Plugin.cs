@@ -100,6 +100,8 @@ namespace TCAMultiplayer
         private MultiplayerMenu _menu;
         private ScoreboardHUD _scoreboard;
         private RespawnScreen _respawnScreen;
+        private Falcon.RewiredInputActionList _pauseMenuInput;
+        private bool _mpPauseMenuOpen;
 
         private Falcon.Game2.MainMenu _nativeMainMenu;
         private bool _suppressNativeMainMenuRestore;
@@ -649,6 +651,8 @@ namespace TCAMultiplayer
             SortieEndPatch.IsMultiplayerSession = () => session.StateMachine.CurrentState != GameState.Disconnected;
             SortieEndPatch.IsHost = () => session.IsHost;
             SortieEndPatch.OnRequestReturnToLobby = _ => _lobby?.ReturnToLobby();
+            SortieEndPatch.OnRequestLeaveSession = _ => _connection?.Disconnect();
+            GamePausePatch.IsMultiplayerSession = () => session.StateMachine.CurrentState != GameState.Disconnected;
             EnvironmentPatch.IsMultiplayerSession = () => session.StateMachine.CurrentState != GameState.Disconnected;
             EnvironmentPatch.GetDeterministicSeed = () => 42;
             FireControlPatch.IsRemote = fc =>
@@ -852,6 +856,11 @@ namespace TCAMultiplayer
                     flightGame.SetNewPlayerAircraft(aircraft);
                     Log.Info(Tag, "FlightGame.SetNewPlayerAircraft — camera + controls attached");
 
+                    // Reset latched flight input from any previous session/life
+                    // (native StartFlight does this; we bypass it). Prevents a
+                    // stale IsEjecting flag from instantly ejecting the new aircraft.
+                    ResetPlayerFlightInput(flightGame);
+
                     // Initialize flight state that StartFlight() normally provides
                     // We bypass StartFlight() (it's private and runs an async game loop)
                     // but we need its critical side effects:
@@ -897,6 +906,11 @@ namespace TCAMultiplayer
                         flightGame.PlayerInput.IsInputBlockedFromGame = false;
                         Log.Info(Tag, "PlayerInput.IsInputBlockedFromGame set to false");
                     }
+
+                    // 4b. Register the pause-menu keys (native StartFlight does
+                    // this, but we bypass it). Esc opens the native pause menu;
+                    // GamePausePatch keeps the simulation running underneath.
+                    RegisterPauseMenuInput();
 
                     // 5. Initialize flight state that StartFlight() normally provides
                     // We bypass StartFlight() (private + runs async loop) but need its side effects
@@ -962,6 +976,12 @@ namespace TCAMultiplayer
                 flightGame.SetNewPlayerAircraft(aircraft);
                 Log.Info(Tag, "Re-attached camera and controls after respawn");
 
+                // Reset latched flight input. FlightGame.Update copies
+                // PlayerInput.FlightInput into the aircraft every frame, and
+                // IsEjecting stays true after an ejection — without this reset
+                // the respawned aircraft ejects again on its first frame.
+                ResetPlayerFlightInput(flightGame);
+
                 // Re-set floating origin reference for the new aircraft
                 if (flightGame.FloatingOrigin != null)
                 {
@@ -973,6 +993,109 @@ namespace TCAMultiplayer
                 {
                     flightGame.PlayerInput.IsInputBlockedFromGame = false;
                 }
+            }
+        }
+
+        /// <summary>
+        /// Reset the persistent PlayerInput state to fresh-spawn defaults, the
+        /// same way native StartFlight()/SpawnPlayerAtAirfield() do. Clears the
+        /// latched FlightInput.IsEjecting flag plus stale throttle/flaps/brakes
+        /// from the previous life.
+        /// </summary>
+        private void ResetPlayerFlightInput(Falcon.Game2.FlightGame flightGame)
+        {
+            var playerInput = flightGame?.PlayerInput;
+            if (playerInput == null) return;
+
+            bool isAirStart = _activeSession?.SpawnType == Core.LobbySpawnType.InAir;
+
+            // Clears eject press/hold latches and resets FlightInput/WeaponInput
+            playerInput.Reset();
+
+            var freshInput = new Falcon.Controls.FlightInput(isEngineOn: true);
+            freshInput.Throttle = isAirStart ? 0.8f : 0f;
+            freshInput.AreFlapsRequested = !isAirStart;
+            playerInput.FlightInput = freshInput;
+
+            Log.Info(Tag, $"PlayerInput reset (airStart={isAirStart}) — eject latch cleared");
+        }
+
+        // ── Multiplayer pause menu (Esc) ────────────────────────────────────
+
+        /// <summary>
+        /// Register Esc/menu keys to open the native pause menu during a
+        /// multiplayer flight. Mirrors the registration that the bypassed
+        /// native StartFlight() would normally perform (actions 57 OpenMenu
+        /// and 126 EscapeMenu).
+        /// </summary>
+        private void RegisterPauseMenuInput()
+        {
+            UnregisterPauseMenuInput();
+            _pauseMenuInput = new Falcon.RewiredInputActionList();
+            _pauseMenuInput.RegisterButtonJustPressed(_ => TryOpenPauseMenu(), 57);
+            _pauseMenuInput.RegisterButtonJustPressed(_ => TryOpenPauseMenu(), 126);
+            Log.Info(Tag, "Pause menu input registered (Esc)");
+        }
+
+        private void UnregisterPauseMenuInput()
+        {
+            _pauseMenuInput?.UnregisterAllActions();
+            _pauseMenuInput = null;
+            _mpPauseMenuOpen = false;
+        }
+
+        private void TryOpenPauseMenu()
+        {
+            if (_mpPauseMenuOpen) return;
+
+            var state = _activeSession?.StateMachine.CurrentState;
+            if (state != GameState.InGame && state != GameState.Respawning) return;
+
+            var flightGame = Falcon.Game2.FlightGame.Instance;
+            if (flightGame == null || flightGame.PauseMenu == null) return;
+
+            ShowMultiplayerPauseMenu(flightGame).Forget();
+        }
+
+        /// <summary>
+        /// Open the native pause menu without pausing the simulation
+        /// (GamePausePatch suppresses the time freeze). SortieEndPatch routes
+        /// the finish button: host → return-to-lobby broadcast for everyone,
+        /// client → disconnect self.
+        /// </summary>
+        private async UniTaskVoid ShowMultiplayerPauseMenu(Falcon.Game2.FlightGame flightGame)
+        {
+            _mpPauseMenuOpen = true;
+            try
+            {
+                if (flightGame.PlayerInput != null)
+                    flightGame.PlayerInput.IsInputBlockedFromGame = true;
+                TinyCursor.LockState = CursorLockMode.None;
+
+                string exitText = _activeSession?.IsHost == true ? "Return To Lobby" : "Leave Session";
+                var result = await flightGame.PauseMenu.ShowPauseMenu(exitText, true);
+
+                if (result == Falcon.Game2.UI.PauseMenu.Result.PhotoMode)
+                    flightGame.Cameras?.StartPhotoMode();
+
+                if (flightGame.PlayerInput != null)
+                    flightGame.PlayerInput.IsInputBlockedFromGame = false;
+
+                // Only re-lock the cursor in normal flight; the respawn screen
+                // and lobby UI manage the cursor themselves.
+                if (_activeSession?.StateMachine.CurrentState == GameState.InGame)
+                    TinyCursor.LockState = CursorLockMode.Locked;
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"Pause menu failed: {ex.Message}");
+                var fg = Falcon.Game2.FlightGame.Instance;
+                if (fg != null && fg.PlayerInput != null)
+                    fg.PlayerInput.IsInputBlockedFromGame = false;
+            }
+            finally
+            {
+                _mpPauseMenuOpen = false;
             }
         }
 
@@ -1169,6 +1292,9 @@ namespace TCAMultiplayer
             SortieEndPatch.IsMultiplayerSession = null;
             SortieEndPatch.IsHost = null;
             SortieEndPatch.OnRequestReturnToLobby = null;
+            SortieEndPatch.OnRequestLeaveSession = null;
+            GamePausePatch.IsMultiplayerSession = null;
+            UnregisterPauseMenuInput();
             EnvironmentPatch.IsMultiplayerSession = null;
             EnvironmentPatch.GetDeterministicSeed = null;
             FireControlPatch.IsRemote = null;

@@ -9,8 +9,10 @@ using TCAMultiplayer.Core;
 namespace TCAMultiplayer.Patches
 {
     /// <summary>
-    /// Intercepts sortie-end actions so only the host can end the mission in MP.
-    /// Clients see the button hidden; host triggers return-to-lobby.
+    /// Intercepts sortie-end actions in MP. In the pause menu the host's
+    /// finish button returns everyone to the lobby, while a client's finish
+    /// button disconnects just them. In the rearm dialog only the host may
+    /// end the sortie; clients see that button hidden.
     /// </summary>
     [HarmonyPatch]
     internal static class SortieEndPatch
@@ -23,6 +25,9 @@ namespace TCAMultiplayer.Patches
 
         /// <summary>Called when the host confirms returning to lobby. Arg = source name.</summary>
         public static Action<string> OnRequestReturnToLobby;
+
+        /// <summary>Called when a client confirms leaving the session. Arg = source name.</summary>
+        public static Action<string> OnRequestLeaveSession;
 
         private static readonly FieldInfo PauseFinishBtn =
             AccessTools.Field(typeof(PauseMenu), "FinishMissionButton");
@@ -51,7 +56,9 @@ namespace TCAMultiplayer.Patches
             PauseMenu menu, UniTask<PauseMenu.Result> original)
         {
             bool host = IsHost?.Invoke() ?? false;
-            SetButtonActive(PauseFinishBtn, menu, host);
+            // Both roles get an exit action: host ends the sortie for everyone
+            // (return to lobby), a client disconnects only themselves.
+            SetButtonActive(PauseFinishBtn, menu, true);
 
             var result = await original;
             if (result != PauseMenu.Result.FinishMission) return result;
@@ -59,7 +66,7 @@ namespace TCAMultiplayer.Patches
             if (host)
                 OnRequestReturnToLobby?.Invoke("PauseMenu");
             else
-                Log.Info("SORTIE", "Client blocked from ending sortie (pause menu)");
+                OnRequestLeaveSession?.Invoke("PauseMenu");
 
             return PauseMenu.Result.Resume;
         }

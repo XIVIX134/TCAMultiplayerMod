@@ -188,14 +188,16 @@ namespace TCAMultiplayer.Game
             }
 
             string aircraftType = player.SelectedAircraft ?? "F-16C";
-            Log.Info(Tag, $"Host approving respawn: peer {peerId} ({aircraftType}) oldLife={player.LifeId}");
+            string loadoutName = player.SelectedLoadout ?? "";
+            Log.Info(Tag, $"Host approving respawn: peer {peerId} ({aircraftType} / {loadoutName}) oldLife={player.LifeId}");
 
             // Broadcast Respawned(51) to all peers
             var respawnedPacket = new AircraftChangedPacket
             {
                 PlayerId = peerId,
                 AircraftType = aircraftType,
-                IsAlive = true
+                IsAlive = true,
+                LoadoutName = loadoutName
             };
 
             var payload = PacketSerializer.SerializeAircraftChanged(respawnedPacket);
@@ -203,7 +205,7 @@ namespace TCAMultiplayer.Game
             _connection.BroadcastReliable(frame);
 
             // Host processes the respawn locally as well
-            HandleRespawned(peerId, aircraftType);
+            HandleRespawned(peerId, aircraftType, loadoutName);
         }
 
         // ── Inbound: All peers receive Respawned ────────────────────
@@ -225,7 +227,7 @@ namespace TCAMultiplayer.Game
                 Log.Warning(Tag, $"Client sent Respawned from {fromPeerId}, ignoring");
                 return;
             }
-            HandleRespawned(packet.PlayerId, packet.AircraftType);
+            HandleRespawned(packet.PlayerId, packet.AircraftType, packet.LoadoutName);
         }
 
         /// <summary>
@@ -233,12 +235,22 @@ namespace TCAMultiplayer.Game
         /// Remote peers: clean up old clone via RemoteAircraftManager.
         /// Local peer: transition back through Spawning → InGame.
         /// </summary>
-        private void HandleRespawned(ulong peerId, string aircraftType)
+        private void HandleRespawned(ulong peerId, string aircraftType, string loadoutName = null)
         {
             Log.Info(Tag, $"Peer {peerId} respawned with {aircraftType}");
 
             var player = _session.GetPlayer(peerId);
             uint lifeId = player != null ? _session.BeginPlayerLife(peerId) : 0;
+
+            // Adopt the respawn selection so every peer's player info matches
+            // (clone spawning reads SelectedAircraft/SelectedLoadout from here)
+            if (player != null)
+            {
+                if (!string.IsNullOrEmpty(aircraftType))
+                    player.SelectedAircraft = aircraftType;
+                if (!string.IsNullOrEmpty(loadoutName))
+                    player.SelectedLoadout = loadoutName;
+            }
 
             if (peerId == _session.LocalPeerId)
             {

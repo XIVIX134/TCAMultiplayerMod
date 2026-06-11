@@ -101,9 +101,10 @@ namespace TCAMultiplayer.Sync
         private static PropertyInfo _fiPitchProp, _fiRollProp, _fiYawProp;
         private object _dummyFlightInput;
 
-        private static Type _swingWingsType;
-        private static MethodInfo _swInitMethod, _swUpdateMethod;
-        private object _swingWingsComponent;
+        private SwingWings _swingWings;
+        private readonly List<Falcon.Vehicles.SpinningPart> _spinningParts =
+            new List<Falcon.Vehicles.SpinningPart>();
+        private bool _lightsOn = true; // native default after aircraft init
 
         private const float GearDebounceSeconds = 0.4f;
         private bool _hasAppliedGearState;
@@ -741,16 +742,27 @@ namespace TCAMultiplayer.Sync
 
         private void ApplyFlags(byte flags)
         {
-            // Bit 0:Afterburner 1:GearDown 2:FlapsDown 3:IsFiring 4:Flare 5:Chaff
+            // Bit 0:Afterburner 1:GearDown 2:FlapsDown 3:IsFiring 4:Flare 5:Chaff 6:NavMode 7:WoW
             bool ab = (flags & (1 << 0)) != 0 && HasAfterburner();
             bool gearDown  = (flags & (1 << 1)) != 0;
             _flapsDown     = (flags & (1 << 2)) != 0;
             _isFiring      = (flags & (1 << 3)) != 0;
             _isFlareFiring = (flags & (1 << 4)) != 0;
             _isChaffFiring = (flags & (1 << 5)) != 0;
+            bool navMode   = (flags & (1 << 6)) != 0;
             _isWeightOnWheels = (flags & (1 << 7)) != 0;
 
             if (ab != _afterburnerActive) { _afterburnerActive = ab; SetAfterburnerState(ab); }
+
+            // Formation lights follow nav mode natively (FireControl.OnNavMode →
+            // SetLightsOn), but a clone never changes mode so its lights stayed
+            // stuck on. Mirror the owner's synced nav-mode state instead.
+            if (navMode != _lightsOn)
+            {
+                _lightsOn = navMode;
+                try { _aircraft?.SetLightsOn(navMode); }
+                catch { }
+            }
 
             // First flags packet: adopt the gear state directly — it's the initial
             // state, not a change, and must not be debounced (or the clone would
@@ -1208,10 +1220,15 @@ namespace TCAMultiplayer.Sync
                 }
             }
 
-            if (_swingWingsComponent != null && _swUpdateMethod != null)
+            _swingWings?.UpdateAutoSpeed(Time.deltaTime, _speedKIAS);
+
+            // Clone engines are always running, so spin props/rotors continuously
+            // (native gates on the main engine, which UniAircraft.Update would do)
+            for (int i = 0; i < _spinningParts.Count; i++)
             {
-                try { _swUpdateMethod.Invoke(_swingWingsComponent, new object[] { Time.deltaTime, _speedKIAS }); }
-                catch { }
+                var part = _spinningParts[i];
+                if (part != null && part.Part != null)
+                    part.Spin(Time.deltaTime);
             }
         }
 
@@ -1311,13 +1328,6 @@ namespace TCAMultiplayer.Sync
             if (_animPartType != null)
                 _animPartUpdateAuto = _animPartType.GetMethod("UpdateAutomatic", f);
 
-            _swingWingsType = Type.GetType("Falcon.UniversalAircraft.SwingWings, Assembly-CSharp");
-            if (_swingWingsType != null)
-            {
-                _swInitMethod = _swingWingsType.GetMethod("InitializeWithData", f);
-                _swUpdateMethod = _swingWingsType.GetMethod("UpdateAutoSpeed", f);
-            }
-
             _flightInputType = Type.GetType("Falcon.Controls.FlightInput, Assembly-CSharp");
             if (_flightInputType != null)
             {
@@ -1335,7 +1345,7 @@ namespace TCAMultiplayer.Sync
             }
 
             Log.Debug(Tag, $"Reflection: EFX={_engineFXType != null} Anim={_animPartType != null} " +
-                $"SW={_swingWingsType != null} FI={_flightInputType != null}");
+                $"FI={_flightInputType != null}");
         }
 
         private void FindEngineFXComponents()
@@ -1410,37 +1420,43 @@ namespace TCAMultiplayer.Sync
                 }
             }
 
-            // SwingWings
-            if (_swingWingsType != null && _swInitMethod != null)
+            // SwingWings — direct API. (The old reflection lookup used
+            // GetField("HasSwingWings"), but that's a property, so it always
+            // returned null and swing wings silently never initialized.)
+            var ac = _aircraft != null ? _aircraft : GetComponentInParent<UniAircraft>();
+            var swProps = ac != null && ac.Data != null ? ac.Data.SwingWings : null;
+            if (swProps != null && swProps.HasSwingWings)
             {
-                if (data == null && parentAc != null)
-                    data = typeof(UniAircraft).GetField("Data", f)?.GetValue(parentAc);
-
-                if (data != null)
+                try
                 {
-                    var swField = data.GetType().GetField("SwingWings", BindingFlags.Public | BindingFlags.Instance);
-                    var swData = swField?.GetValue(data);
-                    var hasField = swData?.GetType().GetField("HasSwingWings");
-                    bool hasSW = hasField != null && (bool)hasField.GetValue(swData);
-
-                    if (hasSW)
-                    {
-                        try
-                        {
-                            _swingWingsComponent = Activator.CreateInstance(_swingWingsType);
-                            if (tDict == null) tDict = BuildTransformDict();
-                            _swInitMethod.Invoke(_swingWingsComponent, new object[] { swData, tDict });
-                        }
-                        catch (Exception ex)
-                        {
-                            _swingWingsComponent = null;
-                            Log.Warning(Tag, $"SwingWings init: {ex.Message}");
-                        }
-                    }
+                    if (tDict == null) tDict = BuildTransformDict();
+                    var sw = new SwingWings();
+                    sw.InitializeWithData(swProps, tDict);
+                    _swingWings = sw;
+                }
+                catch (Exception ex)
+                {
+                    _swingWings = null;
+                    Log.Warning(Tag, $"SwingWings init: {ex.Message}");
                 }
             }
 
-            Log.Debug(Tag, $"Anim: {_animatedParts.Count} parts, Gear={_aircraft?.LandingGear != null}, SW={_swingWingsComponent != null}");
+            // Spinners (props/rotors) — UniAircraft.Update normally drives these,
+            // but it's disabled on clones, so rebuild and spin them ourselves.
+            var spinners = ac != null && ac.Data != null ? ac.Data.Spinners : null;
+            if (spinners != null && spinners.Count > 0)
+            {
+                if (tDict == null) tDict = BuildTransformDict();
+                foreach (var spinner in spinners)
+                {
+                    if (spinner == null || string.IsNullOrEmpty(spinner.PartName)) continue;
+                    if (tDict.TryGetValue(spinner.PartName, out var part) && part != null)
+                        _spinningParts.Add(new Falcon.Vehicles.SpinningPart(part, spinner.SpinSpeedVector));
+                }
+            }
+
+            Log.Info(Tag, $"Anim: {_animatedParts.Count} parts, Gear={_aircraft?.LandingGear != null}, " +
+                          $"SW={_swingWings != null}, Spinners={_spinningParts.Count}");
         }
 
         private void LogVisualDiagnostics()
@@ -1476,7 +1492,8 @@ namespace TCAMultiplayer.Sync
 
             _countermeasures = null;
             _dummyFlightInput = null;
-            _swingWingsComponent = null;
+            _swingWings = null;
+            _spinningParts.Clear();
             _animatedParts.Clear();
             _engineFXComponents.Clear();
             _startedEngineFX.Clear();

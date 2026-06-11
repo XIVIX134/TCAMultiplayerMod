@@ -437,6 +437,19 @@ namespace TCAMultiplayer.Protocol
         public double HitPosY;
         public double HitPosZ;
         public string WeaponName;
+        public string HitPartName;  // damageable part hit on the shooter's clone
+                                    // (backward-compat trailing field; may be empty)
+    }
+
+    /// <summary>
+    /// Part destruction packet — broadcast by the victim when one of their
+    /// damageable parts (wing, stabilizer, engine cowl, ...) breaks off, so
+    /// every peer can shear the same part off their clone.
+    /// </summary>
+    public struct PartDestroyedPacket
+    {
+        public ulong VictimId;
+        public string PartName;
     }
 
     /// <summary>
@@ -523,6 +536,7 @@ namespace TCAMultiplayer.Protocol
         public ulong PlayerId;
         public string AircraftType; // e.g. "F-16", "AV-8B"
         public bool IsAlive;
+        public string LoadoutName;  // backward-compat trailing field (may be empty)
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -554,6 +568,21 @@ namespace TCAMultiplayer.Protocol
     /// </summary>
     public struct AircraftDestructionVfxPacket
     {
+        /// <summary>
+        /// DestructionReason value meaning the pilots ejected. The native
+        /// UniAircraft.DestructionReason enum tops out at Water = 3; receivers
+        /// that predate this value clamp it back into the native range.
+        /// </summary>
+        public const byte ReasonPilotsEjected = 4;
+
+        /// <summary>
+        /// DestructionReason value meaning the victim's aircraft entered the
+        /// critical burn phase but has not exploded yet (native HP not at 0):
+        /// clones should burn and fall, not detonate. Reasons 0-3 mean the
+        /// aircraft fully exploded with that native reason.
+        /// </summary>
+        public const byte ReasonCriticalBurning = 5;
+
         public ulong VictimId;
         public double PosX;
         public double PosY;
@@ -562,6 +591,9 @@ namespace TCAMultiplayer.Protocol
         public float RotY;
         public float RotZ;
         public float RotW;
-        public byte DestructionReason;  // 0 = Air, 1 = GroundSoft, 2 = GroundHard, 3 = Water
+        public byte DestructionReason;  // 0 = Air, 1 = GroundSoft, 2 = GroundHard, 3 = Water, 4 = PilotsEjected
+        public float VelX;              // world-space velocity at death so the wreck/husk
+        public float VelY;              // keeps moving on remote screens
+        public float VelZ;              // (backward-compatible trailing fields)
     }
 }

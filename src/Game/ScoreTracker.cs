@@ -47,6 +47,7 @@ namespace TCAMultiplayer.Game
 
             _router.Register(PacketType.DeathReport, HandleDeathReportRaw);
             _router.Register(PacketType.ScoreEvent, HandleScoreEventRaw);
+            _session.OnPlayerLeft += HandlePlayerLeft;
             Log.Info(Tag, "Initialized");
         }
 
@@ -161,6 +162,30 @@ namespace TCAMultiplayer.Game
             if (_killFeed.Count > MaxKillFeedEntries)
                 _killFeed.RemoveAt(0);
             OnKillFeedUpdated?.Invoke(entry);
+        }
+
+        /// <summary>
+        /// Add a plain informational line (join/leave etc.) to the kill feed.
+        /// </summary>
+        public void RecordSystemMessage(string message)
+        {
+            if (_disposed || string.IsNullOrEmpty(message)) return;
+
+            AddKillFeedEntry(new KillFeedEntry
+            {
+                IsSystemMessage = true,
+                Message = message,
+                Timestamp = _timeProvider()
+            });
+            Log.Info(Tag, $"Feed message: {message}");
+        }
+
+        private void HandlePlayerLeft(PlayerInfo player)
+        {
+            if (_disposed || player == null) return;
+            if (player.PeerId == _session.LocalPeerId) return;
+
+            RecordSystemMessage($"{player.PlayerName ?? $"Player_{player.PeerId}"} left the session");
         }
 
         private void ReplaceUncreditedDeathFeedEntry(KillFeedEntry entry)
@@ -684,6 +709,7 @@ namespace TCAMultiplayer.Game
 
             _router.Unregister(PacketType.DeathReport, HandleDeathReportRaw);
             _router.Unregister(PacketType.ScoreEvent, HandleScoreEventRaw);
+            _session.OnPlayerLeft -= HandlePlayerLeft;
 
             OnKillFeedUpdated = null;
             OnScoresChanged = null;
@@ -753,5 +779,7 @@ namespace TCAMultiplayer.Game
         public string VictimName;
         public string WeaponName;
         public float Timestamp;
+        public bool IsSystemMessage;    // renders Message as a plain feed line
+        public string Message;
     }
 }

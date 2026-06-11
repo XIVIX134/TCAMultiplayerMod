@@ -25,6 +25,13 @@ namespace TCAMultiplayer.Game
 
         public event Action OnLobbyStateChanged;
         public event Action<string> OnGameStarting;
+
+        /// <summary>
+        /// True while we sit in the lobby but the host's game is already
+        /// running (late join). Cleared by the next lobby-state broadcast
+        /// after the host returns to the lobby.
+        /// </summary>
+        public bool HostGameInProgress { get; private set; }
         public event Action OnAllPlayersLoaded;
 
         public LobbyManager(GameSession session, ConnectionManager connection, PacketRouter router)
@@ -238,10 +245,12 @@ namespace TCAMultiplayer.Game
 
         public void SetAircraft(string name)
         {
-            if (!CanChangeLobbySelection(nameof(SetAircraft))) return;
+            // Allowed in lobby and during gameplay (the respawn screen lets a
+            // dead player pick a different aircraft for their next life)
+            if (!CanChangeAircraftSelection(nameof(SetAircraft))) return;
             var local = _session.GetLocalPlayer(); if (local == null) return;
             bool changed = !string.Equals(local.SelectedAircraft, name, StringComparison.Ordinal);
-            if (changed)
+            if (changed && IsInLobbyState())
                 ClearReadyForSelectionChange(local, notifyIfLocal: true);
             local.SelectedAircraft = name;
             PersistAircraft(name);
@@ -266,10 +275,10 @@ namespace TCAMultiplayer.Game
 
         public void SetLoadout(string name)
         {
-            if (!CanChangeLobbySelection(nameof(SetLoadout))) return;
+            if (!CanChangeAircraftSelection(nameof(SetLoadout))) return;
             var local = _session.GetLocalPlayer(); if (local == null) return;
             bool changed = !string.Equals(local.SelectedLoadout, name, StringComparison.Ordinal);
-            if (changed)
+            if (changed && IsInLobbyState())
                 ClearReadyForSelectionChange(local, notifyIfLocal: true);
             local.SelectedLoadout = name;
             PersistLoadout(name);
@@ -336,6 +345,10 @@ namespace TCAMultiplayer.Game
                 return;
             }
 
+            // Late join: the host's game may already be running — surface that
+            // to the lobby UI so the waiting client knows why nothing happens.
+            HostGameInProgress = pkt.GameStarted || pkt.GameLoading;
+
             _session.HostName = pkt.HostName;
             _session.MapName = pkt.MapName;
             _session.SpawnType = FromWire(pkt.SpawnType);
@@ -376,7 +389,11 @@ namespace TCAMultiplayer.Game
         private void HandlePlayerJoinedRaw(ulong from, byte[] data)
         {
             if (_disposed) return;
-            if (!CanApplyLobbyMutation(from, "LobbyPlayerJoined")) return;
+            // The host also accepts joins while a game is running: the late
+            // joiner is registered in the roster and waits in the lobby until
+            // the host returns to it (no mid-game spawn yet).
+            bool lateJoinAsHost = _session.IsHost && IsGameplayState();
+            if (!lateJoinAsHost && !CanApplyLobbyMutation(from, "LobbyPlayerJoined")) return;
             var (_, p) = PacketSerializer.Deserialize(data); if (p == null) return;
             var pkt = PacketSerializer.DeserializeLobbyPlayerJoined(p);
             if (!CanPeerMutatePlayer(from, pkt.PeerId, "LobbyPlayerJoined")) return;
@@ -384,7 +401,7 @@ namespace TCAMultiplayer.Game
             ClampTeamStateForCurrentPlayers();
             OnLobbyStateChanged?.Invoke();
             if (_session.IsHost) BroadcastLobbyState();
-            Log.Info(Tag, $"Player joined: {pkt.PlayerName} ({pkt.PeerId})");
+            Log.Info(Tag, $"Player joined: {pkt.PlayerName} ({pkt.PeerId}){(lateJoinAsHost ? " (waiting in lobby — game in progress)" : "")}");
         }
         private void HandlePlayerLeftRaw(ulong from, byte[] data)
         {
@@ -444,26 +461,27 @@ namespace TCAMultiplayer.Game
         private void HandleAircraftSelectRaw(ulong from, byte[] data)
         {
             if (_disposed) return;
-            if (!CanApplyLobbyMutation(from, "AircraftSelect")) return;
+            if (!CanApplySelectionMutation(from, "AircraftSelect")) return;
             var (_, p) = PacketSerializer.Deserialize(data); if (p == null) return;
             var pkt = PacketSerializer.DeserializeLobbyAircraftSelect(p);
             if (!CanPeerMutatePlayer(from, pkt.PeerId, "AircraftSelect")) return;
             var pi = _session.GetPlayer(pkt.PeerId);
             if (pi != null) pi.SelectedAircraft = pkt.AircraftName;
             OnLobbyStateChanged?.Invoke();
-            if (_session.IsHost) BroadcastLobbyState();
+            // Mid-game, peers learn the new selection from the Respawned packet
+            if (_session.IsHost && IsCurrentState(GameState.HostingLobby)) BroadcastLobbyState();
         }
         private void HandleLoadoutSelectRaw(ulong from, byte[] data)
         {
             if (_disposed) return;
-            if (!CanApplyLobbyMutation(from, "LoadoutSelect")) return;
+            if (!CanApplySelectionMutation(from, "LoadoutSelect")) return;
             var (_, p) = PacketSerializer.Deserialize(data); if (p == null) return;
             var pkt = PacketSerializer.DeserializeLobbyLoadoutSelect(p);
             if (!CanPeerMutatePlayer(from, pkt.PeerId, "LoadoutSelect")) return;
             var pi = _session.GetPlayer(pkt.PeerId);
             if (pi != null) pi.SelectedLoadout = pkt.LoadoutName;
             OnLobbyStateChanged?.Invoke();
-            if (_session.IsHost) BroadcastLobbyState();
+            if (_session.IsHost && IsCurrentState(GameState.HostingLobby)) BroadcastLobbyState();
         }
         private void HandleSpawnSettingsRaw(ulong from, byte[] data)
         {
@@ -642,6 +660,43 @@ namespace TCAMultiplayer.Game
                 return true;
 
             Log.Warning(Tag, $"Ignored {actionName} while state={_session.StateMachine.CurrentState}");
+            return false;
+        }
+
+        /// <summary>
+        /// Aircraft/loadout selection is also legal during gameplay — it only
+        /// changes what the player's NEXT life spawns with (respawn screen).
+        /// </summary>
+        private bool CanChangeAircraftSelection(string actionName)
+        {
+            if (IsInLobbyState() || IsGameplayState())
+                return true;
+
+            Log.Warning(Tag, $"Ignored {actionName} while state={_session.StateMachine.CurrentState}");
+            return false;
+        }
+
+        /// <summary>
+        /// Receive-side gate for aircraft/loadout selection packets — accepted
+        /// in lobby and during gameplay (selection for the sender's next life).
+        /// </summary>
+        private bool CanApplySelectionMutation(ulong fromPeerId, string packetName)
+        {
+            if (_session.IsHost)
+            {
+                if (IsCurrentState(GameState.HostingLobby) || IsGameplayState())
+                    return true;
+
+                Log.Warning(Tag, $"Ignored {packetName} from peer {fromPeerId} while state={_session.StateMachine.CurrentState}");
+                return false;
+            }
+
+            if (!IsFromHost(fromPeerId, packetName))
+                return false;
+            if (IsCurrentState(GameState.ClientLobby) || IsGameplayState())
+                return true;
+
+            Log.Warning(Tag, $"Ignored {packetName} from host while state={_session.StateMachine.CurrentState}");
             return false;
         }
 

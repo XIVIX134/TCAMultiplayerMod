@@ -221,12 +221,15 @@ namespace TCAMultiplayer.Sync
         }
 
         /// <summary>
-        /// Start the native critical-damage death sequence on the remote clone.
-        /// Native aircraft do not gib immediately when OnAircraftDestroyed fires;
-        /// they enter critical HP, shed parts/burn, then Damage.OnDestroyed calls
-        /// DestroyAircraft() for the final explosion and cleanup.
+        /// Play a peer's death on their remote clone. For destruction deaths this
+        /// starts the native critical-damage sequence (critical HP, shed parts,
+        /// burn, then Damage.OnDestroyed explodes and cleans up). For ejection
+        /// deaths (<see cref="AircraftDestructionVfxPacket.ReasonPilotsEjected"/>)
+        /// the clone's pilots eject with parachutes and the pilotless husk keeps
+        /// flying until it crashes or the peer respawns.
         /// </summary>
-        public void PlayPeerDeath(ulong peerId, Vector3 localPosition, Quaternion rotation, byte destructionReason)
+        public void PlayPeerDeath(ulong peerId, Vector3 localPosition, Quaternion rotation, byte destructionReason,
+            Vector3 velocity = default(Vector3))
         {
             if (!_peers.TryGetValue(peerId, out var peer))
             {
@@ -266,14 +269,36 @@ namespace TCAMultiplayer.Sync
                 if (rb != null)
                 {
                     rb.isKinematic = false;
-                    rb.useGravity = false;
                     rb.position = localPosition;
                     rb.rotation = rotation;
+                    rb.velocity = velocity; // gibs and wrecks inherit this momentum
                 }
 
-                SetDestroyedBy(aircraft, destructionReason);
-                StartNativeCriticalDeath(aircraft);
-                Log.Info(Tag, $"Started native death sequence for peer {peerId} reason={destructionReason}");
+                if (destructionReason == AircraftDestructionVfxPacket.ReasonPilotsEjected)
+                {
+                    ReturnWreckToNativePhysics(aircraft);
+                    StartRemoteEjection(aircraft);
+                    Log.Info(Tag, $"Started ejection sequence for peer {peerId}");
+                }
+                else if (destructionReason == AircraftDestructionVfxPacket.ReasonCriticalBurning)
+                {
+                    // Victim is in the critical burn phase: wreck burns and falls
+                    // under the native flight model until it impacts.
+                    ReturnWreckToNativePhysics(aircraft);
+                    StartNativeCriticalDeath(aircraft);
+                    Log.Info(Tag, $"Started critical burn sequence for peer {peerId}");
+                }
+                else
+                {
+                    // Victim's aircraft fully exploded (HP hit 0). Run the exact
+                    // native death: DestroyAircraft() gibs the airframe with
+                    // explosion force, spawns the air/ground/water explosion for
+                    // the reason, and removes the object — same as on the
+                    // victim's own screen.
+                    SetDestroyedBy(aircraft, destructionReason);
+                    aircraft.DestroyAircraft();
+                    Log.Info(Tag, $"Exploded clone of peer {peerId} natively (reason={destructionReason})");
+                }
             }
             catch (Exception ex)
             {
@@ -398,6 +423,39 @@ namespace TCAMultiplayer.Sync
             {
                 Log.Warning(Tag, $"Could not set destroyedBy: {ex.Message}");
             }
+        }
+
+        /// <summary>
+        /// Hand a dead clone back to the native flight model. UniAircraft is
+        /// disabled on live clones (the network controller drives them), but the
+        /// controller is gone at death — re-enabling gives the wreck real
+        /// aero/gravity physics so it falls and crashes exactly like a local
+        /// dying aircraft. The AI pilot is bypassed and the engine cut so
+        /// nothing flies it; an ejection husk glides pilotless natively.
+        /// </summary>
+        private static void ReturnWreckToNativePhysics(UniAircraft aircraft)
+        {
+            aircraft.IsPilotBypassed = true;
+            aircraft.FlightControls = new Falcon.Controls.FlightInput(isEngineOn: false);
+            aircraft.enabled = true;
+        }
+
+        /// <summary>
+        /// Play a pilot ejection on a remote clone: canopy and pilots pop with
+        /// parachutes, and the pilotless airframe keeps flying. EjectPilots marks
+        /// the clone destroyed itself (no mod systems listen to clone destroyed
+        /// events); the husk is removed by DespawnPeer when the peer respawns,
+        /// or by the native crash when it hits the ground.
+        /// </summary>
+        private static void StartRemoteEjection(UniAircraft aircraft)
+        {
+            if (aircraft == null)
+                return;
+
+            if (aircraft.Target != null)
+                aircraft.Target.IsDestroyed = true;
+
+            aircraft.EjectPilots().Forget();
         }
 
         private void StartNativeCriticalDeath(UniAircraft aircraft)

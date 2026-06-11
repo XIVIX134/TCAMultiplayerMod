@@ -27,8 +27,10 @@ namespace TCAMultiplayer.UI
         private GameObject _contentRoot;
         private TextMeshProUGUI _scoreText;
         private Button _respawnButton;
+        private Button _aircraftButton;
 
         private bool _active;
+        private bool _selectorOpen;
 
         // ── Initialization ──────────────────────────────────────────
 
@@ -79,6 +81,8 @@ namespace TCAMultiplayer.UI
                 _contentRoot = null;
                 _scoreText = null;
                 _respawnButton = null;
+                _aircraftButton = null;
+                _selectorOpen = false;
 
                 // Re-lock cursor for flight mode
                 Cursor.lockState = CursorLockMode.Locked;
@@ -139,11 +143,68 @@ namespace TCAMultiplayer.UI
 
         private void DoRespawn()
         {
+            if (_selectorOpen) return;
             if (_respawnButton != null && !_respawnButton.interactable) return;
 
             Log.Info(Tag, "Respawn requested");
             _respawnManager?.RequestRespawn();
             Hide();
+        }
+
+        // ── Aircraft / Loadout Selection ────────────────────────────
+
+        private static string GetAircraftButtonText(string aircraft, string loadout)
+        {
+            if (string.IsNullOrEmpty(aircraft)) aircraft = "F-16C";
+            if (string.IsNullOrEmpty(loadout)) loadout = "Clean";
+            return $"CHANGE AIRCRAFT > {aircraft} - {loadout}";
+        }
+
+        private void OpenAircraftSelector()
+        {
+            if (_selectorOpen) return;
+
+            var local = _session?.GetLocalPlayer();
+            string curAircraft = local?.SelectedAircraft ?? ModConfig.LastAircraft?.Value ?? "F-16C";
+            string curLoadout = local?.SelectedLoadout ?? ModConfig.LastLoadout?.Value ?? "Clean";
+            var aircraftNames = LoadoutHelper.GetAircraftNames();
+            if (aircraftNames == null || aircraftNames.Count == 0)
+            {
+                Log.Warning(Tag, "No aircraft names available for selector");
+                return;
+            }
+
+            // Hide the respawn overlay while the native selector is up so the
+            // dialog isn't buried under this canvas (sortingOrder 1000)
+            _selectorOpen = true;
+            _canvas?.SetActive(false);
+
+            UIFactory.ShowNativeLoadoutSelector(curAircraft, aircraftNames, curLoadout, "",
+                (aircraft, loadout, ammoBelt) =>
+                {
+                    _selectorOpen = false;
+                    if (_canvas != null && _active) _canvas.SetActive(true);
+
+                    if (!string.IsNullOrEmpty(aircraft))
+                    {
+                        _lobby?.SetAircraft(aircraft);
+                        if (ModConfig.LastAircraft != null) ModConfig.LastAircraft.Value = aircraft;
+                    }
+                    if (!string.IsNullOrEmpty(loadout))
+                    {
+                        _lobby?.SetLoadout(loadout);
+                        if (ModConfig.LastLoadout != null) ModConfig.LastLoadout.Value = loadout;
+                    }
+
+                    var pl = _session?.GetLocalPlayer();
+                    if (_aircraftButton != null)
+                    {
+                        var label = _aircraftButton.GetComponentInChildren<TextMeshProUGUI>();
+                        if (label != null)
+                            label.text = GetAircraftButtonText(pl?.SelectedAircraft, pl?.SelectedLoadout);
+                    }
+                    Log.Info(Tag, $"Next-life selection: {pl?.SelectedAircraft} / {pl?.SelectedLoadout}");
+                });
         }
 
         private void EnableRespawnButton()
@@ -231,6 +292,16 @@ namespace TCAMultiplayer.UI
 
             // Spacer
             CreateSpacer(_contentRoot.transform, 16);
+
+            // Aircraft / loadout for the next life (native selector dialog)
+            var local2 = _session?.GetLocalPlayer();
+            _aircraftButton = UIFactory.CreateNativeButton(
+                GetAircraftButtonText(local2?.SelectedAircraft, local2?.SelectedLoadout),
+                _contentRoot.transform, 40);
+            if (_aircraftButton != null)
+                _aircraftButton.onClick.AddListener(OpenAircraftSelector);
+
+            CreateSpacer(_contentRoot.transform, 8);
 
             // Respawn button (big, green)
             _respawnButton = UIFactory.CreateNativeButton("RESPAWN >>>", _contentRoot.transform, 60);

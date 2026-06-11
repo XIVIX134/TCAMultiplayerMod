@@ -23,6 +23,7 @@ namespace TCAMultiplayer.Protocol
             PacketType.BuildingDestroy,
             PacketType.MissileUpdate,
             PacketType.DamageDealt,
+            PacketType.PartDestroyed,
             PacketType.AircraftChanged,
             PacketType.ExplosionSync,
             PacketType.AircraftDestructionVfx,

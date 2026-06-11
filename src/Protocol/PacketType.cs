@@ -75,6 +75,9 @@ namespace TCAMultiplayer.Protocol
         // ── Missile position sync (unreliable, high frequency) ───────
         MissilePositionSync = 80,    // Continuous missile position/velocity correction
 
+        // ── Part damage sync (reliable) ──────────────────────────────
+        PartDestroyed = 81,          // Victim broadcasts a damageable part breaking off
+
         // ── Utility ──────────────────────────────────────────────────
         Ping = 100,
         Pong = 101,

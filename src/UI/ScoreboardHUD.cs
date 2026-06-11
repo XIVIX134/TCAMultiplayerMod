@@ -515,7 +515,9 @@ namespace TCAMultiplayer.UI
                     uiEntry.Root.SetActive(alpha > 0.01f);
                     uiEntry.CanvasGroup.alpha = alpha;
                     uiEntry.Background.color = new Color(0f, 0f, 0f, 0.52f * alpha);
-                    uiEntry.Text.text = $"<color={Green}>{data.KillerName}</color> [{data.WeaponName}] <color={Green}>{data.VictimName}</color>";
+                    uiEntry.Text.text = data.IsSystemMessage
+                        ? $"<color={Green}>{data.Message}</color>"
+                        : $"<color={Green}>{data.KillerName}</color> [{data.WeaponName}] <color={Green}>{data.VictimName}</color>";
                 }
                 else
                 {

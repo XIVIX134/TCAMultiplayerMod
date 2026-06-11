@@ -460,7 +460,8 @@ namespace TCAMultiplayer.Tests
                 HitPosX = 1234.5678,
                 HitPosY = 2345.6789,
                 HitPosZ = 3456.7890,
-                WeaponName = "M61A1"
+                WeaponName = "M61A1",
+                HitPartName = "WingLeft"
             };
 
             byte[] data = PacketSerializer.SerializeDamage(original);
@@ -477,6 +478,48 @@ namespace TCAMultiplayer.Tests
             Assert.AreEqual(original.HitPosY, result.HitPosY, 0.0001);
             Assert.AreEqual(original.HitPosZ, result.HitPosZ, 0.0001);
             Assert.AreEqual(original.WeaponName, result.WeaponName);
+            Assert.AreEqual(original.HitPartName, result.HitPartName);
+        }
+
+        [Test]
+        public void Damage_LegacyPayloadWithoutPartName_Deserializes()
+        {
+            var original = new DamagePacket
+            {
+                VictimId = 10,
+                AttackerId = 20,
+                AttackerLifeId = 3,
+                DamageSequence = 77,
+                WeaponName = "M61A1",
+                HitPartName = "WingLeft"
+            };
+            byte[] full = PacketSerializer.SerializeDamage(original);
+
+            // Strip the trailing part-name string (1 length byte + 8 chars)
+            byte[] legacy = new byte[full.Length - 9];
+            System.Array.Copy(full, legacy, legacy.Length);
+
+            var result = PacketSerializer.DeserializeDamage(legacy);
+            Assert.AreEqual(10UL, result.VictimId);
+            Assert.AreEqual(3U, result.AttackerLifeId);
+            Assert.AreEqual(77U, result.DamageSequence);
+            Assert.IsTrue(string.IsNullOrEmpty(result.HitPartName));
+        }
+
+        [Test]
+        public void PartDestroyed_Roundtrip()
+        {
+            var original = new PartDestroyedPacket
+            {
+                VictimId = 42,
+                PartName = "StabilizerVertical"
+            };
+
+            byte[] data = PacketSerializer.SerializePartDestroyed(original);
+            var result = PacketSerializer.DeserializePartDestroyed(data);
+
+            Assert.AreEqual(original.VictimId, result.VictimId);
+            Assert.AreEqual(original.PartName, result.PartName);
         }
 
         [Test]
@@ -1195,7 +1238,8 @@ namespace TCAMultiplayer.Tests
             {
                 PlayerId = 42,
                 AircraftType = "F-16C",
-                IsAlive = true
+                IsAlive = true,
+                LoadoutName = "Air Superiority"
             };
 
             byte[] data = PacketSerializer.SerializeAircraftChanged(original);
@@ -1204,6 +1248,30 @@ namespace TCAMultiplayer.Tests
             Assert.AreEqual(original.PlayerId, result.PlayerId);
             Assert.AreEqual(original.AircraftType, result.AircraftType);
             Assert.AreEqual(original.IsAlive, result.IsAlive);
+            Assert.AreEqual(original.LoadoutName, result.LoadoutName);
+        }
+
+        [Test]
+        public void AircraftChanged_LegacyPayloadWithoutLoadout_Deserializes()
+        {
+            var original = new AircraftChangedPacket
+            {
+                PlayerId = 5,
+                AircraftType = "AV8B",
+                IsAlive = true,
+                LoadoutName = "Clean"
+            };
+            byte[] full = PacketSerializer.SerializeAircraftChanged(original);
+
+            // Strip the trailing loadout string (1 length byte + 5 chars)
+            byte[] legacy = new byte[full.Length - 6];
+            System.Array.Copy(full, legacy, legacy.Length);
+
+            var result = PacketSerializer.DeserializeAircraftChanged(legacy);
+            Assert.AreEqual(5UL, result.PlayerId);
+            Assert.AreEqual("AV8B", result.AircraftType);
+            Assert.IsTrue(result.IsAlive);
+            Assert.IsTrue(string.IsNullOrEmpty(result.LoadoutName));
         }
 
         [Test]
@@ -1214,7 +1282,8 @@ namespace TCAMultiplayer.Tests
                 VictimId = 99,
                 PosX = 1000.0, PosY = 0.0, PosZ = 2000.0,
                 RotX = 0f, RotY = 0.707f, RotZ = 0f, RotW = 0.707f,
-                DestructionReason = 2 // GroundHard
+                DestructionReason = 2, // GroundHard
+                VelX = 150f, VelY = -12.5f, VelZ = 88f
             };
 
             byte[] data = PacketSerializer.SerializeAircraftDestructionVfx(original);
@@ -1229,6 +1298,48 @@ namespace TCAMultiplayer.Tests
             Assert.AreEqual(original.RotZ, result.RotZ, 0.0001f);
             Assert.AreEqual(original.RotW, result.RotW, 0.0001f);
             Assert.AreEqual(original.DestructionReason, result.DestructionReason);
+            Assert.AreEqual(original.VelX, result.VelX, 0.0001f);
+            Assert.AreEqual(original.VelY, result.VelY, 0.0001f);
+            Assert.AreEqual(original.VelZ, result.VelZ, 0.0001f);
+        }
+
+        [Test]
+        public void AircraftDestructionVfx_EjectedReason_Roundtrips()
+        {
+            var original = new AircraftDestructionVfxPacket
+            {
+                VictimId = 7,
+                DestructionReason = AircraftDestructionVfxPacket.ReasonPilotsEjected
+            };
+
+            byte[] data = PacketSerializer.SerializeAircraftDestructionVfx(original);
+            var result = PacketSerializer.DeserializeAircraftDestructionVfx(data);
+
+            Assert.AreEqual(AircraftDestructionVfxPacket.ReasonPilotsEjected, result.DestructionReason);
+        }
+
+        [Test]
+        public void AircraftDestructionVfx_LegacyPayloadWithoutVelocity_Deserializes()
+        {
+            // Pre-velocity payload: VictimId(8) + Pos(24) + Rot(16) + Reason(1) = 49 bytes
+            var original = new AircraftDestructionVfxPacket
+            {
+                VictimId = 42,
+                PosX = 10.0, PosY = 20.0, PosZ = 30.0,
+                RotW = 1f,
+                DestructionReason = 1
+            };
+            byte[] full = PacketSerializer.SerializeAircraftDestructionVfx(original);
+            byte[] legacy = new byte[49];
+            System.Array.Copy(full, legacy, 49);
+
+            var result = PacketSerializer.DeserializeAircraftDestructionVfx(legacy);
+
+            Assert.AreEqual(42UL, result.VictimId);
+            Assert.AreEqual(1, result.DestructionReason);
+            Assert.AreEqual(0f, result.VelX);
+            Assert.AreEqual(0f, result.VelY);
+            Assert.AreEqual(0f, result.VelZ);
         }
 
         [Test]

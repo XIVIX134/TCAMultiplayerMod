@@ -32,6 +32,7 @@ namespace TCAMultiplayer.Game
         private JFaction _localFaction; // lazy-initialized in EnsureLocalFaction()
 
         private UniAircraft _localAircraft;
+        private UniAircraft _deadHusk; // previous life's airframe (lingers after ejection)
         private bool _disposed;
 
         /// <summary>Fired after the local player's aircraft is spawned and configured.</summary>
@@ -104,6 +105,7 @@ namespace TCAMultiplayer.Game
 
             // Clean up any existing local aircraft first
             DespawnLocalPlayer();
+            DestroyDeadHusk();
 
             var player = _session.GetLocalPlayer();
             if (player == null)
@@ -184,6 +186,27 @@ namespace TCAMultiplayer.Game
 
             _localAircraft = null;
             Log.Info(Tag, "Despawned local player aircraft");
+        }
+
+        /// <summary>
+        /// Destroy the previous life's airframe. After an ejection the pilotless
+        /// plane keeps flying (the mod only nulls its reference on death), so
+        /// without this the old husk survives into the next life. Remote peers
+        /// already despawn our clone on death — this aligns the local view.
+        /// Explosion wrecks that finished their native death sequence are already
+        /// destroyed and compare as null, so this is a no-op for them.
+        /// </summary>
+        private void DestroyDeadHusk()
+        {
+            if (_deadHusk == null) return;
+
+            _eventBridge.UnsubscribeFromAircraft(_deadHusk);
+            if (_deadHusk.gameObject != null)
+            {
+                UnityEngine.Object.Destroy(_deadHusk.gameObject);
+                Log.Info(Tag, "Destroyed previous life's aircraft husk");
+            }
+            _deadHusk = null;
         }
 
         // ── Spawn position resolution ───────────────────────────────────────
@@ -344,10 +367,19 @@ namespace TCAMultiplayer.Game
 
             Log.Info(Tag, "Local player aircraft destroyed");
 
-            // Unsubscribe from the destroyed aircraft
+            // Unsubscribe our own handler, but keep the GameEventBridge attached:
+            // this first event is usually the CRITICAL (burning) phase, and the
+            // wreck fires OnAircraftDestroyed again when it finally explodes
+            // (HP 0 → DestroyAircraft). ExplosionSyncSystem needs that second
+            // event to broadcast the final native explosion to remote peers —
+            // unsubscribing the bridge here made clones burn forever and then
+            // vanish instead of exploding. The bridge is detached in
+            // DestroyDeadHusk/DespawnLocalPlayer once the airframe is gone.
             aircraft.OnAircraftDestroyed -= HandleAircraftDestroyed;
-            _eventBridge.UnsubscribeFromAircraft(aircraft);
 
+            // Keep a handle on the dead airframe so the next spawn can remove it
+            // (an ejected husk keeps flying; see DestroyDeadHusk)
+            _deadHusk = aircraft;
             _localAircraft = null;
 
             // Update player state
@@ -372,6 +404,7 @@ namespace TCAMultiplayer.Game
             _disposed = true;
 
             DespawnLocalPlayer();
+            DestroyDeadHusk();
 
             OnPlayerSpawned = null;
             OnPlayerDied = null;

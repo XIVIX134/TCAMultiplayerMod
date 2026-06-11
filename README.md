@@ -3,7 +3,8 @@
 TCAMP (Tiny Combat Arena Multiplayer) is a BepInEx/Harmony mod for Tiny Combat
 Arena that adds local direct-UDP multiplayer sessions. The current focus is
 peer-hosted dogfighting: lobby flow, aircraft spawning, remote aircraft
-interpolation, combat event sync, score tracking, and respawns.
+interpolation, combat event sync, score tracking, respawns, damageable part
+sync, multiplayer pause/leave flow, and mid-session loadout changes.
 
 This repository contains the mod source only. It does not redistribute Tiny
 Combat Arena, Unity, BepInEx, Harmony, or other third-party/game assemblies.
@@ -11,7 +12,7 @@ Combat Arena, Unity, BepInEx, Harmony, or other third-party/game assemblies.
 ## Current Status
 
 This is a work-in-progress mod. It is playable enough for local host/client
-testing. The first public source release is `v0.1`.
+testing. The current public source release is `v0.2`.
 
 ## Requirements
 

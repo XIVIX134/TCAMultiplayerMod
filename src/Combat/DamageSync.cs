@@ -57,8 +57,10 @@ namespace TCAMultiplayer.Combat
                 BindingFlags.Instance | BindingFlags.NonPublic);
 
             _router.Register(PacketType.DamageDealt, OnDamageDealtReceived);
+            _router.Register(PacketType.PartDestroyed, OnPartDestroyedReceived);
 
             DamagePatch.OnCloneDamageBlocked += OnCloneDamageBlocked;
+            Damageable.OnAnythingDestroyed += HandleAnythingDestroyed;
             Log.Info(Tag, "Initialized");
         }
 
@@ -141,6 +143,11 @@ namespace TCAMultiplayer.Combat
             Vector3 localHitPos = _originService.AbsoluteToLocal(
                 packet.HitPosX, packet.HitPosY, packet.HitPosZ);
 
+            // If the shooter hit a specific damageable part on our clone, apply
+            // the damage to OUR matching part so the native per-part model runs
+            // (part HP, shear-off, engine/control damage, mirror to hull).
+            var targetDamageable = ResolveLocalHitPart(packet.HitPartName) ?? localDamageable;
+
             // Public 9-param DamageSource constructor — no reflection
             var damageSource = new DamageSource(
                 packet.Damage,
@@ -160,9 +167,9 @@ namespace TCAMultiplayer.Combat
             try
             {
                 if (packet.DamageType == 2)
-                    localDamageable.ApplyDamageFromExplosion(damageSource);
+                    targetDamageable.ApplyDamageFromExplosion(damageSource);
                 else
-                    localDamageable.ApplyDamageFromImpact(damageSource);
+                    targetDamageable.ApplyDamageFromImpact(damageSource);
             }
             finally
             {
@@ -170,7 +177,8 @@ namespace TCAMultiplayer.Combat
             }
 
             Log.Info(Tag, $"Applied {packet.Damage} dmg from {packet.AttackerId} " +
-                          $"(type={packet.DamageType}) HP={localDamageable.HitPoints}");
+                          $"(type={packet.DamageType}, part={packet.HitPartName ?? "hull"}) " +
+                          $"hullHP={localDamageable.HitPoints}");
         }
 
         // ── Helpers ──────────────────────────────────────────────────
@@ -210,6 +218,91 @@ namespace TCAMultiplayer.Combat
             return aircraft.gameObject.GetComponentInChildren<Target>();
         }
 
+        /// <summary>
+        /// Find the local aircraft's damageable part matching the name the
+        /// shooter hit on their clone. Returns null when no part matches
+        /// (hull hit, part already gone, or a pre-part-sync sender).
+        /// </summary>
+        private Damageable ResolveLocalHitPart(string hitPartName)
+        {
+            if (string.IsNullOrEmpty(hitPartName)) return null;
+
+            var aircraft = _localAircraftProvider?.Invoke() ?? UniAircraft.Player;
+            if (aircraft == null || IsRemoteClone(aircraft)) return null;
+
+            foreach (var wing in aircraft.GetComponentsInChildren<Falcon.Vehicles.WingDamage>())
+            {
+                if (wing == null || wing.gameObject.name != hitPartName) continue;
+                var partDamageable = wing.GetComponent<Damageable>();
+                if (partDamageable != null && !partDamageable.IsDestroyed)
+                    return partDamageable;
+            }
+            return null;
+        }
+
+        // ── Part destruction sync ─────────────────────────────────────
+
+        /// <summary>
+        /// Broadcast when one of OUR damageable parts is destroyed so every
+        /// peer shears the same part off their clone of us.
+        /// </summary>
+        private void HandleAnythingDestroyed(DestroyedEvent evt)
+        {
+            if (_disposed || !_connection.HasSession) return;
+            var destroyed = evt.Destroyed;
+            if (destroyed == null) return;
+            if (destroyed.GetComponent<Falcon.Vehicles.WingDamage>() == null) return;
+
+            var aircraft = _localAircraftProvider?.Invoke();
+            if (aircraft == null) return;
+            if (!destroyed.transform.IsChildOf(aircraft.transform)) return;
+
+            var packet = new PartDestroyedPacket
+            {
+                VictimId = _session.LocalPeerId,
+                PartName = destroyed.name
+            };
+            var payload = PacketSerializer.SerializePartDestroyed(packet);
+            _connection.BroadcastReliable(PacketSerializer.Serialize(PacketType.PartDestroyed, payload));
+            Log.Info(Tag, $"Broadcast part destroyed: {destroyed.name}");
+        }
+
+        /// <summary>Shear the named part off the victim's remote clone.</summary>
+        private void OnPartDestroyedReceived(ulong fromPeerId, byte[] rawData)
+        {
+            if (_disposed) return;
+
+            var (_, payload) = PacketSerializer.Deserialize(rawData);
+            if (payload == null) return;
+
+            var packet = PacketSerializer.DeserializePartDestroyed(payload);
+            if (_session.IsHost && fromPeerId != _session.LocalPeerId && packet.VictimId != fromPeerId)
+            {
+                Log.Warning(Tag, $"Rejected PartDestroyed from peer {fromPeerId} for victim {packet.VictimId}");
+                return;
+            }
+            if (packet.VictimId == _session.LocalPeerId) return; // already happened locally
+            if (string.IsNullOrEmpty(packet.PartName)) return;
+
+            var aircraft = _remoteManager.GetAircraft(packet.VictimId);
+            if (aircraft == null) return;
+
+            foreach (var wing in aircraft.GetComponentsInChildren<Falcon.Vehicles.WingDamage>())
+            {
+                if (wing == null || wing.gameObject.name != packet.PartName) continue;
+                try
+                {
+                    wing.DestroyWing();
+                    Log.Info(Tag, $"Sheared part '{packet.PartName}' off clone of peer {packet.VictimId}");
+                }
+                catch (Exception ex)
+                {
+                    Log.Warning(Tag, $"Clone part destroy failed ({packet.PartName}): {ex.Message}");
+                }
+                break;
+            }
+        }
+
         private bool IsRemoteClone(UniAircraft aircraft)
         {
             if (aircraft == null) return false;
@@ -242,15 +335,19 @@ namespace TCAMultiplayer.Combat
             if (string.Equals(source.Weapon, "Collision", StringComparison.OrdinalIgnoreCase))
                 return;
 
-            var localPlayer = _session.GetLocalPlayer();
-            if (localPlayer != null && !localPlayer.IsAlive)
+            // The local shooter does NOT need to be alive or InGame here:
+            // fire-and-forget munitions detonate after their shooter died (a
+            // nuke usually kills its own shooter, and that death is applied
+            // synchronously inside the same Explosion.Trigger loop — before the
+            // enemy clone's collider is even processed). Requiring IsAlive or
+            // state==InGame silently dropped every bomb hit in that window.
+            // Only block states where the flight scene itself is gone.
+            var state = _session.StateMachine.CurrentState;
+            if (state != GameState.InGame
+                && state != GameState.Respawning
+                && state != GameState.Spawning)
             {
-                Log.Debug(Tag, $"Ignoring clone damage while local player is dead weapon={source.Weapon}");
-                return;
-            }
-            if (_session.StateMachine.CurrentState != GameState.InGame)
-            {
-                Log.Debug(Tag, $"Ignoring clone damage outside InGame state ({_session.StateMachine.CurrentState}) weapon={source.Weapon}");
+                Log.Debug(Tag, $"Ignoring clone damage outside flight states ({state}) weapon={source.Weapon}");
                 return;
             }
             if (IsEnvironmentWeapon(source.Weapon) && !IsRecentLocalWeaponDamage(source))
@@ -259,20 +356,30 @@ namespace TCAMultiplayer.Combat
                 return;
             }
 
-            // Find which peer owns this clone
+            // Find which peer owns this clone. Resolve via the parent aircraft:
+            // the blocked damageable is often a PART Damageable (wing, stab, ...),
+            // not the hull. The old first-child comparison only matched hull hits,
+            // silently dropping every part hit — the main cause of "my hits
+            // didn't register" desync.
             ulong victimPeerId = 0;
-            foreach (var peerId in _remoteManager.GetAllPeerIds())
+            var ownerAircraft = cloneDamageable.GetComponentInParent<UniAircraft>();
+            if (ownerAircraft != null)
             {
-                var aircraft = _remoteManager.GetAircraft(peerId);
-                if (aircraft == null) continue;
-                var damageable = aircraft.GetComponentInChildren<Damageable>();
-                if (damageable == cloneDamageable)
+                foreach (var peerId in _remoteManager.GetAllPeerIds())
                 {
-                    victimPeerId = peerId;
-                    break;
+                    if (_remoteManager.GetAircraft(peerId) == ownerAircraft)
+                    {
+                        victimPeerId = peerId;
+                        break;
+                    }
                 }
             }
-            if (victimPeerId == 0) return;
+            if (victimPeerId == 0)
+            {
+                Log.Warning(Tag, $"Blocked clone damage with unresolvable owner " +
+                                 $"(damageable={cloneDamageable.name}, weapon={source.Weapon ?? "Unknown"})");
+                return;
+            }
             if (_session.ArePlayersOnSameTeam(_session.LocalPeerId, victimPeerId))
             {
                 Log.Debug(Tag, $"Ignoring friendly clone damage victim={victimPeerId} weapon={source.Weapon}");
@@ -298,6 +405,12 @@ namespace TCAMultiplayer.Combat
                 ApplicationEventKind.Damage,
                 isExplosion ? (byte)2 : (byte)0);
 
+            // Identify the damageable part that was hit on the clone (part
+            // Damageables carry a WingDamage and are named after the JSON part)
+            string hitPartName = cloneDamageable.GetComponent<Falcon.Vehicles.WingDamage>() != null
+                ? cloneDamageable.name
+                : "";
+
             var packet = new DamagePacket
             {
                 VictimId = victimPeerId,
@@ -310,7 +423,8 @@ namespace TCAMultiplayer.Combat
                 HitPosX = absX,
                 HitPosY = absY,
                 HitPosZ = absZ,
-                WeaponName = source.Weapon ?? "Unknown"
+                WeaponName = source.Weapon ?? "Unknown",
+                HitPartName = hitPartName
             };
 
             SendDamage(victimPeerId, packet);
@@ -343,7 +457,9 @@ namespace TCAMultiplayer.Combat
             _disposed = true;
 
             DamagePatch.OnCloneDamageBlocked -= OnCloneDamageBlocked;
+            Damageable.OnAnythingDestroyed -= HandleAnythingDestroyed;
             _router.Unregister(PacketType.DamageDealt, OnDamageDealtReceived);
+            _router.Unregister(PacketType.PartDestroyed, OnPartDestroyedReceived);
             OnRemoteDamageApplied = null;
 
             Log.Info(Tag, "Disposed");

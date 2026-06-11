@@ -241,6 +241,7 @@ namespace TCAMultiplayer.Protocol
                 w.Write(packet.WeaponName ?? "Unknown");
                 w.Write(packet.AttackerLifeId);
                 w.Write(packet.DamageSequence);
+                w.Write(packet.HitPartName ?? "");
                 return ms.ToArray();
             }
         }
@@ -270,7 +271,36 @@ namespace TCAMultiplayer.Protocol
                     packet.DamageSequence = r.ReadUInt32();
                 }
 
+                // Backward compat: hit part name added after event identity.
+                if (r.BaseStream.Position < r.BaseStream.Length)
+                    packet.HitPartName = r.ReadString();
+
                 return packet;
+            });
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        //  PartDestroyed (81)
+        // ═══════════════════════════════════════════════════════════
+
+        public static byte[] SerializePartDestroyed(PartDestroyedPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var w = new BinaryWriter(ms))
+            {
+                w.Write(packet.VictimId);
+                w.Write(packet.PartName ?? "");
+                return ms.ToArray();
+            }
+        }
+
+        public static PartDestroyedPacket DeserializePartDestroyed(byte[] data)
+        {
+            // VictimId(8) + string(1+) = 9
+            return SafeRead(data, 9, nameof(PartDestroyedPacket), r => new PartDestroyedPacket
+            {
+                VictimId = r.ReadUInt64(),
+                PartName = r.ReadString()
             });
         }
 
@@ -585,6 +615,7 @@ namespace TCAMultiplayer.Protocol
                 w.Write(packet.PlayerId);
                 w.Write(packet.AircraftType ?? "Unknown");
                 w.Write(packet.IsAlive);
+                w.Write(packet.LoadoutName ?? "");
                 return ms.ToArray();
             }
         }
@@ -592,11 +623,20 @@ namespace TCAMultiplayer.Protocol
         public static AircraftChangedPacket DeserializeAircraftChanged(byte[] data)
         {
             // PlayerId(8) + string(1+) + IsAlive(1) = 10
-            return SafeRead(data, 10, nameof(AircraftChangedPacket), r => new AircraftChangedPacket
+            return SafeRead(data, 10, nameof(AircraftChangedPacket), r =>
             {
-                PlayerId = r.ReadUInt64(),
-                AircraftType = r.ReadString(),
-                IsAlive = r.ReadBoolean()
+                var packet = new AircraftChangedPacket
+                {
+                    PlayerId = r.ReadUInt64(),
+                    AircraftType = r.ReadString(),
+                    IsAlive = r.ReadBoolean()
+                };
+
+                // Backward compat: loadout added after IsAlive
+                if (r.BaseStream.Position < r.BaseStream.Length)
+                    packet.LoadoutName = r.ReadString();
+
+                return packet;
             });
         }
 
@@ -823,6 +863,9 @@ namespace TCAMultiplayer.Protocol
                 w.Write(packet.RotZ);
                 w.Write(packet.RotW);
                 w.Write(packet.DestructionReason);
+                w.Write(packet.VelX);
+                w.Write(packet.VelY);
+                w.Write(packet.VelZ);
                 return ms.ToArray();
             }
         }
@@ -830,17 +873,30 @@ namespace TCAMultiplayer.Protocol
         public static AircraftDestructionVfxPacket DeserializeAircraftDestructionVfx(byte[] data)
         {
             // VictimId(8) + Pos(24) + Rot(16) + Reason(1) = 49
-            return SafeRead(data, 49, nameof(AircraftDestructionVfxPacket), r => new AircraftDestructionVfxPacket
+            return SafeRead(data, 49, nameof(AircraftDestructionVfxPacket), r =>
             {
-                VictimId = r.ReadUInt64(),
-                PosX = r.ReadDouble(),
-                PosY = r.ReadDouble(),
-                PosZ = r.ReadDouble(),
-                RotX = r.ReadSingle(),
-                RotY = r.ReadSingle(),
-                RotZ = r.ReadSingle(),
-                RotW = r.ReadSingle(),
-                DestructionReason = r.ReadByte()
+                var packet = new AircraftDestructionVfxPacket
+                {
+                    VictimId = r.ReadUInt64(),
+                    PosX = r.ReadDouble(),
+                    PosY = r.ReadDouble(),
+                    PosZ = r.ReadDouble(),
+                    RotX = r.ReadSingle(),
+                    RotY = r.ReadSingle(),
+                    RotZ = r.ReadSingle(),
+                    RotW = r.ReadSingle(),
+                    DestructionReason = r.ReadByte()
+                };
+
+                // Backward compat: death velocity added later
+                if (r.BaseStream.Position + sizeof(float) * 3 <= r.BaseStream.Length)
+                {
+                    packet.VelX = r.ReadSingle();
+                    packet.VelY = r.ReadSingle();
+                    packet.VelZ = r.ReadSingle();
+                }
+
+                return packet;
             });
         }
 
