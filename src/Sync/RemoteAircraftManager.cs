@@ -188,6 +188,17 @@ namespace TCAMultiplayer.Sync
         }
 
         /// <summary>
+        /// Destroy every remote clone (return to lobby). Peers re-register
+        /// automatically from their first state packet next round.
+        /// </summary>
+        public void RemoveAllPeers()
+        {
+            var peerIds = new List<ulong>(_peers.Keys);
+            foreach (var peerId in peerIds)
+                RemovePeer(peerId);
+        }
+
+        /// <summary>
         /// Respawn a peer's aircraft (after death/respawn cycle).
         /// Destroys old aircraft and creates new one on next state packet.
         /// </summary>

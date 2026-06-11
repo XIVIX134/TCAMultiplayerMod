@@ -14,8 +14,15 @@ namespace TCAMultiplayer.Transport
         /// <summary>Seconds before a peer is considered timed out</summary>
         public float TimeoutSeconds { get; set; } = 10.0f;
 
+        /// <summary>
+        /// Seconds after a timeout during which the connection is kept alive and
+        /// actively retried before the peer is finally reported as disconnected.
+        /// 0 disables the grace window (timeout disconnects immediately).
+        /// </summary>
+        public float ReconnectGraceSeconds { get; set; } = 30.0f;
+
         /// <summary>Maximum retransmit attempts for reliable packets</summary>
-        public int MaxRetransmitAttempts { get; set; } = 5;
+        public int MaxRetransmitAttempts { get; set; } = 50;
 
         /// <summary>Seconds between retransmit attempts</summary>
         public float RetransmitInterval { get; set; } = 0.2f;

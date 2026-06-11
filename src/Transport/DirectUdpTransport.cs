@@ -66,6 +66,9 @@ namespace TCAMultiplayer.Transport
         private readonly Dictionary<string, ulong> _endpointToPeer = new Dictionary<string, ulong>();
         private readonly HashSet<ulong> _connectedPeerIds = new HashSet<ulong>();
         private readonly Dictionary<ulong, long> _lastReceivedMs = new Dictionary<ulong, long>();
+        // Peers past TimeoutSeconds but inside the reconnect grace window. They stay
+        // registered (keepalives keep flowing) until the grace expires or data resumes.
+        private readonly HashSet<ulong> _lostPeers = new HashSet<ulong>();
         private ulong _nextPeerId = 2; // Host is always 1; clients start at 2
 
         // ── Cross-thread receive queue ───────────────────────────────
@@ -297,6 +300,12 @@ namespace TCAMultiplayer.Transport
             if (_endpointToPeer.TryGetValue(key, out ulong knownPeerId))
             {
                 _lastReceivedMs[knownPeerId] = _clock.ElapsedMilliseconds;
+
+                // Data resumed from a peer inside the reconnect grace window
+                if (_lostPeers.Remove(knownPeerId))
+                {
+                    Log.Info(Tag, $"Peer {knownPeerId} reconnected after dropout");
+                }
             }
 
             switch (pktType)
@@ -445,8 +454,10 @@ namespace TCAMultiplayer.Transport
             long nowMs = _clock.ElapsedMilliseconds;
             long keepaliveMs = (long)(_config.KeepaliveInterval * 1000f);
             long timeoutMs = (long)(_config.TimeoutSeconds * 1000f);
+            long graceMs = (long)(_config.ReconnectGraceSeconds * 1000f);
 
-            // Send PING to all peers at the configured interval
+            // Send PING to all peers at the configured interval.
+            // Lost peers stay in _peerEndpoints, so pings double as reconnect probes.
             if (nowMs - _lastKeepaliveMs >= keepaliveMs)
             {
                 _lastKeepaliveMs = nowMs;
@@ -455,24 +466,46 @@ namespace TCAMultiplayer.Transport
                 {
                     SendRawTo(ping, kvp.Value);
                 }
+
+                // Client: also re-send CONNECT while the host is lost. A re-ACK
+                // refreshes the host's view of us (and re-punches NAT) even if
+                // the host briefly timed us out.
+                if (!IsHost && _lostPeers.Contains(1) && _hostEndpoint != null)
+                {
+                    SendConnectPacket();
+                }
             }
 
             // Check for timed-out peers
             List<ulong> timedOut = null;
             foreach (var kvp in _lastReceivedMs)
             {
-                if (nowMs - kvp.Value > timeoutMs)
+                long elapsed = nowMs - kvp.Value;
+                if (elapsed <= timeoutMs) continue;
+
+                // First timeout: enter the reconnect grace window instead of
+                // dropping the peer. Data resuming clears this (ProcessRawPacket).
+                if (elapsed <= timeoutMs + graceMs)
                 {
-                    if (timedOut == null) timedOut = new List<ulong>();
-                    timedOut.Add(kvp.Key);
+                    if (_lostPeers.Add(kvp.Key))
+                    {
+                        Log.Warning(Tag, $"Peer {kvp.Key} silent for {_config.TimeoutSeconds}s — " +
+                                         $"retrying for up to {_config.ReconnectGraceSeconds}s before disconnecting");
+                    }
+                    continue;
                 }
+
+                if (timedOut == null) timedOut = new List<ulong>();
+                timedOut.Add(kvp.Key);
             }
 
             if (timedOut != null)
             {
                 foreach (ulong peerId in timedOut)
                 {
-                    Log.Warning(Tag, $"Peer {peerId} timed out ({_config.TimeoutSeconds}s no data)");
+                    Log.Warning(Tag, $"Peer {peerId} timed out " +
+                                     $"({_config.TimeoutSeconds}s + {_config.ReconnectGraceSeconds}s grace, no data)");
+                    _lostPeers.Remove(peerId);
                     RemovePeer(peerId);
 
                     if (!IsHost && peerId == 1)
@@ -504,6 +537,7 @@ namespace TCAMultiplayer.Transport
             }
             _connectedPeerIds.Remove(peerId);
             _lastReceivedMs.Remove(peerId);
+            _lostPeers.Remove(peerId);
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -630,6 +664,7 @@ namespace TCAMultiplayer.Transport
             _endpointToPeer.Clear();
             _connectedPeerIds.Clear();
             _lastReceivedMs.Clear();
+            _lostPeers.Clear();
             _hostEndpoint = null;
             LocalPeerId = 0;
 

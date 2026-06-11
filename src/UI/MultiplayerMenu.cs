@@ -36,7 +36,6 @@ namespace TCAMultiplayer.UI
         private bool _refreshPending;
         private bool _nativeDialogOpen;
         private CursorLockMode _previousCursorLockState;
-        private bool _previousCursorVisible;
 
         public Action OnMenuClosed;
         public bool IsVisible => _visible;
@@ -795,7 +794,6 @@ namespace TCAMultiplayer.UI
             if (capturePrevious)
             {
                 _previousCursorLockState = Cursor.lockState;
-                _previousCursorVisible = Cursor.visible;
             }
 
             Cursor.lockState = CursorLockMode.None;
@@ -804,8 +802,12 @@ namespace TCAMultiplayer.UI
 
         private void RestoreCursor()
         {
-            Cursor.lockState = _previousCursorLockState;
-            Cursor.visible = _previousCursorVisible;
+            // Restore the lock state only; visible stays true like the native
+            // game (Locked hides the pointer on its own). Never re-lock when
+            // there is no flight to return to — that left menus cursorless.
+            bool inFlight = _connection?.Session?.StateMachine.CurrentState == GameState.InGame;
+            Cursor.lockState = inFlight ? _previousCursorLockState : CursorLockMode.None;
+            Cursor.visible = true;
         }
 
         private static void EnsureEventSystem()

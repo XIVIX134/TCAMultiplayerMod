@@ -24,7 +24,7 @@ namespace TCAMultiplayer
     /// BepInEx plugin entry point. ONLY bootstraps and wires components.
     /// No business logic — just creation and disposal.
     /// </summary>
-    [BepInPlugin("com.tcamp.mod", "TCAMP", "0.1.0")]
+    [BepInPlugin("com.tcamp.mod", "TCAMP", "0.2.1")]
     public class Plugin : BaseUnityPlugin
     {
         private const string Tag = "PLUGIN";
@@ -35,7 +35,7 @@ namespace TCAMultiplayer
         {
             Log.Init(Logger);
             ModConfig.Bind(Config);
-            Log.Info(Tag, "TCAMP v0.1.0 initializing...");
+            Log.Info(Tag, "TCAMP v0.2.1 (lobby return + cursor fixes) initializing...");
 
             _harmony = new Harmony("com.tcamp.mod");
             _harmony.PatchAll(typeof(Plugin).Assembly);
@@ -571,6 +571,7 @@ namespace TCAMultiplayer
             _lastDiagnosticsLogTime = 0f;
             var router = _connection.Router;
             _connection.OnPeerLeft += HandlePeerLeft;
+            session.OnStateChanged += HandleSessionStateChanged;
 
             // Restore host settings from ModConfig
             if (session.IsHost)
@@ -944,12 +945,110 @@ namespace TCAMultiplayer
                 }
 
                 _activeSession?.StateMachine.TryTransition(GameState.InGame);
+
+                // Lock the cursor for flight (native StartFlight callers do this —
+                // see QuickMissionGame.RunQuickMission — but we bypass that path).
+                // Locked auto-hides the pointer; visible stays true so menus that
+                // only set LockState=None (the native pattern) show the cursor.
+                TinyCursor.LockState = CursorLockMode.Locked;
+                Cursor.visible = true;
+
                 Log.Info(Tag, $"Local player spawned: {aircraft.name}");
             }
             else
             {
                 Log.Error(Tag, "Failed to spawn local aircraft!");
             }
+        }
+
+        /// <summary>
+        /// Reacts to session state transitions. The lobby return path
+        /// (host Esc → "Return To Lobby", or the LobbyReturnToLobby packet on
+        /// clients) only flips the state machine — the flight teardown lives
+        /// here so both host and clients leave the flight the same way.
+        /// </summary>
+        private void HandleSessionStateChanged(GameState oldState, GameState newState)
+        {
+            bool leftGameplay = oldState == GameState.Loading
+                || oldState == GameState.Spawning
+                || oldState == GameState.InGame
+                || oldState == GameState.Respawning;
+
+            if (newState == GameState.ReturningToLobby
+                || (leftGameplay && (newState == GameState.HostingLobby || newState == GameState.ClientLobby)))
+            {
+                CleanupFlightForLobbyReturn();
+            }
+        }
+
+        /// <summary>
+        /// Tear down the flight portion of the session while keeping the
+        /// session itself alive: despawn aircraft, unload the FlightGame
+        /// scene (map stays as lobby background, like TeardownSession), and
+        /// bring the lobby UI back with an unlocked cursor.
+        /// </summary>
+        private void CleanupFlightForLobbyReturn()
+        {
+            Log.Info(Tag, "Returning to lobby — tearing down flight");
+
+            UnregisterPauseMenuInput();
+            _respawnScreen?.HideForSessionEnd();
+
+            _spawnManager?.CleanupForLobbyReturn();
+            _remoteManager?.RemoveAllPeers();
+            _originService?.Reset();
+
+            try
+            {
+                var flightGame = Falcon.Game2.FlightGame.Instance;
+                if (flightGame != null)
+                {
+                    // Same flight-state cleanup as TeardownSession: prevent
+                    // NREs in FixedUpdate while the scene unloads underneath
+                    if (flightGame.FloatingOrigin != null)
+                        flightGame.FloatingOrigin.ReferenceObject = null;
+
+                    try
+                    {
+                        var missionProp = typeof(Falcon.Game2.FlightGame).GetProperty("IsMissionInProgress",
+                            BindingFlags.Public | BindingFlags.Instance);
+                        missionProp?.SetValue(flightGame, false);
+                    }
+                    catch { }
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(Tag, $"Flight state cleanup error on lobby return: {ex.Message}");
+            }
+
+            try
+            {
+                _loadingScreen?.Close(true).Forget();
+                _loadingScreen = null;
+
+                var flightScene = UnityEngine.SceneManagement.SceneManager.GetSceneByName(GameScenes.G2FlightGame);
+                if (flightScene.IsValid() && flightScene.isLoaded)
+                {
+                    Log.Info(Tag, "Unloading FlightGame scene (lobby return)");
+                    UnityEngine.SceneManagement.SceneManager.UnloadSceneAsync(GameScenes.G2FlightGame);
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(Tag, $"FlightGame unload error on lobby return: {ex.Message}");
+            }
+
+            // Restore the native main menu cameras (hidden by OnGameStarting)
+            // so the lobby has its 3D background again, but keep the native
+            // menu buttons hidden underneath the multiplayer lobby UI.
+            SetNativeMainMenuVisible(true);
+            SetNativeMainMenuUIVisible(false);
+
+            // Back to the lobby UI with a usable cursor
+            TinyCursor.LockState = CursorLockMode.None;
+            Cursor.visible = true;
+            _menu?.ShowLobby();
         }
 
         private void HandlePeerRespawned(ulong peerId, string aircraftType)
@@ -994,6 +1093,10 @@ namespace TCAMultiplayer
                     flightGame.PlayerInput.IsInputBlockedFromGame = false;
                 }
             }
+
+            // Back in flight — re-lock the cursor (same as initial spawn)
+            TinyCursor.LockState = CursorLockMode.Locked;
+            Cursor.visible = true;
         }
 
         /// <summary>
@@ -1131,6 +1234,15 @@ namespace TCAMultiplayer
 
         private void HandleAircraftStateRaw(ulong fromPeerId, byte[] data)
         {
+            // Only track remote aircraft during gameplay. After a return to
+            // lobby, peers still mid-flight keep sending state for a moment —
+            // without this gate those packets resurrect clones into the lobby.
+            var state = _activeSession?.StateMachine.CurrentState;
+            if (state != GameState.Spawning
+                && state != GameState.InGame
+                && state != GameState.Respawning)
+                return;
+
             var (_, payload) = PacketSerializer.Deserialize(data);
             if (payload == null) return;
             var packet = PacketSerializer.DeserializeAircraftState(payload);
@@ -1208,6 +1320,9 @@ namespace TCAMultiplayer
                 _connection.Router.Unregister(PacketType.AircraftChanged, HandleAircraftChangedRaw);
             }
 
+            if (_activeSession != null)
+                _activeSession.OnStateChanged -= HandleSessionStateChanged;
+
             // Clean up flight state to prevent freeze when returning to menu
             try
             {
@@ -1283,6 +1398,7 @@ namespace TCAMultiplayer
 
             // Clear UI references to disposed systems and prevent stale lobby UI after host loss.
             _menu?.HandleSessionEnded();
+            _respawnScreen?.HideForSessionEnd();
 
             // Clear Harmony delegates
             DamagePatch.IsRemoteClone = null;
@@ -1308,6 +1424,11 @@ namespace TCAMultiplayer
             SetNativeMainMenuVisible(true);
             if (_menu?.IsVisible == true)
                 SetNativeMainMenuUIVisible(false);
+
+            // Back in menus — unlock the cursor and clear any stale hidden state
+            // (a death/respawn cycle may have left it locked or invisible)
+            TinyCursor.LockState = CursorLockMode.None;
+            Cursor.visible = true;
 
             // Unload FlightGame and map scenes that were loaded additively
             try

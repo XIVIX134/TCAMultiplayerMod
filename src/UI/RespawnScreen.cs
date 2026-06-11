@@ -70,7 +70,15 @@ namespace TCAMultiplayer.UI
             _active = true;
         }
 
-        public void Hide()
+        public void Hide() => Hide(lockCursorForFlight: true);
+
+        /// <summary>
+        /// Dismiss the screen when the session leaves gameplay (return to lobby,
+        /// disconnect). Leaves the cursor unlocked — we're heading to menus.
+        /// </summary>
+        public void HideForSessionEnd() => Hide(lockCursorForFlight: false);
+
+        private void Hide(bool lockCursorForFlight)
         {
             _active = false;
 
@@ -84,11 +92,15 @@ namespace TCAMultiplayer.UI
                 _aircraftButton = null;
                 _selectorOpen = false;
 
-                // Re-lock cursor for flight mode
-                Cursor.lockState = CursorLockMode.Locked;
-                Cursor.visible = false;
+                // Native pattern: only the lock state changes; Cursor.visible stays
+                // true (Locked hides the pointer by itself). Setting visible=false
+                // here used to leave the cursor invisible in every menu afterwards.
+                Cursor.lockState = lockCursorForFlight
+                    ? CursorLockMode.Locked
+                    : CursorLockMode.None;
+                Cursor.visible = true;
 
-                Log.Info(Tag, "Hidden respawn screen");
+                Log.Info(Tag, $"Hidden respawn screen (lockCursor={lockCursorForFlight})");
             }
         }
 
@@ -99,6 +111,17 @@ namespace TCAMultiplayer.UI
         private void Update()
         {
             if (!_active || _canvas == null) return;
+
+            // Auto-dismiss when the session leaves gameplay underneath us
+            // (host returned everyone to lobby, or the session ended) so the
+            // overlay and its cursor-unlock loop don't leak into the next match.
+            var state = _session?.StateMachine?.CurrentState;
+            if (state != GameState.Respawning)
+            {
+                Log.Info(Tag, $"Session state {state?.ToString() ?? "<none>"} — dismissing respawn screen");
+                Hide(lockCursorForFlight: false);
+                return;
+            }
 
             // Force cursor visible while respawn screen is up (game may re-lock it)
             if (Cursor.lockState != CursorLockMode.None || !Cursor.visible)

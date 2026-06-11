@@ -168,6 +168,16 @@ namespace TCAMultiplayer.Game
         }
 
         /// <summary>
+        /// Remove the local plane and any leftover dead husk when the session
+        /// returns to the lobby (unlike SpawnLocalPlayer, no new spawn follows).
+        /// </summary>
+        public void CleanupForLobbyReturn()
+        {
+            DespawnLocalPlayer();
+            DestroyDeadHusk();
+        }
+
+        /// <summary>
         /// Destroy the local player's current aircraft.
         /// Cleans up subscriptions and nulls the reference.
         /// </summary>
