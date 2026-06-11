@@ -78,6 +78,32 @@ Before publishing or opening a pull request, run:
 This catches accidentally tracked DLLs, logs, local game copies, decompiler
 output, and build artifacts.
 
+## Release
+
+Run releases from a local machine that already has `libs/` populated and the
+GitHub CLI authenticated:
+
+```powershell
+.\scripts\Release-Version.ps1 -Version v0.3 -Message "Release v0.3"
+```
+
+The release helper bumps `src\TCAMP.csproj` and this README, stages all
+non-ignored changes, builds `TCAMP.dll`, creates
+`release\TCAMP-v0.3-plugin.zip`, commits, tags, pushes `main` and the tag, and
+creates the GitHub release with the zip and SHA256 checksum attached.
+
+Use this helper instead of manually pushing a release tag. GitHub-hosted runners
+do not have the local Tiny Combat Arena, Unity, or BepInEx reference DLLs needed
+to build the plugin, so the workflow only validates repository hygiene on tag
+pushes.
+
+Useful options:
+
+- `-StagedOnly` commits only your already staged changes plus the version bump.
+- `-Closes 39,40` adds `Fixes #39` and `Fixes #40` to the release commit.
+- `-RunTests` runs `dotnet test .\TCAMP.sln -c Release` before committing.
+- `-NoPush` creates the local commit, tag, and zip without pushing or uploading.
+
 ## Project Layout
 
 - `src/Core` - session state, config, logging, and connection orchestration
