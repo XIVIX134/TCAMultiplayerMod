@@ -78,6 +78,23 @@ try {
 
     $projectPath = Resolve-TcampRepositoryPath -Path "src\TCAMP.csproj" -Root $root
     $readmePath = Resolve-TcampRepositoryPath -Path "README.md" -Root $root
+    $changelogPath = Resolve-TcampRepositoryPath -Path "CHANGELOG.md" -Root $root
+
+    if (!(Test-Path -LiteralPath $changelogPath)) {
+        throw "CHANGELOG.md not found. Add release notes under an '## Unreleased' section before releasing."
+    }
+
+    $changelogText = [System.IO.File]::ReadAllText($changelogPath)
+    $releaseNotes = Get-TcampChangelogSection -Content $changelogText -Heading "Unreleased"
+    if (!(Test-TcampMeaningfulChangelogBody -Body $releaseNotes)) {
+        throw "CHANGELOG.md needs real notes under '## Unreleased' before releasing $tag."
+    }
+
+    $releaseDate = Get-Date -Format "yyyy-MM-dd"
+    $escapedTag = [regex]::Escape($tag)
+    if ($changelogText -match "(?m)^## $escapedTag(\s|-|$)") {
+        throw "CHANGELOG.md already has a section for $tag."
+    }
 
     $projectText = [System.IO.File]::ReadAllText($projectPath)
     $projectText = $projectText -replace '<Version>[^<]+</Version>', "<Version>$packageVersion</Version>"
@@ -97,7 +114,15 @@ try {
         { param($m) $m.Groups[1].Value + $tag + $m.Groups[2].Value })
     Write-TcampUtf8NoBom -Path $readmePath -Content $readmeText
 
-    Invoke-TcampCheckedCommand -FilePath "git" -Arguments @("add", "README.md", "src/TCAMP.csproj")
+    $newReleaseSection = "## $tag - $releaseDate`r`n`r`n$releaseNotes`r`n`r`n"
+    $changelogText = [regex]::Replace(
+        $changelogText,
+        "(?ms)^## Unreleased\s*\r?\n(?<body>.*?)(?=^## |\z)",
+        "## Unreleased`r`n`r`n- Add new changes here before running ``.\scripts\Release-Version.ps1``.`r`n`r`n$newReleaseSection",
+        1)
+    Write-TcampUtf8NoBom -Path $changelogPath -Content $changelogText
+
+    Invoke-TcampCheckedCommand -FilePath "git" -Arguments @("add", "CHANGELOG.md", "README.md", "src/TCAMP.csproj")
     if (!$StagedOnly) {
         Invoke-TcampCheckedCommand -FilePath "git" -Arguments @("add", "-A")
     }
@@ -153,6 +178,8 @@ try {
     if ($releaseExists) {
         Invoke-TcampCheckedCommand -FilePath "gh" -Arguments @(
             "release", "upload", $tag, $package.ZipPath, $package.Sha256Path, "--clobber")
+        Invoke-TcampCheckedCommand -FilePath "gh" -Arguments @(
+            "release", "edit", $tag, "--notes", $releaseNotes)
     }
     else {
         $releaseArgs = @(
@@ -160,7 +187,7 @@ try {
             $package.ZipPath,
             $package.Sha256Path,
             "--title", $tag,
-            "--generate-notes",
+            "--notes", $releaseNotes,
             "--verify-tag")
 
         if ($Draft) { $releaseArgs += "--draft" }

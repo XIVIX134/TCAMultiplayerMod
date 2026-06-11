@@ -79,6 +79,41 @@ function Write-TcampUtf8NoBom {
     [System.IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
+function Get-TcampChangelogSection {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Content,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Heading
+    )
+
+    $escapedHeading = [regex]::Escape($Heading)
+    $match = [regex]::Match(
+        $Content,
+        "(?ms)^## $escapedHeading\s*\r?\n(?<body>.*?)(?=^## |\z)")
+
+    if (!$match.Success) {
+        return $null
+    }
+
+    return $match.Groups["body"].Value.Trim()
+}
+
+function Test-TcampMeaningfulChangelogBody {
+    param([string]$Body)
+
+    if ([string]::IsNullOrWhiteSpace($Body)) {
+        return $false
+    }
+
+    $lines = $Body -split "\r?\n" |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -and $_ -notmatch '^-\s*Add new changes here before running' }
+
+    return @($lines).Count -gt 0
+}
+
 function Invoke-TcampCheckedCommand {
     param(
         [Parameter(Mandatory = $true)]

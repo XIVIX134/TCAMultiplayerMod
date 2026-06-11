@@ -88,9 +88,13 @@ GitHub CLI authenticated:
 ```
 
 The release helper bumps `src\TCAMP.csproj` and this README, stages all
-non-ignored changes, builds `TCAMP.dll`, creates
-`release\TCAMP-v0.3-plugin.zip`, commits, tags, pushes `main` and the tag, and
-creates the GitHub release with the zip and SHA256 checksum attached.
+non-ignored changes, promotes the `CHANGELOG.md` `Unreleased` section into the
+new version, builds `TCAMP.dll`, creates `release\TCAMP-v0.3-plugin.zip`,
+commits, tags, pushes `main` and the tag, and creates the GitHub release with
+the changelog notes, zip, and SHA256 checksum attached.
+
+Before running it, replace the placeholder under `CHANGELOG.md` `Unreleased`
+with the release notes for the next version.
 
 Use this helper instead of manually pushing a release tag. GitHub-hosted runners
 do not have the local Tiny Combat Arena, Unity, or BepInEx reference DLLs needed
