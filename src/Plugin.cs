@@ -35,7 +35,7 @@ namespace TCAMultiplayer
         {
             Log.Init(Logger);
             ModConfig.Bind(Config);
-            Log.Info(Tag, "TCAMP v0.2.1 (lobby return + cursor fixes) initializing...");
+            Log.Info(Tag, "TCAMP v0.2.2 initializing...");
 
             _harmony = new Harmony("com.tcamp.mod");
             _harmony.PatchAll(typeof(Plugin).Assembly);
