@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using TCAMultiplayer.Core;
 using TCAMultiplayer.Transport;
 
@@ -45,6 +46,11 @@ namespace TCAMultiplayer.Protocol
         // ── Per-peer receive state ────────────────────────────────────
         private readonly Dictionary<ulong, ReceiveState> _receiveStates = new Dictionary<ulong, ReceiveState>();
 
+        private long _totalReliableSent;
+        private long _totalReliableAcked;
+        private long _totalReliableRetransmitted;
+        private long _totalReliableDropped;
+
         /// <summary>
         /// Fired when processed data is ready for the application layer.
         /// Args: (peerId, data) where data is the original payload (no reliability framing).
@@ -72,6 +78,11 @@ namespace TCAMultiplayer.Protocol
 
             uint seq = NextSendSequence(peerId);
             byte[] framed = FrameReliable(seq, data);
+            if (_config.MaxPacketSize > 0 && framed.Length + 2 > _config.MaxPacketSize)
+            {
+                Log.Warning(Tag, $"Reliable payload seq={seq} to peer {peerId} is {framed.Length + 2} bytes, " +
+                                 $"above MaxPacketSize={_config.MaxPacketSize}. This may fragment or drop on VPN/TUN links.");
+            }
 
             // Store for retransmit
             if (!_pendingByPeer.TryGetValue(peerId, out var pending))
@@ -90,6 +101,7 @@ namespace TCAMultiplayer.Protocol
                 RetryCount = 0
             };
 
+            Interlocked.Increment(ref _totalReliableSent);
             _transport.Send(peerId, framed, false); // send raw over UDP, we handle reliability
         }
 
@@ -177,6 +189,8 @@ namespace TCAMultiplayer.Protocol
         public void Update(float deltaTime)
         {
             List<(ulong peerId, uint seq)> toRemove = null;
+            int retransmitsThisUpdate = 0;
+            int retransmitBudget = _config.MaxReliableRetransmitsPerUpdate;
 
             foreach (var kvp in _pendingByPeer)
             {
@@ -195,21 +209,37 @@ namespace TCAMultiplayer.Protocol
                     {
                         Log.Warning(Tag,
                             $"Reliable packet seq={packet.SequenceNumber} to peer {peerId} " +
-                            $"dropped after {_config.MaxRetransmitAttempts} retries");
+                            $"dropped after {_config.MaxRetransmitAttempts} retries. " +
+                            "If the peer appears connected but never ACKs, check UDP route/firewall/NAT.");
 
                         if (toRemove == null)
                             toRemove = new List<(ulong, uint)>();
                         toRemove.Add((peerId, pkvp.Key));
+                        Interlocked.Increment(ref _totalReliableDropped);
                     }
                     else
                     {
+                        if (retransmitBudget > 0 && retransmitsThisUpdate >= retransmitBudget)
+                            continue;
+
                         packet.RetryCount++;
                         packet.TimeSinceSend = 0f;
+                        retransmitsThisUpdate++;
+                        Interlocked.Increment(ref _totalReliableRetransmitted);
                         _transport.Send(peerId, packet.FramedData, false);
 
-                        Log.Debug(Tag,
-                            $"Retransmit seq={packet.SequenceNumber} to peer {peerId}, " +
-                            $"attempt {packet.RetryCount}/{_config.MaxRetransmitAttempts}");
+                        if (packet.RetryCount == 5 || packet.RetryCount % 25 == 0)
+                        {
+                            Log.Warning(Tag,
+                                $"Reliable packet seq={packet.SequenceNumber} to peer {peerId} still unacked " +
+                                $"after {packet.RetryCount}/{_config.MaxRetransmitAttempts} attempts");
+                        }
+                        else
+                        {
+                            Log.Debug(Tag,
+                                $"Retransmit seq={packet.SequenceNumber} to peer {peerId}, " +
+                                $"attempt {packet.RetryCount}/{_config.MaxRetransmitAttempts}");
+                        }
                     }
                 }
             }
@@ -254,6 +284,26 @@ namespace TCAMultiplayer.Protocol
         public int GetPendingCount(ulong peerId)
         {
             return _pendingByPeer.TryGetValue(peerId, out var pending) ? pending.Count : 0;
+        }
+
+        public int GetTotalPendingCount()
+        {
+            int total = 0;
+            foreach (var pending in _pendingByPeer.Values)
+                total += pending.Count;
+            return total;
+        }
+
+        public ReliabilityStats GetStats()
+        {
+            return new ReliabilityStats
+            {
+                PendingCount = GetTotalPendingCount(),
+                ReliableSent = Interlocked.Read(ref _totalReliableSent),
+                ReliableAcked = Interlocked.Read(ref _totalReliableAcked),
+                ReliableRetransmitted = Interlocked.Read(ref _totalReliableRetransmitted),
+                ReliableDropped = Interlocked.Read(ref _totalReliableDropped)
+            };
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -310,6 +360,7 @@ namespace TCAMultiplayer.Protocol
             {
                 if (pending.Remove(seq))
                 {
+                    Interlocked.Increment(ref _totalReliableAcked);
                     Log.Debug(Tag, $"ACK received seq={seq} from peer {peerId}");
                 }
             }
@@ -363,6 +414,15 @@ namespace TCAMultiplayer.Protocol
             public byte[] RawData;      // Original payload (for diagnostics)
             public float TimeSinceSend;
             public int RetryCount;
+        }
+
+        public struct ReliabilityStats
+        {
+            public int PendingCount;
+            public long ReliableSent;
+            public long ReliableAcked;
+            public long ReliableRetransmitted;
+            public long ReliableDropped;
         }
 
         /// <summary>

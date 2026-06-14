@@ -36,6 +36,7 @@ namespace TCAMultiplayer.Compatibility
             _router.Register(PacketType.ModCompatibilityResult, HandleCompatibilityResultRaw);
             Log.Info(Tag, "Initialized");
         }
+
         // ── Manifest Collection ─────────────────────────────────────────
 
         /// <summary>
@@ -102,7 +103,8 @@ namespace TCAMultiplayer.Compatibility
             var packet = new ModManifestPacket
             {
                 PeerId = _session.LocalPeerId,
-                ManifestData = manifestBytes
+                ManifestData = manifestBytes,
+                ModVersion = PluginMetadata.Version
             };
 
             var payload = PacketSerializer.SerializeModManifest(packet);
@@ -138,19 +140,34 @@ namespace TCAMultiplayer.Compatibility
                 ? Encoding.UTF8.GetString(packet.ManifestData)
                 : "";
             string hostHash = GetManifestHash();
-            bool isCompatible = string.Equals(hostHash, clientHash, StringComparison.Ordinal);
-            string reason = isCompatible
-                ? ""
-                : $"Mod mismatch — host hash: {hostHash}, client hash: {clientHash}";
+            string clientVersion = packet.ModVersion ?? "";
+            string hostVersion = PluginMetadata.Version;
+            bool versionMatches = string.Equals(hostVersion, clientVersion, StringComparison.Ordinal);
+            bool hashMatches = string.Equals(hostHash, clientHash, StringComparison.Ordinal);
+            bool isCompatible = versionMatches && hashMatches;
+            string reason = "";
+            if (!versionMatches)
+            {
+                string shownClientVersion = string.IsNullOrWhiteSpace(clientVersion) ? "unknown/old build" : clientVersion;
+                reason = $"TCAMP version mismatch — host {hostVersion}, client {shownClientVersion}";
+            }
+            else if (!hashMatches)
+            {
+                reason = $"Mod mismatch — host hash: {hostHash}, client hash: {clientHash}";
+            }
 
-            Log.Info(Tag, $"Peer {fromPeerId}: compatible={isCompatible} (host={hostHash}, client={clientHash})");
+            Log.Info(Tag,
+                $"Peer {fromPeerId}: compatible={isCompatible} " +
+                $"(hostVersion={hostVersion}, clientVersion={clientVersion}, host={hostHash}, client={clientHash})");
 
             var result = new ModCompatibilityResultPacket
             {
                 PeerId = fromPeerId,
                 IsCompatible = isCompatible,
-                RejectionReason = reason
+                RejectionReason = reason,
+                HostModVersion = hostVersion
             };
+
             var resultPayload = PacketSerializer.SerializeModCompatibilityResult(result);
             var resultFrame = PacketSerializer.Serialize(PacketType.ModCompatibilityResult, resultPayload);
             _connection.SendReliable(fromPeerId, resultFrame);
@@ -173,12 +190,26 @@ namespace TCAMultiplayer.Compatibility
 
         private void HandleCompatibilityResult(ModCompatibilityResultPacket packet)
         {
-            if (packet.IsCompatible)
-                Log.Info(Tag, "Mods compatible with host");
-            else
-                Log.Warning(Tag, $"Mod incompatible: {packet.RejectionReason}");
+            bool isCompatible = packet.IsCompatible;
+            string reason = packet.RejectionReason ?? "";
+            string hostVersion = packet.HostModVersion ?? "";
+            if (isCompatible && !string.Equals(hostVersion, PluginMetadata.Version, StringComparison.Ordinal))
+            {
+                string shownHostVersion = string.IsNullOrWhiteSpace(hostVersion) ? "unknown/old build" : hostVersion;
+                isCompatible = false;
+                reason = $"TCAMP version mismatch — host {shownHostVersion}, client {PluginMetadata.Version}";
+            }
 
-            OnCompatibilityResult?.Invoke(packet.IsCompatible, packet.RejectionReason ?? "");
+            if (isCompatible)
+            {
+                Log.Info(Tag, "Mods compatible with host");
+            }
+            else
+            {
+                Log.Warning(Tag, $"Mod incompatible: {reason}");
+            }
+
+            OnCompatibilityResult?.Invoke(isCompatible, reason);
         }
 
         // ── Dispose ─────────────────────────────────────────────────────

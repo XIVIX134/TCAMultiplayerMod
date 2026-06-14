@@ -164,6 +164,7 @@ namespace TCAMultiplayer.Protocol
     {
         public ulong PeerId;
         public byte[] ManifestData;
+        public string ModVersion;
     }
 
     /// <summary>
@@ -174,6 +175,7 @@ namespace TCAMultiplayer.Protocol
         public ulong PeerId;
         public bool IsCompatible;
         public string RejectionReason;
+        public string HostModVersion;
     }
 
     // ═══════════════════════════════════════════════════════════════

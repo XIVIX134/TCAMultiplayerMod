@@ -1302,6 +1302,7 @@ namespace TCAMultiplayer.Protocol
                 {
                     w.Write(packet.ManifestData);
                 }
+                w.Write(packet.ModVersion ?? "");
                 return ms.ToArray();
             }
         }
@@ -1328,6 +1329,8 @@ namespace TCAMultiplayer.Protocol
                     packet.ManifestData = r.ReadBytes(length);
                 }
 
+                packet.ModVersion = ReadOptionalString(r);
+
                 return packet;
             });
         }
@@ -1340,6 +1343,7 @@ namespace TCAMultiplayer.Protocol
                 w.Write(packet.PeerId);
                 w.Write(packet.IsCompatible);
                 w.Write(packet.RejectionReason ?? "");
+                w.Write(packet.HostModVersion ?? "");
                 return ms.ToArray();
             }
         }
@@ -1347,12 +1351,37 @@ namespace TCAMultiplayer.Protocol
         public static ModCompatibilityResultPacket DeserializeModCompatibilityResult(byte[] data)
         {
             // PeerId(8) + IsCompatible(1) + str(1+) = 10
-            return SafeRead(data, 10, nameof(ModCompatibilityResultPacket), r => new ModCompatibilityResultPacket
+            return SafeRead(data, 10, nameof(ModCompatibilityResultPacket), r =>
             {
-                PeerId = r.ReadUInt64(),
-                IsCompatible = r.ReadBoolean(),
-                RejectionReason = r.ReadString()
+                var packet = new ModCompatibilityResultPacket
+                {
+                    PeerId = r.ReadUInt64(),
+                    IsCompatible = r.ReadBoolean(),
+                    RejectionReason = r.ReadString()
+                };
+
+                packet.HostModVersion = ReadOptionalString(r);
+                return packet;
             });
+        }
+
+        private static string ReadOptionalString(BinaryReader r)
+        {
+            if (r == null || r.BaseStream.Position >= r.BaseStream.Length)
+                return "";
+
+            try
+            {
+                return r.ReadString() ?? "";
+            }
+            catch (EndOfStreamException)
+            {
+                return "";
+            }
+            catch (IOException)
+            {
+                return "";
+            }
         }
     }
 }

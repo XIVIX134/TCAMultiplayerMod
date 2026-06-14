@@ -1493,7 +1493,8 @@ namespace TCAMultiplayer.Tests
             var original = new ModManifestPacket
             {
                 PeerId = 42,
-                ManifestData = manifestBytes
+                ManifestData = manifestBytes,
+                ModVersion = "0.2.1"
             };
 
             byte[] data = PacketSerializer.SerializeModManifest(original);
@@ -1501,6 +1502,7 @@ namespace TCAMultiplayer.Tests
 
             Assert.AreEqual(original.PeerId, result.PeerId);
             CollectionAssert.AreEqual(manifestBytes, result.ManifestData);
+            Assert.AreEqual(original.ModVersion, result.ModVersion);
         }
 
         [Test]
@@ -1517,6 +1519,7 @@ namespace TCAMultiplayer.Tests
 
             Assert.AreEqual(original.PeerId, result.PeerId);
             Assert.IsNull(result.ManifestData);
+            Assert.AreEqual("", result.ModVersion);
         }
 
         [Test]
@@ -1526,7 +1529,8 @@ namespace TCAMultiplayer.Tests
             {
                 PeerId = 42,
                 IsCompatible = false,
-                RejectionReason = "Missing mod: CoolPlanes v2.0"
+                RejectionReason = "Missing mod: CoolPlanes v2.0",
+                HostModVersion = "0.2.1"
             };
 
             byte[] data = PacketSerializer.SerializeModCompatibilityResult(original);
@@ -1535,6 +1539,49 @@ namespace TCAMultiplayer.Tests
             Assert.AreEqual(original.PeerId, result.PeerId);
             Assert.AreEqual(original.IsCompatible, result.IsCompatible);
             Assert.AreEqual(original.RejectionReason, result.RejectionReason);
+            Assert.AreEqual(original.HostModVersion, result.HostModVersion);
+        }
+
+        [Test]
+        public void ModManifest_LegacyPayload_DefaultsVersionToEmpty()
+        {
+            var manifestBytes = new byte[] { 0xAA, 0xBB };
+            byte[] data;
+            using (var ms = new System.IO.MemoryStream())
+            using (var w = new System.IO.BinaryWriter(ms))
+            {
+                w.Write(42UL);
+                w.Write(manifestBytes.Length);
+                w.Write(manifestBytes);
+                data = ms.ToArray();
+            }
+
+            var result = PacketSerializer.DeserializeModManifest(data);
+
+            Assert.AreEqual(42UL, result.PeerId);
+            CollectionAssert.AreEqual(manifestBytes, result.ManifestData);
+            Assert.AreEqual("", result.ModVersion);
+        }
+
+        [Test]
+        public void ModCompatibilityResult_LegacyPayload_DefaultsHostVersionToEmpty()
+        {
+            byte[] data;
+            using (var ms = new System.IO.MemoryStream())
+            using (var w = new System.IO.BinaryWriter(ms))
+            {
+                w.Write(42UL);
+                w.Write(true);
+                w.Write("");
+                data = ms.ToArray();
+            }
+
+            var result = PacketSerializer.DeserializeModCompatibilityResult(data);
+
+            Assert.AreEqual(42UL, result.PeerId);
+            Assert.IsTrue(result.IsCompatible);
+            Assert.AreEqual("", result.RejectionReason);
+            Assert.AreEqual("", result.HostModVersion);
         }
 
         // ═══════════════════════════════════════════════════════════

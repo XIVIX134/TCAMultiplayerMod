@@ -22,12 +22,14 @@ namespace TCAMultiplayer.Core
         private const string Tag = "CONN";
 
         private readonly ITransport _transport;
+        private readonly ITransportDiagnostics _diagnostics;
         private readonly TransportConfig _config;
         private readonly ReliabilityLayer _reliability;
         private readonly PacketRouter _router;
 
         private GameSession _session;
         private bool _disposed;
+        private string _statusMessage = "";
 
         // ── Public accessors ─────────────────────────────────────────────
 
@@ -43,6 +45,8 @@ namespace TCAMultiplayer.Core
         /// <summary>Fired after a peer leaves the current session.</summary>
         public event Action<ulong> OnPeerLeft;
 
+        /// <summary>Fired when the transport/session has a user-facing network status.</summary>
+        public event Action<string> OnStatusMessage;
 
         /// <summary>Packet router for handler registration.</summary>
         public PacketRouter Router => _router;
@@ -63,11 +67,15 @@ namespace TCAMultiplayer.Core
         /// <summary>True if the local peer is hosting.</summary>
         public bool IsHost => _transport?.IsHost ?? false;
 
+        /// <summary>Most recent user-facing networking status.</summary>
+        public string StatusMessage => _statusMessage;
+
         // ── Constructor ──────────────────────────────────────────────────
 
         public ConnectionManager(ITransport transport, TransportConfig config = null)
         {
             _transport = transport ?? throw new ArgumentNullException(nameof(transport));
+            _diagnostics = transport as ITransportDiagnostics;
             _config = config ?? new TransportConfig();
 
             _router = new PacketRouter();
@@ -77,6 +85,8 @@ namespace TCAMultiplayer.Core
             _transport.OnPeerConnected += HandlePeerConnected;
             _transport.OnPeerDisconnected += HandlePeerDisconnected;
             _transport.OnDataReceived += HandleDataReceived;
+            if (_diagnostics != null)
+                _diagnostics.OnStatusChanged += SetStatusMessage;
 
             // Wire reliability → router
             _reliability.OnDataReady += HandleDataReady;
@@ -99,6 +109,7 @@ namespace TCAMultiplayer.Core
             }
 
             _reliability.Clear();
+            SetStatusMessage($"Hosting on port {port}");
             _transport.StartHost(port);
 
             _session = new GameSession(isHost: true);
@@ -129,6 +140,7 @@ namespace TCAMultiplayer.Core
             }
 
             _reliability.Clear();
+            SetStatusMessage($"Connecting to {address}:{port}");
             _transport.Connect(address, port);
 
             _session = new GameSession(isHost: false);
@@ -165,6 +177,7 @@ namespace TCAMultiplayer.Core
             if (hadSession)
                 OnSessionEnded?.Invoke();
 
+            SetStatusMessage("Disconnected");
             Log.Info(Tag, "Disconnected");
         }
 
@@ -221,6 +234,32 @@ namespace TCAMultiplayer.Core
             return _reliability.GetPendingCount(peerId);
         }
 
+        public int GetReliablePendingCount()
+        {
+            return _reliability.GetTotalPendingCount();
+        }
+
+        public ReliabilityLayer.ReliabilityStats GetReliabilityStats()
+        {
+            return _reliability.GetStats();
+        }
+
+        public NetworkQualitySnapshot GetNetworkQuality()
+        {
+            return _diagnostics?.GetNetworkQuality()
+                ?? NetworkQualitySnapshot.Empty(_statusMessage);
+        }
+
+        public void SetStatusMessage(string message)
+        {
+            message = message ?? string.Empty;
+            if (message == _statusMessage)
+                return;
+
+            _statusMessage = message;
+            OnStatusMessage?.Invoke(message);
+        }
+
         // ── Dispose ─────────────────────────────────────────────────────
 
         public void Dispose()
@@ -234,10 +273,13 @@ namespace TCAMultiplayer.Core
             _transport.OnPeerConnected -= HandlePeerConnected;
             _transport.OnPeerDisconnected -= HandlePeerDisconnected;
             _transport.OnDataReceived -= HandleDataReceived;
+            if (_diagnostics != null)
+                _diagnostics.OnStatusChanged -= SetStatusMessage;
             _reliability.OnDataReady -= HandleDataReady;
             OnSessionCreated = null;
             OnSessionEnded = null;
             OnPeerLeft = null;
+            OnStatusMessage = null;
         }
 
         // ── Event handlers (private) ────────────────────────────────────
@@ -254,11 +296,13 @@ namespace TCAMultiplayer.Core
                 var username = ModConfig.Username?.Value ?? "Player";
                 _session.AddPlayer(_session.LocalPeerId, username);
                 Log.Info(Tag, $"Client assigned peer ID {_session.LocalPeerId}");
+                SetStatusMessage("Connected");
             }
 
             // Add the remote peer (host sees client, client sees host)
             _session.AddPlayer(peerId, $"Peer_{peerId}");
             Log.Info(Tag, $"Peer {peerId} connected");
+            SetStatusMessage(_session.IsHost ? $"Peer {peerId} connected" : "Connected");
 
             // HOST: send Welcome packet with the new peer's assigned ID
             if (_session.IsHost)
@@ -289,15 +333,29 @@ namespace TCAMultiplayer.Core
             if (!_session.IsHost && peerId == 1)
             {
                 _reliability.RemovePeer(peerId);
-                Log.Warning(Tag, "Host disconnected — ending client session");
+                string rejectionStatus = GetTransportRejectionStatus();
+                if (string.IsNullOrWhiteSpace(rejectionStatus))
+                {
+                    SetStatusMessage("Host disconnected");
+                    Log.Warning(Tag, "Host disconnected — ending client session");
+                }
+                else
+                {
+                    SetStatusMessage(rejectionStatus);
+                    Log.Warning(Tag, $"Host rejected connection — ending client session: {rejectionStatus}");
+                }
+
                 OnPeerLeft?.Invoke(peerId);
                 Disconnect();
+                if (!string.IsNullOrWhiteSpace(rejectionStatus))
+                    SetStatusMessage(rejectionStatus);
                 return;
             }
 
             _session.RemovePlayer(peerId);
             _reliability.RemovePeer(peerId);
             Log.Info(Tag, $"Peer {peerId} disconnected");
+            SetStatusMessage($"Peer {peerId} disconnected");
             OnPeerLeft?.Invoke(peerId);
         }
 
@@ -317,6 +375,18 @@ namespace TCAMultiplayer.Core
         private void HandleDataReady(ulong peerId, byte[] data)
         {
             _router.Route(peerId, data);
+        }
+
+        private string GetTransportRejectionStatus()
+        {
+            string status = _diagnostics?.StatusMessage ?? string.Empty;
+            if (status.IndexOf("version mismatch", StringComparison.OrdinalIgnoreCase) >= 0
+                || status.IndexOf("rejected", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return status;
+            }
+
+            return string.Empty;
         }
 
         // ── Guards ──────────────────────────────────────────────────────

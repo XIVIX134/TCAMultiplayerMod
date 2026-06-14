@@ -15,6 +15,9 @@ namespace TCAMultiplayer.Core
         public static ConfigEntry<string> Username { get; private set; }
         public static ConfigEntry<string> LastIP { get; private set; }
         public static ConfigEntry<string> LastPort { get; private set; }
+        public static ConfigEntry<bool> VpnMode { get; private set; }
+        public static ConfigEntry<string> LocalBindAddress { get; private set; }
+        public static ConfigEntry<bool> LowBandwidthMode { get; private set; }
         public static ConfigEntry<string> LastAircraft { get; private set; }
         public static ConfigEntry<string> LastLoadout { get; private set; }
         public static ConfigEntry<string> LastAirfield { get; private set; }
@@ -73,6 +76,12 @@ namespace TCAMultiplayer.Core
             Username        = config.Bind("Player", "Username", "Player", "Your multiplayer username.");
             LastIP          = config.Bind("Network", "LastIP", "127.0.0.1", "Last connected IP address.");
             LastPort        = config.Bind("Network", "LastPort", "7777", "Last connected port.");
+            VpnMode = config.Bind("Network", "VpnMode", true,
+                "Deprecated: routing is automatic. Leave enabled unless debugging an adapter issue.");
+            LocalBindAddress = config.Bind("Network", "LocalBindAddress", "",
+                "Advanced: optional local IPv4 address to bind multiplayer UDP to. Leave blank for automatic route selection.");
+            LowBandwidthMode = config.Bind("Network", "LowBandwidthMode", false,
+                "Advanced: force reduced aircraft update traffic and longer waits. Normally automatic quality detection handles this.");
             LastAircraft    = config.Bind("Player", "LastAircraft", "AV8B", "Last selected aircraft ID.");
             LastLoadout     = config.Bind("Player", "LastLoadout", "Clean", "Last selected loadout name.");
             LastAirfield    = config.Bind("Player", "LastAirfield", "", "Last selected airfield name.");

@@ -24,7 +24,7 @@ namespace TCAMultiplayer
     /// BepInEx plugin entry point. ONLY bootstraps and wires components.
     /// No business logic — just creation and disposal.
     /// </summary>
-    [BepInPlugin("com.tcamp.mod", "TCAMP", "0.2.1")]
+    [BepInPlugin(PluginMetadata.Guid, PluginMetadata.Name, PluginMetadata.Version)]
     public class Plugin : BaseUnityPlugin
     {
         private const string Tag = "PLUGIN";
@@ -124,8 +124,12 @@ namespace TCAMultiplayer
 
             var config = new TransportConfig
             {
-                MaxConnections = GameSession.ClampMaxPlayersTotal(ModConfig.HostMaxPlayersTotal?.Value ?? 8) - 1
+                MaxConnections = GameSession.ClampMaxPlayersTotal(ModConfig.HostMaxPlayersTotal?.Value ?? 8) - 1,
+                LocalBindAddress = ModConfig.LocalBindAddress?.Value ?? "",
+                AutoVpnBind = true,
+                ModVersion = PluginMetadata.Version
             };
+            ApplyBandwidthPreset(config);
             _transport = new DirectUdpTransport(config);
 
             _connection = new ConnectionManager(_transport, config);
@@ -173,9 +177,16 @@ namespace TCAMultiplayer
 
         private float _lastStateSendTime;
         private float _stateSendAccumulator;
+        private float _adaptiveStateSendRateHz = DefaultStateSendRateHz;
+        private float _nextNetworkQualityUpdateTime;
+        private long _lastReliableRetransmits;
+        private long _lastReliableDrops;
         private const float DefaultStateSendRateHz = 60f;
         private const float MinStateSendRateHz = 10f;
         private const float MaxStateSendRateHz = 120f;
+        private const float LowBandwidthStateSendRateHz = 20f;
+        private const float PoorQualityStateSendRateHz = 30f;
+        private const float BadQualityStateSendRateHz = 20f;
 
         private void Update()
         {
@@ -201,6 +212,7 @@ namespace TCAMultiplayer
             _missileSync?.Update();
             _bombSync?.Update();
             LogSessionDiagnostics(localAircraft);
+            UpdateAdaptiveNetworkQuality();
 
             if (localAircraft != null)
             {
@@ -211,7 +223,11 @@ namespace TCAMultiplayer
 
         private bool ShouldSendAircraftState(float deltaTime)
         {
-            float rateHz = ModConfig.StateSendRateHz?.Value ?? DefaultStateSendRateHz;
+            bool lowBandwidth = ModConfig.LowBandwidthMode?.Value ?? false;
+            float configuredRate = ModConfig.StateSendRateHz?.Value ?? DefaultStateSendRateHz;
+            float rateHz = Mathf.Min(configuredRate, _adaptiveStateSendRateHz);
+            if (lowBandwidth)
+                rateHz = Mathf.Min(rateHz, LowBandwidthStateSendRateHz);
             rateHz = Mathf.Clamp(rateHz, MinStateSendRateHz, MaxStateSendRateHz);
             float interval = 1f / rateHz;
 
@@ -386,6 +402,7 @@ namespace TCAMultiplayer
             try
             {
                 SetNativeMainMenuUIVisible(false);
+                ApplyBandwidthPreset(_connection?.Config);
 
                 if (_liveTest.Role == LiveTestRole.Host)
                 {
@@ -464,6 +481,82 @@ namespace TCAMultiplayer
                 $"Defaults applied: player={local.PlayerName}, aircraft={local.SelectedAircraft}, " +
                 $"loadout={local.SelectedLoadout}, airfield={local.SelectedAirfield}");
             return true;
+        }
+
+        private static void ApplyBandwidthPreset(TransportConfig config)
+        {
+            if (config == null) return;
+
+            config.LocalBindAddress = ModConfig.LocalBindAddress?.Value ?? "";
+            config.AutoVpnBind = true;
+            config.ModVersion = PluginMetadata.Version;
+            bool lowBandwidth = ModConfig.LowBandwidthMode?.Value ?? false;
+            if (lowBandwidth)
+            {
+                config.KeepaliveInterval = 1.0f;
+                config.TimeoutSeconds = 20.0f;
+                config.ReconnectGraceSeconds = 90.0f;
+                config.EndpointRefreshInterval = 3.0f;
+                config.RetransmitInterval = 0.35f;
+                config.MaxRetransmitAttempts = 180;
+                config.MaxReliableRetransmitsPerUpdate = 4;
+            }
+            else
+            {
+                config.KeepaliveInterval = 2.0f;
+                config.TimeoutSeconds = 10.0f;
+                config.ReconnectGraceSeconds = 30.0f;
+                config.EndpointRefreshInterval = 5.0f;
+                config.RetransmitInterval = 0.25f;
+                config.MaxRetransmitAttempts = 120;
+                config.MaxReliableRetransmitsPerUpdate = 8;
+            }
+        }
+
+        private void UpdateAdaptiveNetworkQuality()
+        {
+            if (_connection == null || _activeSession == null)
+                return;
+            if (Time.time < _nextNetworkQualityUpdateTime)
+                return;
+
+            _nextNetworkQualityUpdateTime = Time.time + 2f;
+
+            var quality = _connection.GetNetworkQuality();
+            var reliability = _connection.GetReliabilityStats();
+            long retransmitDelta = Math.Max(0L, reliability.ReliableRetransmitted - _lastReliableRetransmits);
+            long dropDelta = Math.Max(0L, reliability.ReliableDropped - _lastReliableDrops);
+            _lastReliableRetransmits = reliability.ReliableRetransmitted;
+            _lastReliableDrops = reliability.ReliableDropped;
+
+            float configuredRate = ModConfig.StateSendRateHz?.Value ?? DefaultStateSendRateHz;
+            float targetRate = Mathf.Clamp(configuredRate, MinStateSendRateHz, MaxStateSendRateHz);
+            bool lowBandwidth = ModConfig.LowBandwidthMode?.Value ?? false;
+
+            if (lowBandwidth)
+            {
+                targetRate = Mathf.Min(targetRate, LowBandwidthStateSendRateHz);
+            }
+            else if (dropDelta > 0 || reliability.PendingCount >= 12 || retransmitDelta >= 16
+                || quality.SmoothedRttMs >= 450f || quality.SecondsSinceLastReceive >= 3.5f)
+            {
+                targetRate = Mathf.Min(targetRate, BadQualityStateSendRateHz);
+            }
+            else if (reliability.PendingCount >= 5 || retransmitDelta >= 6
+                || quality.SmoothedRttMs >= 220f || quality.SecondsSinceLastReceive >= 2.0f)
+            {
+                targetRate = Mathf.Min(targetRate, PoorQualityStateSendRateHz);
+            }
+
+            targetRate = Mathf.Clamp(targetRate, MinStateSendRateHz, MaxStateSendRateHz);
+            if (Mathf.Abs(targetRate - _adaptiveStateSendRateHz) < 0.5f)
+                return;
+
+            _adaptiveStateSendRateHz = targetRate;
+            Log.Info(Tag,
+                $"Adaptive send rate -> {_adaptiveStateSendRateHz:0} Hz " +
+                $"(rtt={quality.SmoothedRttMs:0}ms, pending={reliability.PendingCount}, " +
+                $"retries+{retransmitDelta}, drops+{dropDelta}, route={quality.RouteDescription})");
         }
 
         private bool RemotePlayersReady()
@@ -1301,6 +1394,7 @@ namespace TCAMultiplayer
             {
                 Log.Warning(Tag, $"Mod compatibility rejected by host: {reason}");
                 _connection?.Disconnect();
+                _connection?.SetStatusMessage($"Connected, but mod mismatch: {reason}");
             }
         }
 

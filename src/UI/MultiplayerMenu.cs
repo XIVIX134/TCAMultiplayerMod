@@ -36,6 +36,7 @@ namespace TCAMultiplayer.UI
         private bool _refreshPending;
         private bool _nativeDialogOpen;
         private CursorLockMode _previousCursorLockState;
+        private string _statusMessage = "";
 
         public Action OnMenuClosed;
         public bool IsVisible => _visible;
@@ -49,6 +50,9 @@ namespace TCAMultiplayer.UI
         public void Init(ConnectionManager connection)
         {
             _connection = connection ?? throw new ArgumentNullException(nameof(connection));
+            _connection.OnStatusMessage -= OnConnectionStatusMessage;
+            _connection.OnStatusMessage += OnConnectionStatusMessage;
+            _statusMessage = _connection.StatusMessage ?? "";
             UIFactory.NativeDialogActiveChanged -= OnNativeDialogActiveChanged;
             UIFactory.NativeDialogActiveChanged += OnNativeDialogActiveChanged;
         }
@@ -133,12 +137,20 @@ namespace TCAMultiplayer.UI
         private void OnDestroy()
         {
             if (_lobby != null) _lobby.OnLobbyStateChanged -= OnLobbyStateChanged;
+            if (_connection != null) _connection.OnStatusMessage -= OnConnectionStatusMessage;
             UIFactory.NativeDialogActiveChanged -= OnNativeDialogActiveChanged;
         }
 
         private void OnLobbyStateChanged()
         {
             if (_visible && _currentScreen == Screen.Lobby)
+                RefreshUI();
+        }
+
+        private void OnConnectionStatusMessage(string message)
+        {
+            _statusMessage = message ?? "";
+            if (_visible)
                 RefreshUI();
         }
 
@@ -267,6 +279,7 @@ namespace TCAMultiplayer.UI
         {
             var panel = CreateMenuPanel(620f, 470f);
             AddHeader(panel.transform, "MULTIPLAYER", "Host a direct session or connect to another pilot.");
+            DrawStatusMessage(panel.transform);
 
             UIFactory.CreateLabelInputRow("Pilot >", _username, panel.transform, val =>
             {
@@ -290,8 +303,9 @@ namespace TCAMultiplayer.UI
 
         private void DrawHostSetup()
         {
-            var panel = CreateMenuPanel(680f, 500f);
+            var panel = CreateMenuPanel(700f, 560f);
             AddHeader(panel.transform, "HOST GAME", "Create a lobby and wait for peers to join.");
+            DrawStatusMessage(panel.transform);
 
             UIFactory.CreateLabelInputRow("Server >", _hostName, panel.transform, val =>
             {
@@ -330,8 +344,9 @@ namespace TCAMultiplayer.UI
 
         private void DrawDirectConnect()
         {
-            var panel = CreateMenuPanel(660f, 430f);
+            var panel = CreateMenuPanel(700f, 470f);
             AddHeader(panel.transform, "DIRECT CONNECT", "Join a lobby by address.");
+            DrawStatusMessage(panel.transform);
 
             UIFactory.CreateLabelInputRow("Address >", _connectIP, panel.transform, val =>
             {
@@ -362,6 +377,7 @@ namespace TCAMultiplayer.UI
 
             var shell = CreateMenuPanel(1120f, 800f);
             AddHeader(shell.transform, "MULTIPLAYER LOBBY", BuildLobbySubtitle(session, isHost));
+            DrawStatusMessage(shell.transform);
 
             var body = UIFactory.CreateHorizontalGroup(shell.transform, 16);
             UIFactory.SetFlexible(body, 1f, 1f);
@@ -689,6 +705,7 @@ namespace TCAMultiplayer.UI
             try
             {
                 ApplyHostConfigToTransport();
+                ApplyNetworkConfigToTransport();
                 _connection.HostSession(_hostName, port);
                 var local = _connection.Session?.GetLocalPlayer();
                 if (local != null) local.PlayerName = _username;
@@ -710,6 +727,7 @@ namespace TCAMultiplayer.UI
 
             try
             {
+                ApplyNetworkConfigToTransport();
                 _connection.JoinSession(_connectIP, port);
                 var local = _connection.Session?.GetLocalPlayer();
                 if (local != null) local.PlayerName = _username;
@@ -756,6 +774,17 @@ namespace TCAMultiplayer.UI
                 desc.GetComponent<LayoutElement>().preferredHeight = 30f;
             }
             UIFactory.CreateDivider(parent, 0.18f);
+        }
+
+        private void DrawStatusMessage(Transform parent)
+        {
+            if (string.IsNullOrWhiteSpace(_statusMessage))
+                return;
+
+            var text = UIFactory.CreateNativeText(
+                $"<color={Green}>{_statusMessage}</color>",
+                parent, 15, TextAlignmentOptions.Left);
+            text.GetComponent<LayoutElement>().preferredHeight = 24f;
         }
 
         private Button Track(Button button)
@@ -896,6 +925,39 @@ namespace TCAMultiplayer.UI
             if (_connection?.Config == null) return;
             int maxPlayers = GameSession.ClampMaxPlayersTotal(ModConfig.HostMaxPlayersTotal?.Value ?? 8);
             _connection.Config.MaxConnections = Math.Max(0, maxPlayers - 1);
+        }
+
+        private void ApplyNetworkConfigToTransport()
+        {
+            if (_connection?.Config == null) return;
+
+            _connection.Config.LocalBindAddress = ModConfig.LocalBindAddress?.Value ?? "";
+            _connection.Config.AutoVpnBind = true;
+            _connection.Config.ModVersion = PluginMetadata.Version;
+
+            bool lowBandwidth = ModConfig.LowBandwidthMode?.Value ?? false;
+            if (lowBandwidth)
+            {
+                _connection.Config.KeepaliveInterval = 1.0f;
+                _connection.Config.TimeoutSeconds = 20.0f;
+                _connection.Config.ReconnectGraceSeconds = 90.0f;
+                _connection.Config.EndpointRefreshInterval = 3.0f;
+                _connection.Config.RetransmitInterval = 0.35f;
+                _connection.Config.MaxRetransmitAttempts = 180;
+                _connection.Config.MaxReliableRetransmitsPerUpdate = 4;
+            }
+            else
+            {
+                _connection.Config.KeepaliveInterval = 2.0f;
+                _connection.Config.TimeoutSeconds = 10.0f;
+                _connection.Config.ReconnectGraceSeconds = 30.0f;
+                _connection.Config.EndpointRefreshInterval = 5.0f;
+                _connection.Config.RetransmitInterval = 0.25f;
+                _connection.Config.MaxRetransmitAttempts = 120;
+                _connection.Config.MaxReliableRetransmitsPerUpdate = 8;
+            }
+
+            ModConfig.Save();
         }
 
         private static string BuildLobbySubtitle(GameSession session, bool isHost)
