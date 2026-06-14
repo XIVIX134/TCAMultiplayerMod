@@ -827,6 +827,8 @@ namespace TCAMultiplayer
                 // Matches GameLogic.StartQuickMission pattern: ShowMainMenu(false) when entering flight
                 SetNativeMainMenuVisible(false);
 
+                await WaitForFlightGameTeardown("before new game start");
+
                 string resolvedMapName = string.IsNullOrWhiteSpace(mapName)
                     ? MapHelper.GetDefaultMapName()
                     : mapName;
@@ -855,11 +857,11 @@ namespace TCAMultiplayer
                     UnityEngine.SceneManagement.SceneManager.SetActiveScene(flightScene);
 
                 Log.Info(Tag, "Waiting for FlightGame initialization...");
-                float timeout = Time.time + 10f;
-                while (Falcon.Game2.FlightGame.Instance == null && Time.time < timeout)
+                float timeout = Time.realtimeSinceStartup + 10f;
+                while (!IsFlightGameInstanceInScene(flightScene) && Time.realtimeSinceStartup < timeout)
                     await UniTask.Yield();
 
-                if (Falcon.Game2.FlightGame.Instance == null)
+                if (!IsFlightGameInstanceInScene(flightScene))
                 {
                     Log.Error(Tag, "FlightGame.Instance timed out!");
                     _connection?.Disconnect();
@@ -1120,12 +1122,7 @@ namespace TCAMultiplayer
                 _loadingScreen?.Close(true).Forget();
                 _loadingScreen = null;
 
-                var flightScene = UnityEngine.SceneManagement.SceneManager.GetSceneByName(GameScenes.G2FlightGame);
-                if (flightScene.IsValid() && flightScene.isLoaded)
-                {
-                    Log.Info(Tag, "Unloading FlightGame scene (lobby return)");
-                    UnityEngine.SceneManagement.SceneManager.UnloadSceneAsync(GameScenes.G2FlightGame);
-                }
+                UnloadFlightGameScene("lobby return").Forget();
             }
             catch (System.Exception ex)
             {
@@ -1238,6 +1235,64 @@ namespace TCAMultiplayer
             _pauseMenuInput?.UnregisterAllActions();
             _pauseMenuInput = null;
             _mpPauseMenuOpen = false;
+        }
+
+        private static bool IsFlightGameSceneLoaded()
+        {
+            var flightScene = UnityEngine.SceneManagement.SceneManager.GetSceneByName(GameScenes.G2FlightGame);
+            return flightScene.IsValid() && flightScene.isLoaded;
+        }
+
+        private static bool IsFlightGameInstanceAlive()
+        {
+            return Falcon.Game2.FlightGame.Instance != null;
+        }
+
+        private static bool IsFlightGameInstanceInScene(UnityEngine.SceneManagement.Scene scene)
+        {
+            var flightGame = Falcon.Game2.FlightGame.Instance;
+            return flightGame != null
+                && scene.IsValid()
+                && flightGame.gameObject.scene == scene;
+        }
+
+        private async UniTask WaitForFlightGameTeardown(string reason, float timeoutSeconds = 10f)
+        {
+            float deadline = Time.realtimeSinceStartup + timeoutSeconds;
+
+            while ((IsFlightGameSceneLoaded() || IsFlightGameInstanceAlive())
+                && Time.realtimeSinceStartup < deadline)
+            {
+                await UniTask.Yield();
+            }
+
+            if (IsFlightGameSceneLoaded() || IsFlightGameInstanceAlive())
+            {
+                Log.Warning(Tag,
+                    $"Timed out waiting for FlightGame teardown ({reason}); " +
+                    $"sceneLoaded={IsFlightGameSceneLoaded()}, instanceAlive={IsFlightGameInstanceAlive()}");
+            }
+        }
+
+        private async UniTask UnloadFlightGameScene(string reason)
+        {
+            try
+            {
+                var flightScene = UnityEngine.SceneManagement.SceneManager.GetSceneByName(GameScenes.G2FlightGame);
+                if (flightScene.IsValid() && flightScene.isLoaded)
+                {
+                    Log.Info(Tag, $"Unloading FlightGame scene ({reason})");
+                    var unloadOp = UnityEngine.SceneManagement.SceneManager.UnloadSceneAsync(flightScene);
+                    while (unloadOp != null && !unloadOp.isDone)
+                        await UniTask.Yield();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(Tag, $"FlightGame unload error ({reason}): {ex.Message}");
+            }
+
+            await WaitForFlightGameTeardown(reason);
         }
 
         private void TryOpenPauseMenu()
@@ -1533,8 +1588,7 @@ namespace TCAMultiplayer
                 var flightScene = UnityEngine.SceneManagement.SceneManager.GetSceneByName(GameScenes.G2FlightGame);
                 if (flightScene.IsValid() && flightScene.isLoaded)
                 {
-                    Log.Info(Tag, "Unloading FlightGame scene");
-                    UnityEngine.SceneManagement.SceneManager.UnloadSceneAsync(GameScenes.G2FlightGame);
+                    UnloadFlightGameScene("session teardown").Forget();
                 }
 
                 var gameLogic = Falcon.Game2.GameLogic.Instance;
