@@ -17,6 +17,7 @@ using System;
 using TCAMultiplayer.Protocol;
 using TCAMultiplayer.UI;
 using TCAMultiplayer.Compatibility;
+using TCAMultiplayer.Updating;
 
 namespace TCAMultiplayer
 {
@@ -106,6 +107,12 @@ namespace TCAMultiplayer
         private Falcon.Game2.MainMenu _nativeMainMenu;
         private bool _suppressNativeMainMenuRestore;
         private bool _tearingDown;
+        private readonly object _updaterLock = new object();
+        private ModUpdater _updater;
+        private string _updaterStatusMessage = "";
+        private bool _updaterStatusDirty;
+        private ModUpdateResult _pendingUpdateNotice;
+        private bool _updateNoticeShown;
         private LiveTestOptions _liveTest;
         private bool _liveSessionStarted;
         private bool _liveDefaultsApplied;
@@ -142,6 +149,7 @@ namespace TCAMultiplayer
             // UI (always available — independent of session)
             _menu = gameObject.AddComponent<MultiplayerMenu>();
             _menu.Init(_connection);
+            _menu.SetExternalStatusProvider(() => _updaterStatusMessage);
             _menu.OnMenuClosed = () =>
             {
                 if (_suppressNativeMainMenuRestore)
@@ -152,6 +160,7 @@ namespace TCAMultiplayer
             };
             _scoreboard = gameObject.AddComponent<ScoreboardHUD>();
             _respawnScreen = gameObject.AddComponent<RespawnScreen>();
+            StartUpdater();
 
             // Wire main menu button → multiplayer menu + hide native main menu UI
             MainMenuPatch.OnMultiplayerClicked = mainMenu =>
@@ -190,6 +199,7 @@ namespace TCAMultiplayer
 
         private void Update()
         {
+            ProcessUpdaterUi();
             _connection?.Update(Time.deltaTime);
             DriveLiveTest();
             DriveLiveGearCycle();
@@ -244,6 +254,74 @@ namespace TCAMultiplayer
 
             _stateSendAccumulator %= interval;
             return true;
+        }
+
+        private void StartUpdater()
+        {
+            if (ModConfig.CheckForUpdatesOnLaunch?.Value != true)
+            {
+                Log.Info("UPDATER", "Update check disabled by config");
+                return;
+            }
+
+            _updater = new ModUpdater(new UpdateSettings
+            {
+                LatestReleaseApiUrl = ModConfig.UpdateApiUrl?.Value,
+                CurrentVersion = PluginMetadata.Version,
+                CurrentPluginPath = Assembly.GetExecutingAssembly().Location,
+                TimeoutMilliseconds = 15000
+            });
+            _updater.OnStatusChanged += HandleUpdaterStatusChanged;
+            _updater.OnUpdateReady += HandleUpdateReady;
+            _updater.CheckForUpdatesAsync().Forget();
+        }
+
+        private void HandleUpdaterStatusChanged(string message)
+        {
+            lock (_updaterLock)
+            {
+                _updaterStatusMessage = message ?? "";
+                _updaterStatusDirty = true;
+            }
+        }
+
+        private void HandleUpdateReady(ModUpdateResult result)
+        {
+            lock (_updaterLock)
+            {
+                _pendingUpdateNotice = result;
+                _updaterStatusMessage = result?.Message ?? "";
+                _updaterStatusDirty = true;
+            }
+        }
+
+        private void ProcessUpdaterUi()
+        {
+            bool refreshMenu;
+            ModUpdateResult notice;
+            lock (_updaterLock)
+            {
+                refreshMenu = _updaterStatusDirty;
+                _updaterStatusDirty = false;
+                notice = _pendingUpdateNotice;
+            }
+
+            if (refreshMenu)
+                _menu?.RefreshIfVisible();
+
+            if (_updateNoticeShown || notice == null || !UIFactory.HasPrefabs || _activeSession != null)
+                return;
+
+            _updateNoticeShown = true;
+            string message = notice.Message
+                + "\n\nThe updater will replace the plugin after this game process closes. Launch the game again to load the new version.";
+            UIFactory.ShowConfirmDialog(
+                "TCAMP UPDATE READY",
+                message,
+                "OK",
+                "LATER",
+                () => { },
+                () => { });
         }
 
         private void DriveLiveTest()
@@ -1642,6 +1720,11 @@ namespace TCAMultiplayer
             _eventBridge?.Dispose();
             _aircraftSpawner?.Dispose();
             _originService?.Dispose();
+            if (_updater != null)
+            {
+                _updater.OnStatusChanged -= HandleUpdaterStatusChanged;
+                _updater.OnUpdateReady -= HandleUpdateReady;
+            }
             if (_connection != null)
             {
                 _connection.OnSessionCreated -= OnSessionCreated;

@@ -48,6 +48,7 @@ namespace TCAMultiplayer.UI
         private bool _nativeDialogOpen;
         private CursorLockMode _previousCursorLockState;
         private string _statusMessage = "";
+        private Func<string> _externalStatusProvider;
         private ModManifestCollector _modManifest;
         private ModManifestCollector.ModMismatchInfo _modMismatch;
         private bool _modSyncInProgress;
@@ -79,6 +80,17 @@ namespace TCAMultiplayer.UI
             if (_lobby != null) _lobby.OnLobbyStateChanged -= OnLobbyStateChanged;
             _lobby = lobby;
             if (_lobby != null) _lobby.OnLobbyStateChanged += OnLobbyStateChanged;
+        }
+
+        public void SetExternalStatusProvider(Func<string> statusProvider)
+        {
+            _externalStatusProvider = statusProvider;
+        }
+
+        public void RefreshIfVisible()
+        {
+            if (_visible)
+                RefreshUI();
         }
 
         public void SetModManifest(ModManifestCollector modManifest)
@@ -1039,11 +1051,14 @@ namespace TCAMultiplayer.UI
 
         private void DrawStatusMessage(Transform parent)
         {
-            if (string.IsNullOrWhiteSpace(_statusMessage))
+            string message = !string.IsNullOrWhiteSpace(_statusMessage)
+                ? _statusMessage
+                : _externalStatusProvider?.Invoke();
+            if (string.IsNullOrWhiteSpace(message))
                 return;
 
             var text = UIFactory.CreateNativeText(
-                $"<color={Green}>{_statusMessage}</color>",
+                $"<color={Green}>{message}</color>",
                 parent, 15, TextAlignmentOptions.Left);
             text.GetComponent<LayoutElement>().preferredHeight = 24f;
         }

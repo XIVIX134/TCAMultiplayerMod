@@ -64,6 +64,10 @@ namespace TCAMultiplayer.Core
         public static ConfigEntry<float> RemoteMotionDebugLogIntervalSeconds { get; private set; }
         public static ConfigEntry<float> RemoteMotionDebugDrawScale { get; private set; }
 
+        // ── Updater ────────────────────────────────────────────────────
+        public static ConfigEntry<bool> CheckForUpdatesOnLaunch { get; private set; }
+        public static ConfigEntry<string> UpdateApiUrl { get; private set; }
+
         /// <summary>
         /// Bind all config entries to the given <paramref name="config"/> file.
         /// Call once from Plugin.Awake().
@@ -138,6 +142,13 @@ namespace TCAMultiplayer.Core
                 "Seconds between detailed remote-motion debug log lines while debug is enabled.");
             RemoteMotionDebugDrawScale = config.Bind("Testing", "RemoteMotionDebugDrawScale", 0.20f,
                 "Scale applied to velocity/debug vectors drawn in world space.");
+
+            // Updater
+            CheckForUpdatesOnLaunch = config.Bind("Updater", "CheckForUpdatesOnLaunch", true,
+                "Check GitHub for a newer TCAMP release when the game launches.");
+            UpdateApiUrl = config.Bind("Updater", "UpdateApiUrl",
+                "https://api.github.com/repos/XIVIX134/TCAMultiplayerMod/releases/latest",
+                "GitHub latest-release API endpoint used by the in-game updater.");
         }
 
         public static string ConfigDirectory
