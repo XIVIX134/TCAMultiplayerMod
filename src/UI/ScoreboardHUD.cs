@@ -54,6 +54,8 @@ namespace TCAMultiplayer.UI
                 return;
             }
 
+            if (!HasCompleteUI())
+                ResetBuiltUI();
             if (!_uiBuilt) BuildUI();
             SetOverlaySorting(state == GameState.Respawning);
             ShowAll();
@@ -69,6 +71,41 @@ namespace TCAMultiplayer.UI
         private static bool ShouldShowHud(GameState state)
         {
             return state == GameState.InGame || state == GameState.Respawning;
+        }
+
+        private bool HasCompleteUI()
+        {
+            return _uiBuilt
+                && _canvasGo != null
+                && _compactPanel != null
+                && _killFeedPanel != null
+                && _scoreboardPanel != null
+                && _scoreboardPlayerContainer != null
+                && _killsText != null
+                && _deathsText != null;
+        }
+
+        private void ResetBuiltUI()
+        {
+            if (!_uiBuilt) return;
+
+            if (_compactPanel != null)
+                Object.Destroy(_compactPanel);
+            if (_canvasGo != null)
+                Object.Destroy(_canvasGo);
+
+            _canvasGo = null;
+            _compactPanel = null;
+            _killsText = null;
+            _deathsText = null;
+            _compactHudParent = null;
+            _compactHud = null;
+            _killFeedPanel = null;
+            _scoreboardPanel = null;
+            _scoreboardPlayerContainer = null;
+            _killFeedEntries.Clear();
+            _scoreboardRows.Clear();
+            _uiBuilt = false;
         }
 
         // ── UI Construction ─────────────────────────────────────────

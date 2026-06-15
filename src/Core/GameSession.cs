@@ -83,6 +83,7 @@ namespace TCAMultiplayer.Core
                     PlayerName = name,
                     IsHost = (peerId == LocalPeerId && IsHost)
                 };
+                info.IsModsVerified = info.IsHost;
 
                 _players[peerId] = info;
                 OnPlayerJoined?.Invoke(info);

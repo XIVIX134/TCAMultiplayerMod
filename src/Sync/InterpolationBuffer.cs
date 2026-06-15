@@ -433,7 +433,11 @@ namespace TCAMultiplayer.Sync
 
             if (!_renderClockInitialized)
             {
-                _renderClock = targetRenderTime;
+                float offsetRenderTime = localTime - _clockOffset - _interpolationDelay;
+                bool slightInitialUnderrun = offsetRenderTime > newestRemoteTime
+                    && offsetRenderTime - newestRemoteTime <= MaxExtrapolationSeconds;
+
+                _renderClock = slightInitialUnderrun ? offsetRenderTime : targetRenderTime;
                 _renderClockInitialized = true;
                 _lastLocalTime = localTime;
                 _rateIntegral = 0f;

@@ -78,6 +78,10 @@ namespace TCAMultiplayer.Protocol
         // ── Part damage sync (reliable) ──────────────────────────────
         PartDestroyed = 81,          // Victim broadcasts a damageable part breaking off
 
+        // ── Mod file sync (reliable, chunked) ────────────────────────
+        ModSyncRequest = 82,         // Client asks host to send differing allowed mod files
+        ModSyncChunk = 83,           // Host sends one chunk of the sync package
+
         // ── Utility ──────────────────────────────────────────────────
         Ping = 100,
         Pong = 101,

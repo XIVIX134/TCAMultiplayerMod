@@ -12,7 +12,7 @@ Combat Arena, Unity, BepInEx, Harmony, or other third-party/game assemblies.
 ## Current Status
 
 This is a work-in-progress mod. It is playable enough for local host/client
-testing. The current public source release is `v0.2.1`.
+testing. The current public source release is `v0.2.2`.
 
 ## Requirements
 

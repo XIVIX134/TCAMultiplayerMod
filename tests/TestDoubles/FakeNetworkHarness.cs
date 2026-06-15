@@ -333,6 +333,19 @@ namespace TCAMultiplayer.Tests.TestDoubles
             IsConnected = false;
         }
 
+        public void DisconnectPeer(ulong peerId)
+        {
+            ThrowIfDisposed();
+            if (peerId == 0)
+                return;
+
+            if (_connectedPeers.Remove(peerId))
+                _eventQueue.Enqueue(TransportEvent.PeerDisconnected(peerId));
+
+            if (!IsHost && peerId == 1)
+                IsConnected = false;
+        }
+
         public void Send(ulong peerId, byte[] data, bool reliable)
         {
             ThrowIfDisposed();

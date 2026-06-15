@@ -166,7 +166,20 @@ namespace TCAMultiplayer.Combat
 
         private static Munition SpawnDetachedMunition(string storeName)
         {
-            var store = GameDataStores.SpawnStore(storeName);
+            if (string.IsNullOrWhiteSpace(storeName))
+                return null;
+
+            Store store;
+            try
+            {
+                store = GameDataStores.SpawnStore(storeName);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"SpawnStore('{storeName}') failed: {ex.Message}");
+                return null;
+            }
+
             var munition = store as Munition;
             if (munition == null)
             {

@@ -7,6 +7,7 @@ using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
+using TCAMultiplayer.Compatibility;
 using TCAMultiplayer.Core;
 using TCAMultiplayer.Game;
 using TCAMultiplayer.Transport;
@@ -24,6 +25,16 @@ namespace TCAMultiplayer.UI
         private const string Tag = "MP-MENU";
         private const string Green = "#00FF40";
         private const string DimGreen = "#007A28";
+        private const string ModSyncWarning =
+            "Syncing from the host will overwrite changed mod files and remove extra sync-safe files in your Mods folder.\n\n" +
+            "Executable and plugin files are blocked from sync and will not be copied.";
+        private static readonly Color ModSyncPrimaryFill = new Color(0f, 0.34f, 0.10f, 0.95f);
+        private static readonly Color ModSyncPrimaryHover = new Color(0f, 0.58f, 0.17f, 1f);
+        private static readonly Color ModSyncPrimaryPressed = new Color(0f, 0.24f, 0.08f, 1f);
+        private static readonly Color ModSyncSecondaryFill = new Color(0f, 0f, 0f, 0.38f);
+        private static readonly Color ModSyncSecondaryHover = new Color(0f, 0.18f, 0.06f, 0.65f);
+        private static readonly Color ModSyncSecondaryPressed = new Color(0f, 0.10f, 0.04f, 0.8f);
+        private static readonly Color ModSyncDisabledFill = new Color(0f, 0.05f, 0.02f, 0.45f);
 
         private enum Screen { MainMenu, HostSetup, DirectConnect, SteamLobbyBrowser, Lobby }
         private Screen _currentScreen = Screen.MainMenu;
@@ -40,6 +51,14 @@ namespace TCAMultiplayer.UI
         private bool _refreshPending;
         private bool _nativeDialogOpen;
         private CursorLockMode _previousCursorLockState;
+        private string _statusMessage = "";
+        private Func<string> _externalStatusProvider;
+        private ModManifestCollector _modManifest;
+        private ModManifestCollector.ModMismatchInfo _modMismatch;
+        private bool _modSyncInProgress;
+        private int _modSyncReceived;
+        private int _modSyncTotal;
+        private float _lastModSyncUiRefreshTime;
 
         public Action OnMenuClosed;
         public bool IsVisible => _visible;
@@ -57,6 +76,9 @@ namespace TCAMultiplayer.UI
         public void Init(ConnectionManager connection)
         {
             _connection = connection ?? throw new ArgumentNullException(nameof(connection));
+            _connection.OnStatusMessage -= OnConnectionStatusMessage;
+            _connection.OnStatusMessage += OnConnectionStatusMessage;
+            _statusMessage = _connection.StatusMessage ?? "";
             UIFactory.NativeDialogActiveChanged -= OnNativeDialogActiveChanged;
             UIFactory.NativeDialogActiveChanged += OnNativeDialogActiveChanged;
         }
@@ -68,9 +90,41 @@ namespace TCAMultiplayer.UI
             if (_lobby != null) _lobby.OnLobbyStateChanged += OnLobbyStateChanged;
         }
 
+        public void SetExternalStatusProvider(Func<string> statusProvider)
+        {
+            _externalStatusProvider = statusProvider;
+        }
+
+        public void RefreshIfVisible()
+        {
+            if (_visible)
+                RefreshUI();
+        }
+
+        public void SetModManifest(ModManifestCollector modManifest)
+        {
+            if (_modManifest != null)
+            {
+                _modManifest.OnCompatibilityMismatch -= OnModCompatibilityMismatch;
+                _modManifest.OnCompatibilityAccepted -= OnModCompatibilityAccepted;
+                _modManifest.OnSyncStatus -= OnModSyncStatus;
+            }
+
+            _modManifest = modManifest;
+            if (_modManifest != null)
+            {
+                _modManifest.OnCompatibilityMismatch += OnModCompatibilityMismatch;
+                _modManifest.OnCompatibilityAccepted += OnModCompatibilityAccepted;
+                _modManifest.OnSyncStatus += OnModSyncStatus;
+            }
+        }
+
         public void HandleSessionEnded()
         {
             SetLobby(null);
+            SetModManifest(null);
+            _modMismatch = null;
+            ResetModSyncState();
             _currentScreen = Screen.MainMenu;
 
             if (!_visible)
@@ -143,12 +197,56 @@ namespace TCAMultiplayer.UI
         private void OnDestroy()
         {
             if (_lobby != null) _lobby.OnLobbyStateChanged -= OnLobbyStateChanged;
+            if (_connection != null) _connection.OnStatusMessage -= OnConnectionStatusMessage;
             UIFactory.NativeDialogActiveChanged -= OnNativeDialogActiveChanged;
         }
 
         private void OnLobbyStateChanged()
         {
             if (_visible && _currentScreen == Screen.Lobby)
+                RefreshUI();
+        }
+
+        private void OnConnectionStatusMessage(string message)
+        {
+            _statusMessage = message ?? "";
+            if (_visible)
+                RefreshUI();
+        }
+
+        private void OnModCompatibilityMismatch(ModManifestCollector.ModMismatchInfo info)
+        {
+            _modMismatch = info;
+            _modSyncInProgress = false;
+            _currentScreen = Screen.Lobby;
+            ShowLobby();
+        }
+
+        private void OnModCompatibilityAccepted()
+        {
+            _modMismatch = null;
+            ResetModSyncState();
+            if (_visible)
+                RefreshUI();
+        }
+
+        private void OnModSyncStatus(string message)
+        {
+            _statusMessage = message ?? "";
+            if (UpdateModSyncProgress(message))
+            {
+                if (_visible && Time.unscaledTime - _lastModSyncUiRefreshTime >= 0.2f)
+                {
+                    _lastModSyncUiRefreshTime = Time.unscaledTime;
+                    RefreshUI();
+                }
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(message))
+                _modSyncInProgress = true;
+
+            if (_visible)
                 RefreshUI();
         }
 
@@ -279,6 +377,7 @@ namespace TCAMultiplayer.UI
         {
             var panel = CreateMenuPanel(860f, 580f);
             AddHeader(panel.transform, "MULTIPLAYER", "Host a session or connect to another pilot.");
+            DrawStatusMessage(panel.transform);
 
             UIFactory.CreateLabelInputRow("Pilot >", _username, panel.transform, val =>
             {
@@ -355,6 +454,7 @@ namespace TCAMultiplayer.UI
             float height = isSteam ? 520f : 500f;
             var panel = CreateMenuPanel(960f, height);
             AddHeader(panel.transform, "HOST GAME", "Create a lobby and wait for peers to join.");
+            DrawStatusMessage(panel.transform);
 
             UIFactory.CreateLabelInputRow("Server Name >", _hostName, panel.transform, val =>
             {
@@ -413,6 +513,7 @@ namespace TCAMultiplayer.UI
         {
             var panel = CreateMenuPanel(960f, 430f);
             AddHeader(panel.transform, "DIRECT CONNECT", "Join a lobby by address.");
+            DrawStatusMessage(panel.transform);
 
             UIFactory.CreateLabelInputRow("Address >", _connectIP, panel.transform, val =>
             {
@@ -768,6 +869,13 @@ namespace TCAMultiplayer.UI
 
             var shell = CreateMenuPanel(1200f, 860f);
             AddHeader(shell.transform, "MULTIPLAYER LOBBY", BuildLobbySubtitle(session, isHost));
+            DrawStatusMessage(shell.transform);
+
+            if (!isHost && (_modMismatch != null || _modSyncInProgress))
+            {
+                DrawModSyncPanel(shell.transform);
+                return;
+            }
 
             var body = UIFactory.CreateHorizontalGroup(shell.transform, 16);
             UIFactory.SetFlexible(body, 1f, 1f);
@@ -828,9 +936,15 @@ namespace TCAMultiplayer.UI
             }
             else if (!canReady)
             {
-                string warningText = ShowTeamSelection(session)
-                    ? "SELECT AIRCRAFT, AIRFIELD, AND TEAM BEFORE READYING."
-                    : "SELECT AIRCRAFT AND AIRFIELD BEFORE READYING.";
+                string warningText;
+                if (HasUnverifiedPeers(session))
+                    warningText = isHost
+                        ? "WAITING FOR PEER MOD VERIFICATION."
+                        : "WAITING FOR MOD VERIFICATION.";
+                else
+                    warningText = ShowTeamSelection(session)
+                        ? "SELECT AIRCRAFT, AIRFIELD, AND TEAM BEFORE READYING."
+                        : "SELECT AIRCRAFT AND AIRFIELD BEFORE READYING.";
                 var warning = UIFactory.CreateNativeText(
                     $"<color={Green}>{warningText}</color>",
                     shell.transform, 16, TextAlignmentOptions.Center);
@@ -875,16 +989,25 @@ namespace TCAMultiplayer.UI
             UIFactory.SetFlexible(nameText.gameObject);
 
             var stateText = player.IsReady ? $"<color={Green}>READY</color>" : $"<color={DimGreen}>WAIT</color>";
+            if (!player.IsHost && player.IsModSyncing)
+                stateText = $"<color={DimGreen}>SYNC</color>";
+            else if (!player.IsHost && !player.IsModsVerified)
+                stateText = $"<color={DimGreen}>VERIFY</color>";
             var status = UIFactory.CreateNativeText(stateText, row.transform, 16, TextAlignmentOptions.MidlineRight);
-            UIFactory.SetLayoutWidth(status.gameObject, 82f, 82f);
+            UIFactory.SetLayoutWidth(status.gameObject, 96f, 96f);
 
             string aircraft = string.IsNullOrEmpty(player.SelectedAircraft) ? "No aircraft" : player.SelectedAircraft;
             string airfield = string.IsNullOrEmpty(player.SelectedAirfield) ? "No airfield" : player.SelectedAirfield;
             string detail = $"{aircraft}  /  {airfield}";
+            if (!player.IsHost && player.IsModSyncing)
+                detail = "Syncing Mods folder with host";
+            else if (!player.IsHost && !player.IsModsVerified)
+                detail = "Checking Mods folder";
             if (showTeam)
             {
                 string team = player.Team == MultiplayerTeam.None ? "No team" : GetTeamDisplayName(player.Team);
-                detail = $"{detail}  /  {team}";
+                if (player.IsModsVerified)
+                    detail = $"{detail}  /  {team}";
             }
             UIFactory.CreateNativeText(
                 $"<color={DimGreen}>{detail}</color>",
@@ -1134,6 +1257,7 @@ namespace TCAMultiplayer.UI
             try
             {
                 ApplyHostConfigToTransport();
+                ApplyNetworkConfigToTransport();
                 _connection.HostSession(_hostName, port);
                 var local = _connection.Session?.GetLocalPlayer();
                 if (local != null) local.PlayerName = _username;
@@ -1162,6 +1286,7 @@ namespace TCAMultiplayer.UI
 
             try
             {
+                ApplyNetworkConfigToTransport();
                 _connection.JoinSession(_connectIP, port);
                 var local = _connection.Session?.GetLocalPlayer();
                 if (local != null) local.PlayerName = _username;
@@ -1247,6 +1372,274 @@ namespace TCAMultiplayer.UI
                 desc.GetComponent<LayoutElement>().preferredHeight = 30f;
             }
             UIFactory.CreateDivider(parent, 0.18f);
+        }
+
+        private void DrawModSyncPanel(Transform parent)
+        {
+            UIFactory.CreateSpacer(parent, 8);
+
+            var panel = UIFactory.CreateNativePanel(parent, 22, 10);
+            UIFactory.SetFlexible(panel, 1f, 1f);
+
+            string title = _modSyncInProgress ? "SYNCING MOD FILES" : "MOD FILES DO NOT MATCH";
+            UIFactory.CreateNativeText($"<color={Green}>{title}</color>", panel.transform, 22, TextAlignmentOptions.Center);
+            UIFactory.CreateDivider(panel.transform, 0.14f);
+
+            if (_modSyncInProgress)
+            {
+                DrawModSyncProgress(panel.transform);
+                UIFactory.CreateSpacer(panel.transform, 12, 1f);
+                var cancel = Track(UIFactory.CreateNativeButton("CANCEL JOIN", panel.transform, 46));
+                if (cancel != null)
+                {
+                    cancel.onClick.AddListener(() =>
+                    {
+                        _connection?.Disconnect();
+                        ResetModSyncState();
+                        SetScreen(Screen.MainMenu);
+                    });
+                }
+                return;
+            }
+
+            string summary = BuildModMismatchSummary(_modMismatch);
+            var detailText = UIFactory.CreateNativeText(
+                $"<color={DimGreen}>{summary}</color>",
+                panel.transform, 16, TextAlignmentOptions.Center);
+            detailText.GetComponent<LayoutElement>().preferredHeight = 72f;
+
+            bool canSync = _modMismatch?.CanSync == true;
+            string note = canSync
+                ? "Your Mods folder can be updated from the host."
+                : "This mismatch includes blocked files. Match the host manually.";
+            var noteText = UIFactory.CreateNativeText(
+                $"<color={DimGreen}>{note}</color>",
+                panel.transform, 15, TextAlignmentOptions.Center);
+            noteText.GetComponent<LayoutElement>().preferredHeight = 30f;
+
+            UIFactory.CreateSpacer(panel.transform, 8, 1f);
+
+            var actions = UIFactory.CreateHorizontalRow(panel.transform, 52, 12);
+            actions.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = true;
+
+            var sync = Track(UIFactory.CreateNativeButton(canSync ? "SYNC FROM HOST" : "SYNC UNAVAILABLE", actions.transform, 52));
+            if (sync != null)
+            {
+                UIFactory.SetFlexible(sync.gameObject);
+                sync.interactable = canSync;
+                StyleModSyncPrimaryAction(sync, canSync);
+                sync.onClick.AddListener(ShowModSyncWarning);
+            }
+
+            var cancelButton = Track(UIFactory.CreateNativeButton("CANCEL JOIN", actions.transform, 52));
+            if (cancelButton != null)
+            {
+                UIFactory.SetFlexible(cancelButton.gameObject);
+                StyleModSyncSecondaryAction(cancelButton);
+                cancelButton.onClick.AddListener(() =>
+                {
+                    _modMismatch = null;
+                    ResetModSyncState();
+                    _connection?.Disconnect();
+                    SetScreen(Screen.MainMenu);
+                });
+            }
+        }
+
+        private static void StyleModSyncPrimaryAction(Button button, bool enabled)
+        {
+            if (button == null) return;
+
+            var colors = button.colors;
+            colors.normalColor = enabled ? ModSyncPrimaryFill : ModSyncDisabledFill;
+            colors.highlightedColor = enabled ? ModSyncPrimaryHover : ModSyncDisabledFill;
+            colors.selectedColor = enabled ? ModSyncPrimaryHover : ModSyncDisabledFill;
+            colors.pressedColor = enabled ? ModSyncPrimaryPressed : ModSyncDisabledFill;
+            colors.disabledColor = ModSyncDisabledFill;
+            colors.colorMultiplier = 1f;
+            colors.fadeDuration = 0.08f;
+            button.colors = colors;
+
+            var image = button.GetComponent<Image>();
+            if (image != null)
+                image.color = enabled ? ModSyncPrimaryFill : ModSyncDisabledFill;
+
+            foreach (var tmp in button.GetComponentsInChildren<TextMeshProUGUI>(true))
+            {
+                tmp.color = enabled ? UIFactory.AccentColor : UIFactory.MutedTextColor;
+                tmp.fontStyle |= FontStyles.Bold;
+            }
+        }
+
+        private static void StyleModSyncSecondaryAction(Button button)
+        {
+            if (button == null) return;
+
+            var colors = button.colors;
+            colors.normalColor = ModSyncSecondaryFill;
+            colors.highlightedColor = ModSyncSecondaryHover;
+            colors.selectedColor = ModSyncSecondaryHover;
+            colors.pressedColor = ModSyncSecondaryPressed;
+            colors.disabledColor = ModSyncDisabledFill;
+            colors.colorMultiplier = 1f;
+            colors.fadeDuration = 0.08f;
+            button.colors = colors;
+
+            var image = button.GetComponent<Image>();
+            if (image != null)
+                image.color = ModSyncSecondaryFill;
+
+            foreach (var tmp in button.GetComponentsInChildren<TextMeshProUGUI>(true))
+            {
+                tmp.color = UIFactory.MutedTextColor;
+                tmp.fontStyle = FontStyles.Normal;
+            }
+        }
+
+        private void DrawModSyncProgress(Transform parent)
+        {
+            string progress = _modSyncTotal > 0
+                ? $"{_modSyncReceived}/{_modSyncTotal}"
+                : "Preparing transfer";
+            var status = UIFactory.CreateNativeText(
+                $"<color={Green}>{progress}</color>",
+                parent, 34, TextAlignmentOptions.Center);
+            status.GetComponent<LayoutElement>().preferredHeight = 54f;
+
+            float pct = _modSyncTotal > 0
+                ? Mathf.Clamp01((float)_modSyncReceived / Mathf.Max(1, _modSyncTotal))
+                : 0f;
+            DrawProgressBar(parent, pct);
+
+            string detail = string.IsNullOrWhiteSpace(_statusMessage)
+                ? "Receiving files from host..."
+                : _statusMessage;
+            var detailText = UIFactory.CreateNativeText(
+                $"<color={DimGreen}>{detail}</color>",
+                parent, 16, TextAlignmentOptions.Center);
+            detailText.GetComponent<LayoutElement>().preferredHeight = 52f;
+        }
+
+        private static void DrawProgressBar(Transform parent, float pct)
+        {
+            var outer = new GameObject("ModSyncProgress", typeof(RectTransform), typeof(Image));
+            outer.transform.SetParent(parent, false);
+            outer.GetComponent<Image>().color = new Color(0f, 0f, 0f, 0.7f);
+            UIFactory.AddNativeBorder(outer, 0.8f);
+            var outerLayout = outer.AddComponent<LayoutElement>();
+            outerLayout.minHeight = 24f;
+            outerLayout.preferredHeight = 24f;
+
+            var fill = new GameObject("Fill", typeof(RectTransform), typeof(Image));
+            fill.transform.SetParent(outer.transform, false);
+            fill.GetComponent<Image>().color = new Color(0f, 1f, 0.25f, 0.55f);
+            var rect = fill.GetComponent<RectTransform>();
+            rect.anchorMin = Vector2.zero;
+            rect.anchorMax = new Vector2(pct, 1f);
+            rect.offsetMin = new Vector2(2f, 2f);
+            rect.offsetMax = new Vector2(-2f, -2f);
+        }
+
+        private void DrawStatusMessage(Transform parent)
+        {
+            string message = !string.IsNullOrWhiteSpace(_statusMessage)
+                ? _statusMessage
+                : _externalStatusProvider?.Invoke();
+            if (string.IsNullOrWhiteSpace(message))
+                return;
+
+            var text = UIFactory.CreateNativeText(
+                $"<color={Green}>{message}</color>",
+                parent, 15, TextAlignmentOptions.Left);
+            text.GetComponent<LayoutElement>().preferredHeight = 24f;
+        }
+
+        private bool UpdateModSyncProgress(string message)
+        {
+            if (string.IsNullOrWhiteSpace(message))
+                return false;
+
+            const string prefix = "Receiving mod sync ";
+            int start = message.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
+            if (start < 0)
+                return false;
+
+            start += prefix.Length;
+            int slash = message.IndexOf('/', start);
+            if (slash < 0)
+                return false;
+
+            int end = message.IndexOf('.', slash);
+            if (end < 0)
+                end = message.Length;
+
+            if (!int.TryParse(message.Substring(start, slash - start), out int received)
+                || !int.TryParse(message.Substring(slash + 1, end - slash - 1), out int total))
+            {
+                return false;
+            }
+
+            _modSyncInProgress = true;
+            _modSyncReceived = Mathf.Max(0, received);
+            _modSyncTotal = Mathf.Max(0, total);
+            return true;
+        }
+
+        private void ResetModSyncState()
+        {
+            _modSyncInProgress = false;
+            _modSyncReceived = 0;
+            _modSyncTotal = 0;
+            _lastModSyncUiRefreshTime = 0f;
+        }
+
+        private void ShowModSyncWarning()
+        {
+            if (_modSyncInProgress || _modMismatch?.CanSync != true)
+                return;
+
+            UIFactory.ShowConfirmDialog(
+                "SYNC MODS FROM HOST?",
+                ModSyncWarning,
+                "SYNC ANYWAY",
+                "CANCEL",
+                StartModSyncFromHost,
+                destructive: true);
+        }
+
+        private void StartModSyncFromHost()
+        {
+            if (_modSyncInProgress || _modManifest == null)
+                return;
+
+            _modSyncInProgress = true;
+            _modSyncReceived = 0;
+            _modSyncTotal = 0;
+            _statusMessage = "Requesting mod sync from host...";
+            _modMismatch = null;
+            _modManifest.RequestSyncFromHost();
+            RefreshUI();
+        }
+
+        private static string BuildModMismatchSummary(ModManifestCollector.ModMismatchInfo info)
+        {
+            var diff = info?.Diff;
+            if (diff == null)
+                return info?.Reason ?? "Host and client Mods folders differ.";
+
+            var parts = new List<string>();
+            if (diff.Missing.Count > 0)
+                parts.Add($"{diff.Missing.Count} missing");
+            if (diff.Changed.Count > 0)
+                parts.Add($"{diff.Changed.Count} changed");
+            if (diff.Extra.Count > 0)
+                parts.Add($"{diff.Extra.Count} extra");
+            if (diff.Unsyncable.Count > 0)
+                parts.Add($"{diff.Unsyncable.Count} blocked");
+
+            return parts.Count == 0
+                ? "Host and client Mods folders differ."
+                : "Mods folder differs: " + string.Join(", ", parts.ToArray()) + ".";
         }
 
         private Button Track(Button button)
@@ -1389,6 +1782,39 @@ namespace TCAMultiplayer.UI
             _connection.Config.MaxConnections = Math.Max(0, maxPlayers - 1);
         }
 
+        private void ApplyNetworkConfigToTransport()
+        {
+            if (_connection?.Config == null) return;
+
+            _connection.Config.LocalBindAddress = ModConfig.LocalBindAddress?.Value ?? "";
+            _connection.Config.AutoVpnBind = true;
+            _connection.Config.ModVersion = PluginMetadata.Version;
+
+            bool lowBandwidth = ModConfig.LowBandwidthMode?.Value ?? false;
+            if (lowBandwidth)
+            {
+                _connection.Config.KeepaliveInterval = 1.0f;
+                _connection.Config.TimeoutSeconds = 20.0f;
+                _connection.Config.ReconnectGraceSeconds = 90.0f;
+                _connection.Config.EndpointRefreshInterval = 3.0f;
+                _connection.Config.RetransmitInterval = 0.35f;
+                _connection.Config.MaxRetransmitAttempts = 180;
+                _connection.Config.MaxReliableRetransmitsPerUpdate = 4;
+            }
+            else
+            {
+                _connection.Config.KeepaliveInterval = 2.0f;
+                _connection.Config.TimeoutSeconds = 10.0f;
+                _connection.Config.ReconnectGraceSeconds = 30.0f;
+                _connection.Config.EndpointRefreshInterval = 5.0f;
+                _connection.Config.RetransmitInterval = 0.25f;
+                _connection.Config.MaxRetransmitAttempts = 120;
+                _connection.Config.MaxReliableRetransmitsPerUpdate = 8;
+            }
+
+            ModConfig.Save();
+        }
+
         private static string BuildLobbySubtitle(GameSession session, bool isHost)
         {
             if (session == null) return "Waiting for lobby state.";
@@ -1440,10 +1866,23 @@ namespace TCAMultiplayer.UI
         {
             var local = session?.GetLocalPlayer();
             return local != null
+                && local.IsModsVerified
                 && !string.IsNullOrEmpty(local.SelectedAircraft)
                 && !string.IsNullOrEmpty(local.SelectedAirfield)
                 && (!ShowTeamSelection(session)
                     || local.Team != MultiplayerTeam.None);
+        }
+
+        private static bool HasUnverifiedPeers(GameSession session)
+        {
+            if (session == null)
+                return false;
+
+            foreach (var player in session.Players.Values)
+                if (!player.IsHost && !player.IsModsVerified)
+                    return true;
+
+            return false;
         }
 
         private static bool AllRequiredPlayersReady(GameSession session)
@@ -1452,6 +1891,7 @@ namespace TCAMultiplayer.UI
             foreach (var player in session.Players.Values)
             {
                 if (player.IsHost) continue;
+                if (!player.IsModsVerified) return false;
                 if (!player.IsReady) return false;
                 if (ShowTeamSelection(session)
                     && player.Team == MultiplayerTeam.None) return false;

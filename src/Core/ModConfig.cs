@@ -28,6 +28,9 @@ namespace TCAMultiplayer.Core
         public static ConfigEntry<string> Username { get; private set; }
         public static ConfigEntry<string> LastIP { get; private set; }
         public static ConfigEntry<string> LastPort { get; private set; }
+        public static ConfigEntry<bool> VpnMode { get; private set; }
+        public static ConfigEntry<string> LocalBindAddress { get; private set; }
+        public static ConfigEntry<bool> LowBandwidthMode { get; private set; }
         public static ConfigEntry<string> LastAircraft { get; private set; }
         public static ConfigEntry<string> LastLoadout { get; private set; }
         public static ConfigEntry<string> LastAirfield { get; private set; }
@@ -75,6 +78,10 @@ namespace TCAMultiplayer.Core
         public static ConfigEntry<float> RemoteMotionDebugLogIntervalSeconds { get; private set; }
         public static ConfigEntry<float> RemoteMotionDebugDrawScale { get; private set; }
 
+        // ── Updater ────────────────────────────────────────────────────
+        public static ConfigEntry<bool> CheckForUpdatesOnLaunch { get; private set; }
+        public static ConfigEntry<string> UpdateApiUrl { get; private set; }
+
         /// <summary>
         /// Bind all config entries to the given <paramref name="config"/> file.
         /// Call once from Plugin.Awake().
@@ -90,6 +97,12 @@ namespace TCAMultiplayer.Core
             Username        = config.Bind("Player", "Username", "Player", "Your multiplayer username.");
             LastIP          = config.Bind("Network", "LastIP", "127.0.0.1", "Last connected IP address.");
             LastPort        = config.Bind("Network", "LastPort", "7777", "Last connected port.");
+            VpnMode = config.Bind("Network", "VpnMode", true,
+                "Deprecated: routing is automatic. Leave enabled unless debugging an adapter issue.");
+            LocalBindAddress = config.Bind("Network", "LocalBindAddress", "",
+                "Advanced: optional local IPv4 address to bind multiplayer UDP to. Leave blank for automatic route selection.");
+            LowBandwidthMode = config.Bind("Network", "LowBandwidthMode", false,
+                "Advanced: force reduced aircraft update traffic and longer waits. Normally automatic quality detection handles this.");
             LastAircraft    = config.Bind("Player", "LastAircraft", "AV8B", "Last selected aircraft ID.");
             LastLoadout     = config.Bind("Player", "LastLoadout", "Clean", "Last selected loadout name.");
             LastAirfield    = config.Bind("Player", "LastAirfield", "", "Last selected airfield name.");
@@ -147,6 +160,13 @@ namespace TCAMultiplayer.Core
                 "Seconds between detailed remote-motion debug log lines while debug is enabled.");
             RemoteMotionDebugDrawScale = config.Bind("Testing", "RemoteMotionDebugDrawScale", 0.20f,
                 "Scale applied to velocity/debug vectors drawn in world space.");
+
+            // Updater
+            CheckForUpdatesOnLaunch = config.Bind("Updater", "CheckForUpdatesOnLaunch", true,
+                "Check GitHub for a newer TCAMP release when the game launches.");
+            UpdateApiUrl = config.Bind("Updater", "UpdateApiUrl",
+                "https://api.github.com/repos/XIVIX134/TCAMultiplayerMod/releases/latest",
+                "GitHub latest-release API endpoint used by the in-game updater.");
         }
 
         /// <summary>Parse the TransportMode config string into a <see cref="TransportType"/> enum.</summary>

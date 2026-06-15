@@ -51,6 +51,8 @@
       <HintPath>..\libs\BepInEx.dll</HintPath>
       <Private>true</Private>
     </Reference>
+    <Reference Include="System.IO.Compression" />
+    <Reference Include="System.IO.Compression.FileSystem" />
   </ItemGroup>
 
   <!-- netstandard facade needed at runtime for Unity DLLs targeting netstandard 2.1 -->

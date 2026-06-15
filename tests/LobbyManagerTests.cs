@@ -151,6 +151,8 @@ namespace TCAMultiplayer.Tests
                 session.AddPlayer(1, "Host");
                 var second = session.AddPlayer(2, "Two");
                 var third = session.AddPlayer(3, "Three");
+                second.IsModsVerified = true;
+                third.IsModsVerified = true;
                 var router = new PacketRouter();
 
                 using (new LobbyManager(session, connection, router))
@@ -319,6 +321,76 @@ namespace TCAMultiplayer.Tests
                 Assert.Contains(PacketType.LoadoutSelect, sentTypes);
                 Assert.Contains(PacketType.LobbyAirfieldSelect, sentTypes);
                 Assert.Contains(PacketType.LobbyPlayerJoined, sentTypes);
+            }
+        }
+
+        [Test]
+        public void HostAcceptsJoinNameBeforeModVerificationButBlocksSelection()
+        {
+            using (var session = new GameSession(isHost: true))
+            using (var transport = new FakeTransport())
+            using (var connection = new ConnectionManager(transport))
+            {
+                session.LocalPeerId = 1;
+                session.StateMachine.TryTransition(GameState.HostingLobby);
+                session.AddPlayer(1, "Host");
+                var peer = session.AddPlayer(2, "Peer_2");
+                peer.IsModsVerified = false;
+
+                var router = new PacketRouter();
+                using (new LobbyManager(session, connection, router))
+                {
+                    router.Route(2, Frame(PacketType.LobbyPlayerJoined,
+                        PacketSerializer.SerializeLobbyPlayerJoined(new LobbyPlayerJoinedPacket
+                        {
+                            PeerId = 2,
+                            PlayerName = "ClientName"
+                        })));
+
+                    router.Route(2, Frame(PacketType.AircraftSelect,
+                        PacketSerializer.SerializeLobbyAircraftSelect(new LobbyAircraftSelectPacket
+                        {
+                            PeerId = 2,
+                            AircraftName = "F16A"
+                        })));
+                }
+
+                var updatedPeer = session.GetPlayer(2);
+                Assert.IsNotNull(updatedPeer);
+                Assert.AreEqual("ClientName", updatedPeer.PlayerName);
+                Assert.IsFalse(updatedPeer.IsModsVerified);
+                Assert.AreNotEqual("F16A", updatedPeer.SelectedAircraft);
+            }
+        }
+
+        [Test]
+        public void ClientLobbyState_PreservesLocalNameOverHostPlaceholder()
+        {
+            using (var session = new GameSession(isHost: false))
+            using (var transport = new FakeTransport())
+            using (var connection = new ConnectionManager(transport))
+            {
+                session.LocalPeerId = 2;
+                session.StateMachine.TryTransition(GameState.ClientLobby);
+                session.AddPlayer(2, "ClientName");
+
+                var router = new PacketRouter();
+                using (new LobbyManager(session, connection, router))
+                {
+                    router.Route(1, LobbyStateFrame(new LobbyStatePacket
+                    {
+                        HostName = "TCA Server",
+                        MapName = "ActionIsland",
+                        Revision = 1,
+                        Players = new[]
+                        {
+                            new LobbyPlayerInfo { PeerId = 1, PlayerName = "Host", IsHost = true },
+                            new LobbyPlayerInfo { PeerId = 2, PlayerName = "Peer_2" }
+                        }
+                    }));
+                }
+
+                Assert.AreEqual("ClientName", session.GetPlayer(2)?.PlayerName);
             }
         }
 
@@ -663,6 +735,13 @@ namespace TCAMultiplayer.Tests
                 IsConnected = false;
                 LocalPeerId = 0;
                 _connectedPeers.Clear();
+            }
+
+            public void DisconnectPeer(ulong peerId)
+            {
+                _connectedPeers.Remove(peerId);
+                if (!IsHost && peerId == 1)
+                    Disconnect();
             }
 
             public void Send(ulong peerId, byte[] data, bool reliable)

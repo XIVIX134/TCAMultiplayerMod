@@ -17,6 +17,7 @@ using System;
 using TCAMultiplayer.Protocol;
 using TCAMultiplayer.UI;
 using TCAMultiplayer.Compatibility;
+using TCAMultiplayer.Updating;
 
 namespace TCAMultiplayer
 {
@@ -24,7 +25,7 @@ namespace TCAMultiplayer
     /// BepInEx plugin entry point. ONLY bootstraps and wires components.
     /// No business logic — just creation and disposal.
     /// </summary>
-    [BepInPlugin("com.tcamp.mod", "TCAMP", "0.2.1")]
+    [BepInPlugin(PluginMetadata.Guid, PluginMetadata.Name, PluginMetadata.Version)]
     public class Plugin : BaseUnityPlugin
     {
         private const string Tag = "PLUGIN";
@@ -35,7 +36,7 @@ namespace TCAMultiplayer
         {
             Log.Init(Logger);
             ModConfig.Bind(Config);
-            Log.Info(Tag, "TCAMP v0.2.1 (lobby return + cursor fixes) initializing...");
+            Log.Info(Tag, "TCAMP v0.2.2 initializing...");
 
             _harmony = new Harmony("com.tcamp.mod");
             _harmony.PatchAll(typeof(Plugin).Assembly);
@@ -106,6 +107,12 @@ namespace TCAMultiplayer
         private Falcon.Game2.MainMenu _nativeMainMenu;
         private bool _suppressNativeMainMenuRestore;
         private bool _tearingDown;
+        private readonly object _updaterLock = new object();
+        private ModUpdater _updater;
+        private string _updaterStatusMessage = "";
+        private bool _updaterStatusDirty;
+        private ModUpdateResult _pendingUpdateNotice;
+        private bool _updateNoticeShown;
         private LiveTestOptions _liveTest;
         private bool _liveSessionStarted;
         private bool _liveDefaultsApplied;
@@ -124,9 +131,12 @@ namespace TCAMultiplayer
 
             var config = new TransportConfig
             {
-                MaxConnections = GameSession.ClampMaxPlayersTotal(ModConfig.HostMaxPlayersTotal?.Value ?? 8) - 1
+                MaxConnections = GameSession.ClampMaxPlayersTotal(ModConfig.HostMaxPlayersTotal?.Value ?? 8) - 1,
+                LocalBindAddress = ModConfig.LocalBindAddress?.Value ?? "",
+                AutoVpnBind = true,
+                ModVersion = PluginMetadata.Version
             };
-
+            ApplyBandwidthPreset(config);
             _transport = CreateTransport(config);
 
             _connection = new ConnectionManager(_transport, config);
@@ -150,6 +160,7 @@ namespace TCAMultiplayer
             // UI (always available — independent of session)
             _menu = gameObject.AddComponent<MultiplayerMenu>();
             _menu.Init(_connection);
+            _menu.SetExternalStatusProvider(() => _updaterStatusMessage);
             _menu.OnMenuClosed = () =>
             {
                 if (_suppressNativeMainMenuRestore)
@@ -160,6 +171,7 @@ namespace TCAMultiplayer
             };
             _scoreboard = gameObject.AddComponent<ScoreboardHUD>();
             _respawnScreen = gameObject.AddComponent<RespawnScreen>();
+            StartUpdater();
 
             // Wire main menu button → multiplayer menu + hide native main menu UI
             MainMenuPatch.OnMultiplayerClicked = mainMenu =>
@@ -208,12 +220,20 @@ namespace TCAMultiplayer
 
         private float _lastStateSendTime;
         private float _stateSendAccumulator;
+        private float _adaptiveStateSendRateHz = DefaultStateSendRateHz;
+        private float _nextNetworkQualityUpdateTime;
+        private long _lastReliableRetransmits;
+        private long _lastReliableDrops;
         private const float DefaultStateSendRateHz = 60f;
         private const float MinStateSendRateHz = 10f;
         private const float MaxStateSendRateHz = 120f;
+        private const float LowBandwidthStateSendRateHz = 20f;
+        private const float PoorQualityStateSendRateHz = 30f;
+        private const float BadQualityStateSendRateHz = 20f;
 
         private void Update()
         {
+            ProcessUpdaterUi();
             _connection?.Update(Time.deltaTime);
             DriveLiveTest();
             DriveLiveGearCycle();
@@ -227,6 +247,7 @@ namespace TCAMultiplayer
                 _modManifest?.SendManifest();
             }
 
+            _modManifest?.Update(Time.deltaTime);
             _lobby?.Update();
             _respawnManager?.Update();
 
@@ -236,6 +257,7 @@ namespace TCAMultiplayer
             _missileSync?.Update();
             _bombSync?.Update();
             LogSessionDiagnostics(localAircraft);
+            UpdateAdaptiveNetworkQuality();
 
             if (localAircraft != null)
             {
@@ -246,7 +268,11 @@ namespace TCAMultiplayer
 
         private bool ShouldSendAircraftState(float deltaTime)
         {
-            float rateHz = ModConfig.StateSendRateHz?.Value ?? DefaultStateSendRateHz;
+            bool lowBandwidth = ModConfig.LowBandwidthMode?.Value ?? false;
+            float configuredRate = ModConfig.StateSendRateHz?.Value ?? DefaultStateSendRateHz;
+            float rateHz = Mathf.Min(configuredRate, _adaptiveStateSendRateHz);
+            if (lowBandwidth)
+                rateHz = Mathf.Min(rateHz, LowBandwidthStateSendRateHz);
             rateHz = Mathf.Clamp(rateHz, MinStateSendRateHz, MaxStateSendRateHz);
             float interval = 1f / rateHz;
 
@@ -262,6 +288,74 @@ namespace TCAMultiplayer
 
             _stateSendAccumulator %= interval;
             return true;
+        }
+
+        private void StartUpdater()
+        {
+            if (ModConfig.CheckForUpdatesOnLaunch?.Value != true)
+            {
+                Log.Info("UPDATER", "Update check disabled by config");
+                return;
+            }
+
+            _updater = new ModUpdater(new UpdateSettings
+            {
+                LatestReleaseApiUrl = ModConfig.UpdateApiUrl?.Value,
+                CurrentVersion = PluginMetadata.Version,
+                CurrentPluginPath = Assembly.GetExecutingAssembly().Location,
+                TimeoutMilliseconds = 15000
+            });
+            _updater.OnStatusChanged += HandleUpdaterStatusChanged;
+            _updater.OnUpdateReady += HandleUpdateReady;
+            _updater.CheckForUpdatesAsync().Forget();
+        }
+
+        private void HandleUpdaterStatusChanged(string message)
+        {
+            lock (_updaterLock)
+            {
+                _updaterStatusMessage = message ?? "";
+                _updaterStatusDirty = true;
+            }
+        }
+
+        private void HandleUpdateReady(ModUpdateResult result)
+        {
+            lock (_updaterLock)
+            {
+                _pendingUpdateNotice = result;
+                _updaterStatusMessage = result?.Message ?? "";
+                _updaterStatusDirty = true;
+            }
+        }
+
+        private void ProcessUpdaterUi()
+        {
+            bool refreshMenu;
+            ModUpdateResult notice;
+            lock (_updaterLock)
+            {
+                refreshMenu = _updaterStatusDirty;
+                _updaterStatusDirty = false;
+                notice = _pendingUpdateNotice;
+            }
+
+            if (refreshMenu)
+                _menu?.RefreshIfVisible();
+
+            if (_updateNoticeShown || notice == null || !UIFactory.HasPrefabs || _activeSession != null)
+                return;
+
+            _updateNoticeShown = true;
+            string message = notice.Message
+                + "\n\nThe updater will replace the plugin after this game process closes. Launch the game again to load the new version.";
+            UIFactory.ShowConfirmDialog(
+                "TCAMP UPDATE READY",
+                message,
+                "OK",
+                "LATER",
+                () => { },
+                () => { });
         }
 
         private void DriveLiveTest()
@@ -421,6 +515,7 @@ namespace TCAMultiplayer
             try
             {
                 SetNativeMainMenuUIVisible(false);
+                ApplyBandwidthPreset(_connection?.Config);
 
                 if (_liveTest.Role == LiveTestRole.Host)
                 {
@@ -499,6 +594,82 @@ namespace TCAMultiplayer
                 $"Defaults applied: player={local.PlayerName}, aircraft={local.SelectedAircraft}, " +
                 $"loadout={local.SelectedLoadout}, airfield={local.SelectedAirfield}");
             return true;
+        }
+
+        private static void ApplyBandwidthPreset(TransportConfig config)
+        {
+            if (config == null) return;
+
+            config.LocalBindAddress = ModConfig.LocalBindAddress?.Value ?? "";
+            config.AutoVpnBind = true;
+            config.ModVersion = PluginMetadata.Version;
+            bool lowBandwidth = ModConfig.LowBandwidthMode?.Value ?? false;
+            if (lowBandwidth)
+            {
+                config.KeepaliveInterval = 1.0f;
+                config.TimeoutSeconds = 20.0f;
+                config.ReconnectGraceSeconds = 90.0f;
+                config.EndpointRefreshInterval = 3.0f;
+                config.RetransmitInterval = 0.35f;
+                config.MaxRetransmitAttempts = 180;
+                config.MaxReliableRetransmitsPerUpdate = 4;
+            }
+            else
+            {
+                config.KeepaliveInterval = 2.0f;
+                config.TimeoutSeconds = 10.0f;
+                config.ReconnectGraceSeconds = 30.0f;
+                config.EndpointRefreshInterval = 5.0f;
+                config.RetransmitInterval = 0.25f;
+                config.MaxRetransmitAttempts = 120;
+                config.MaxReliableRetransmitsPerUpdate = 8;
+            }
+        }
+
+        private void UpdateAdaptiveNetworkQuality()
+        {
+            if (_connection == null || _activeSession == null)
+                return;
+            if (Time.time < _nextNetworkQualityUpdateTime)
+                return;
+
+            _nextNetworkQualityUpdateTime = Time.time + 2f;
+
+            var quality = _connection.GetNetworkQuality();
+            var reliability = _connection.GetReliabilityStats();
+            long retransmitDelta = Math.Max(0L, reliability.ReliableRetransmitted - _lastReliableRetransmits);
+            long dropDelta = Math.Max(0L, reliability.ReliableDropped - _lastReliableDrops);
+            _lastReliableRetransmits = reliability.ReliableRetransmitted;
+            _lastReliableDrops = reliability.ReliableDropped;
+
+            float configuredRate = ModConfig.StateSendRateHz?.Value ?? DefaultStateSendRateHz;
+            float targetRate = Mathf.Clamp(configuredRate, MinStateSendRateHz, MaxStateSendRateHz);
+            bool lowBandwidth = ModConfig.LowBandwidthMode?.Value ?? false;
+
+            if (lowBandwidth)
+            {
+                targetRate = Mathf.Min(targetRate, LowBandwidthStateSendRateHz);
+            }
+            else if (dropDelta > 0 || reliability.PendingCount >= 12 || retransmitDelta >= 16
+                || quality.SmoothedRttMs >= 450f || quality.SecondsSinceLastReceive >= 3.5f)
+            {
+                targetRate = Mathf.Min(targetRate, BadQualityStateSendRateHz);
+            }
+            else if (reliability.PendingCount >= 5 || retransmitDelta >= 6
+                || quality.SmoothedRttMs >= 220f || quality.SecondsSinceLastReceive >= 2.0f)
+            {
+                targetRate = Mathf.Min(targetRate, PoorQualityStateSendRateHz);
+            }
+
+            targetRate = Mathf.Clamp(targetRate, MinStateSendRateHz, MaxStateSendRateHz);
+            if (Mathf.Abs(targetRate - _adaptiveStateSendRateHz) < 0.5f)
+                return;
+
+            _adaptiveStateSendRateHz = targetRate;
+            Log.Info(Tag,
+                $"Adaptive send rate -> {_adaptiveStateSendRateHz:0} Hz " +
+                $"(rtt={quality.SmoothedRttMs:0}ms, pending={reliability.PendingCount}, " +
+                $"retries+{retransmitDelta}, drops+{dropDelta}, route={quality.RouteDescription})");
         }
 
         private bool RemotePlayersReady()
@@ -634,7 +805,9 @@ namespace TCAMultiplayer
             _remoteManager = new RemoteAircraftManager(session, _aircraftSpawner, _originService);
             _stateReader = new LocalAircraftStateReader(_originService);
             _modManifest = new ModManifestCollector(session, _connection, router);
-            _modManifest.OnCompatibilityResult += HandleModCompatibilityResult;
+            _modManifest.OnCompatibilityAccepted += HandleModCompatibilityAccepted;
+            _modManifest.OnCompatibilityMismatch += HandleModCompatibilityMismatch;
+            _modManifest.OnSyncStatus += HandleModSyncStatus;
 
             // Register AircraftState packet handler — routes incoming state to RemoteAircraftManager
             router.Register(PacketType.AircraftState, HandleAircraftStateRaw);
@@ -675,6 +848,7 @@ namespace TCAMultiplayer
 
             // Wire UI to session-scoped systems
             _menu.SetLobby(_lobby);
+            _menu.SetModManifest(_modManifest);
             _scoreboard.Init(session, _scoreTracker);
             _respawnScreen.Init(_respawnManager, _spawnManager, session, _lobby);
 
@@ -786,6 +960,8 @@ namespace TCAMultiplayer
                 // Matches GameLogic.StartQuickMission pattern: ShowMainMenu(false) when entering flight
                 SetNativeMainMenuVisible(false);
 
+                await WaitForFlightGameTeardown("before new game start");
+
                 string resolvedMapName = string.IsNullOrWhiteSpace(mapName)
                     ? MapHelper.GetDefaultMapName()
                     : mapName;
@@ -814,11 +990,11 @@ namespace TCAMultiplayer
                     UnityEngine.SceneManagement.SceneManager.SetActiveScene(flightScene);
 
                 Log.Info(Tag, "Waiting for FlightGame initialization...");
-                float timeout = Time.time + 10f;
-                while (Falcon.Game2.FlightGame.Instance == null && Time.time < timeout)
+                float timeout = Time.realtimeSinceStartup + 10f;
+                while (!IsFlightGameInstanceInScene(flightScene) && Time.realtimeSinceStartup < timeout)
                     await UniTask.Yield();
 
-                if (Falcon.Game2.FlightGame.Instance == null)
+                if (!IsFlightGameInstanceInScene(flightScene))
                 {
                     Log.Error(Tag, "FlightGame.Instance timed out!");
                     _connection?.Disconnect();
@@ -1092,12 +1268,7 @@ namespace TCAMultiplayer
                 _loadingScreen?.Close(true).Forget();
                 _loadingScreen = null;
 
-                var flightScene = UnityEngine.SceneManagement.SceneManager.GetSceneByName(GameScenes.G2FlightGame);
-                if (flightScene.IsValid() && flightScene.isLoaded)
-                {
-                    Log.Info(Tag, "Unloading FlightGame scene (lobby return)");
-                    UnityEngine.SceneManagement.SceneManager.UnloadSceneAsync(GameScenes.G2FlightGame);
-                }
+                UnloadFlightGameScene("lobby return").Forget();
             }
             catch (System.Exception ex)
             {
@@ -1210,6 +1381,64 @@ namespace TCAMultiplayer
             _pauseMenuInput?.UnregisterAllActions();
             _pauseMenuInput = null;
             _mpPauseMenuOpen = false;
+        }
+
+        private static bool IsFlightGameSceneLoaded()
+        {
+            var flightScene = UnityEngine.SceneManagement.SceneManager.GetSceneByName(GameScenes.G2FlightGame);
+            return flightScene.IsValid() && flightScene.isLoaded;
+        }
+
+        private static bool IsFlightGameInstanceAlive()
+        {
+            return Falcon.Game2.FlightGame.Instance != null;
+        }
+
+        private static bool IsFlightGameInstanceInScene(UnityEngine.SceneManagement.Scene scene)
+        {
+            var flightGame = Falcon.Game2.FlightGame.Instance;
+            return flightGame != null
+                && scene.IsValid()
+                && flightGame.gameObject.scene == scene;
+        }
+
+        private async UniTask WaitForFlightGameTeardown(string reason, float timeoutSeconds = 10f)
+        {
+            float deadline = Time.realtimeSinceStartup + timeoutSeconds;
+
+            while ((IsFlightGameSceneLoaded() || IsFlightGameInstanceAlive())
+                && Time.realtimeSinceStartup < deadline)
+            {
+                await UniTask.Yield();
+            }
+
+            if (IsFlightGameSceneLoaded() || IsFlightGameInstanceAlive())
+            {
+                Log.Warning(Tag,
+                    $"Timed out waiting for FlightGame teardown ({reason}); " +
+                    $"sceneLoaded={IsFlightGameSceneLoaded()}, instanceAlive={IsFlightGameInstanceAlive()}");
+            }
+        }
+
+        private async UniTask UnloadFlightGameScene(string reason)
+        {
+            try
+            {
+                var flightScene = UnityEngine.SceneManagement.SceneManager.GetSceneByName(GameScenes.G2FlightGame);
+                if (flightScene.IsValid() && flightScene.isLoaded)
+                {
+                    Log.Info(Tag, $"Unloading FlightGame scene ({reason})");
+                    var unloadOp = UnityEngine.SceneManagement.SceneManager.UnloadSceneAsync(flightScene);
+                    while (unloadOp != null && !unloadOp.isDone)
+                        await UniTask.Yield();
+                }
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(Tag, $"FlightGame unload error ({reason}): {ex.Message}");
+            }
+
+            await WaitForFlightGameTeardown(reason);
         }
 
         private void TryOpenPauseMenu()
@@ -1374,16 +1603,33 @@ namespace TCAMultiplayer
             Log.Info(Tag, $"Cleaned up disconnected peer {peerId}");
         }
 
-        private void HandleModCompatibilityResult(bool isCompatible, string reason)
+        private void HandleModCompatibilityAccepted()
         {
-            if (isCompatible)
+            if (_activeSession?.IsHost == true)
+                return;
+
+            var local = _activeSession?.GetLocalPlayer();
+            if (local != null)
+                local.IsModsVerified = true;
+
+            Log.Info(Tag, "Mod compatibility accepted by host");
+            _connection?.SetStatusMessage("Mods verified");
+            _lobby?.AnnounceLocalPlayer();
+        }
+
+        private void HandleModCompatibilityMismatch(ModManifestCollector.ModMismatchInfo info)
+        {
+            string reason = info?.Reason ?? "Mod files mismatch";
+            Log.Warning(Tag, $"Mod compatibility rejected by host: {reason}");
+            _connection?.SetStatusMessage("Mod mismatch - sync or cancel");
+        }
+
+        private void HandleModSyncStatus(string message)
+        {
+            if (!string.IsNullOrWhiteSpace(message))
             {
-                Log.Info(Tag, "Mod compatibility accepted by host");
-            }
-            else
-            {
-                Log.Warning(Tag, $"Mod compatibility rejected by host: {reason}");
-                _connection?.Disconnect();
+                Log.Info(Tag, message);
+                _connection?.SetStatusMessage(message);
             }
         }
 
@@ -1447,7 +1693,9 @@ namespace TCAMultiplayer
             // Game flow
             if (_modManifest != null)
             {
-                _modManifest.OnCompatibilityResult -= HandleModCompatibilityResult;
+                _modManifest.OnCompatibilityAccepted -= HandleModCompatibilityAccepted;
+                _modManifest.OnCompatibilityMismatch -= HandleModCompatibilityMismatch;
+                _modManifest.OnSyncStatus -= HandleModSyncStatus;
                 _modManifest.Dispose();
                 _modManifest = null;
             }
@@ -1534,8 +1782,7 @@ namespace TCAMultiplayer
                 var flightScene = UnityEngine.SceneManagement.SceneManager.GetSceneByName(GameScenes.G2FlightGame);
                 if (flightScene.IsValid() && flightScene.isLoaded)
                 {
-                    Log.Info(Tag, "Unloading FlightGame scene");
-                    UnityEngine.SceneManagement.SceneManager.UnloadSceneAsync(GameScenes.G2FlightGame);
+                    UnloadFlightGameScene("session teardown").Forget();
                 }
 
                 var gameLogic = Falcon.Game2.GameLogic.Instance;
@@ -1567,6 +1814,11 @@ namespace TCAMultiplayer
             _eventBridge?.Dispose();
             _aircraftSpawner?.Dispose();
             _originService?.Dispose();
+            if (_updater != null)
+            {
+                _updater.OnStatusChanged -= HandleUpdaterStatusChanged;
+                _updater.OnUpdateReady -= HandleUpdateReady;
+            }
             if (_connection != null)
             {
                 _connection.OnSessionCreated -= OnSessionCreated;
