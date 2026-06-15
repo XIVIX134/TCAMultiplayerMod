@@ -23,7 +23,7 @@ namespace TCAMP.Tests
         public void ParseSha256_ReadsReleaseChecksumLine()
         {
             string sha = "4285a1a8b5c0558dd524974bf50009d58297f1270217bdc8952e2a3088d5c30a";
-            string line = sha + "  TCAMP-v0.2.2-plugin.zip";
+            string line = sha + "  TCAMP.dll";
 
             Assert.AreEqual(sha, ModUpdater.ParseSha256(line));
         }
@@ -40,8 +40,8 @@ namespace TCAMP.Tests
       ""digest"": ""sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa""
     },
     {
-      ""name"": ""TCAMP-v0.2.3-plugin.zip.sha256"",
-      ""browser_download_url"": ""https://example.test/plugin.zip.sha256""
+      ""name"": ""TCAMP-v0.2.3-plugin.dll.sha256"",
+      ""browser_download_url"": ""https://example.test/plugin.dll.sha256""
     }
   ]
 }";
@@ -62,7 +62,7 @@ namespace TCAMP.Tests
   ""assets"": [
     { ""name"": ""source.zip"", ""browser_download_url"": ""https://example.test/source.zip"" },
     { ""name"": ""TCAMP-v0.2.3-plugin.zip"", ""browser_download_url"": ""https://example.test/plugin.zip"" },
-    { ""name"": ""TCAMP-v0.2.3-plugin.zip.sha256"", ""browser_download_url"": ""https://example.test/plugin.zip.sha256"" }
+    { ""name"": ""TCAMP-v0.2.3-plugin.dll.sha256"", ""browser_download_url"": ""https://example.test/plugin.dll.sha256"" }
   ]
 }");
 
@@ -74,7 +74,7 @@ namespace TCAMP.Tests
 
             Assert.IsTrue(ok, error);
             Assert.AreEqual("TCAMP-v0.2.3-plugin.zip", package.Name);
-            Assert.AreEqual("TCAMP-v0.2.3-plugin.zip.sha256", checksum.Name);
+            Assert.AreEqual("TCAMP-v0.2.3-plugin.dll.sha256", checksum.Name);
         }
 
         [Test]

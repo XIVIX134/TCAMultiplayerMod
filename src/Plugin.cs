@@ -111,7 +111,9 @@ namespace TCAMultiplayer
         private ModUpdater _updater;
         private string _updaterStatusMessage = "";
         private bool _updaterStatusDirty;
+        private ModUpdateAvailable _pendingUpdateAvailable;
         private ModUpdateResult _pendingUpdateNotice;
+        private bool _updateAvailablePromptShown;
         private bool _updateNoticeShown;
         private LiveTestOptions _liveTest;
         private bool _liveSessionStarted;
@@ -272,6 +274,7 @@ namespace TCAMultiplayer
                 TimeoutMilliseconds = 15000
             });
             _updater.OnStatusChanged += HandleUpdaterStatusChanged;
+            _updater.OnUpdateAvailable += HandleUpdateAvailable;
             _updater.OnUpdateReady += HandleUpdateReady;
             _updater.CheckForUpdatesAsync().Forget();
         }
@@ -281,6 +284,18 @@ namespace TCAMultiplayer
             lock (_updaterLock)
             {
                 _updaterStatusMessage = message ?? "";
+                _updaterStatusDirty = true;
+            }
+        }
+
+        private void HandleUpdateAvailable(ModUpdateAvailable update)
+        {
+            lock (_updaterLock)
+            {
+                _pendingUpdateAvailable = update;
+                _updaterStatusMessage = update != null
+                    ? $"TCAMP {update.TagName} is available"
+                    : "";
                 _updaterStatusDirty = true;
             }
         }
@@ -298,30 +313,69 @@ namespace TCAMultiplayer
         private void ProcessUpdaterUi()
         {
             bool refreshMenu;
+            ModUpdateAvailable available;
             ModUpdateResult notice;
             lock (_updaterLock)
             {
                 refreshMenu = _updaterStatusDirty;
                 _updaterStatusDirty = false;
+                available = _pendingUpdateAvailable;
                 notice = _pendingUpdateNotice;
             }
 
             if (refreshMenu)
                 _menu?.RefreshIfVisible();
 
+            if (!_updateAvailablePromptShown && available != null && UIFactory.HasPrefabs && _activeSession == null)
+            {
+                _updateAvailablePromptShown = true;
+                string current = string.IsNullOrWhiteSpace(available.CurrentVersion)
+                    ? PluginMetadata.Version
+                    : available.CurrentVersion;
+                string intro = available.IsNewerVersion
+                    ? "There is a newer version of TCAMP available."
+                    : "There is an updated TCAMP build available.";
+                string availableMessage =
+                    $"{intro}\n\nCurrent: v{current}\nLatest: {available.TagName}\n\nUpdate now?";
+                UIFactory.ShowConfirmDialog(
+                    "TCAMP UPDATE AVAILABLE",
+                    availableMessage,
+                    "UPDATE NOW",
+                    "NOT NOW",
+                    () => _updater?.DownloadAndStageUpdateAsync(available).Forget(),
+                    () => SetUpdaterStatus("Update skipped"));
+                return;
+            }
+
             if (_updateNoticeShown || notice == null || !UIFactory.HasPrefabs || _activeSession != null)
                 return;
 
             _updateNoticeShown = true;
-            string message = notice.Message
-                + "\n\nThe updater will replace the plugin after this game process closes. Launch the game again to load the new version.";
+            string message = $"TCAMP {notice.TagName} downloaded and verified."
+                + "\n\nRestart now to apply it. The game will close, replace the plugin, and reopen automatically.";
             UIFactory.ShowConfirmDialog(
                 "TCAMP UPDATE READY",
                 message,
-                "OK",
+                "RESTART NOW",
                 "LATER",
-                () => { },
-                () => { });
+                () => RestartForUpdate(notice),
+                () => SetUpdaterStatus("Update staged; restart later to apply"),
+                destructive: true);
+        }
+
+        private void RestartForUpdate(ModUpdateResult notice)
+        {
+            if (_updater?.TryApplyStagedUpdateAndRestart(notice) == true)
+                Application.Quit();
+        }
+
+        private void SetUpdaterStatus(string message)
+        {
+            lock (_updaterLock)
+            {
+                _updaterStatusMessage = message ?? "";
+                _updaterStatusDirty = true;
+            }
         }
 
         private void DriveLiveTest()
@@ -1723,6 +1777,7 @@ namespace TCAMultiplayer
             if (_updater != null)
             {
                 _updater.OnStatusChanged -= HandleUpdaterStatusChanged;
+                _updater.OnUpdateAvailable -= HandleUpdateAvailable;
                 _updater.OnUpdateReady -= HandleUpdateReady;
             }
             if (_connection != null)

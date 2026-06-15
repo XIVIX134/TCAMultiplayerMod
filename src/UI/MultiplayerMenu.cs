@@ -22,6 +22,7 @@ namespace TCAMultiplayer.UI
         private const string Green = "#00FF40";
         private const string DimGreen = "#007A28";
         private const string ModSyncWarning =
+            "Before syncing, TCAMP will back up your current Mods folder to TCAMP_ModBackups in the game root.\n\n" +
             "Syncing from the host will overwrite changed mod files and remove extra sync-safe files in your Mods folder.\n\n" +
             "Executable and plugin files are blocked from sync and will not be copied.";
         private static readonly Color ModSyncPrimaryFill = new Color(0f, 0.34f, 0.10f, 0.95f);

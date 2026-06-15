@@ -177,7 +177,7 @@ try {
 
     if ($releaseExists) {
         Invoke-TcampCheckedCommand -FilePath "gh" -Arguments @(
-            "release", "upload", $tag, $package.ZipPath, $package.Sha256Path, "--clobber")
+            "release", "upload", $tag, $package.ZipPath, $package.DllSha256Path, "--clobber")
         Invoke-TcampCheckedCommand -FilePath "gh" -Arguments @(
             "release", "edit", $tag, "--notes", $releaseNotes)
     }
@@ -185,7 +185,7 @@ try {
         $releaseArgs = @(
             "release", "create", $tag,
             $package.ZipPath,
-            $package.Sha256Path,
+            $package.DllSha256Path,
             "--title", $tag,
             "--notes", $releaseNotes,
             "--verify-tag")

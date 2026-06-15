@@ -24,6 +24,7 @@ namespace TCAMultiplayer.Updating
     {
         private const string Tag = "UPDATER";
         private const string PackageSuffix = "-plugin.zip";
+        private const string DllChecksumSuffix = ".dll.sha256";
         private const string PluginDllName = "TCAMP.dll";
         private const int MaxPackageBytes = 64 * 1024 * 1024;
         private const int MaxPluginDllBytes = 32 * 1024 * 1024;
@@ -37,11 +38,13 @@ namespace TCAMultiplayer.Updating
         }
 
         public event Action<string> OnStatusChanged;
+        public event Action<ModUpdateAvailable> OnUpdateAvailable;
         public event Action<ModUpdateResult> OnUpdateReady;
 
         public string StatusMessage { get; private set; } = "";
 
         public bool IsChecking => _isChecking;
+        public bool IsUpdating { get; private set; }
 
         public async UniTask CheckForUpdatesAsync()
         {
@@ -84,32 +87,85 @@ namespace TCAMultiplayer.Updating
             }
 
             int versionComparison = CompareReleaseVersion(release.TagName, _settings.CurrentVersion);
-            if (versionComparison < 0)
+            if (versionComparison <= 0)
             {
-                SetStatus($"TCAMP is up to date ({_settings.CurrentVersion})");
-                return;
+                SetStatus($"Checking TCAMP {NormalizeTag(release.TagName)} DLL hash...");
             }
 
-            if (!TryChooseReleaseAssets(release, out var packageAsset, out var checksumAsset, out string assetError))
+            if (!TryChooseReleaseAssets(release, out var packageAsset, out var dllChecksumAsset, out string assetError))
             {
                 SetStatus(assetError);
                 return;
             }
 
-            SetStatus(versionComparison > 0
-                ? $"Downloading TCAMP {NormalizeTag(release.TagName)}..."
-                : $"Checking TCAMP {NormalizeTag(release.TagName)} release files...");
-            string expectedPackageSha = GetExpectedPackageSha(packageAsset, checksumAsset);
-            byte[] packageBytes = DownloadBytes(packageAsset.DownloadUrl, MaxPackageBytes);
-            string actualPackageSha = ComputeSha256(packageBytes);
-            if (!string.Equals(actualPackageSha, expectedPackageSha, StringComparison.OrdinalIgnoreCase))
+            string expectedPluginSha = GetExpectedPluginSha(dllChecksumAsset);
+            string currentDllPath = GetCurrentPluginPath(_settings.CurrentPluginPath);
+            string currentDllSha = File.Exists(currentDllPath)
+                ? ComputeFileSha256(currentDllPath)
+                : "";
+
+            if (string.Equals(currentDllSha, expectedPluginSha, StringComparison.OrdinalIgnoreCase))
             {
-                throw new InvalidDataException(
-                    $"Package SHA256 mismatch: expected {expectedPackageSha}, got {actualPackageSha}");
+                SetStatus($"TCAMP {NormalizeTag(release.TagName)} is up to date");
+                return;
             }
 
+            var available = new ModUpdateAvailable
+            {
+                TagName = NormalizeTag(release.TagName),
+                CurrentVersion = _settings.CurrentVersion,
+                PackageName = packageAsset.Name,
+                PackageDownloadUrl = packageAsset.DownloadUrl,
+                DllChecksumDownloadUrl = dllChecksumAsset?.DownloadUrl ?? "",
+                ExpectedPluginSha256 = expectedPluginSha,
+                CurrentPluginSha256 = currentDllSha,
+                IsNewerVersion = versionComparison > 0
+            };
+
+            SetStatus(available.IsNewerVersion
+                ? $"TCAMP {available.TagName} is available"
+                : $"TCAMP {available.TagName} release DLL differs from this install");
+            OnUpdateAvailable?.Invoke(available);
+        }
+
+        public async UniTask DownloadAndStageUpdateAsync(ModUpdateAvailable update)
+        {
+            if (update == null || IsUpdating)
+                return;
+
+            IsUpdating = true;
+            try
+            {
+                await UniTask.SwitchToThreadPool();
+                DownloadAndStageUpdateBlocking(update);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("Update failed: " + ex.Message);
+                Log.Warning(Tag, $"Update failed: {ex}");
+            }
+            finally
+            {
+                IsUpdating = false;
+            }
+        }
+
+        private void DownloadAndStageUpdateBlocking(ModUpdateAvailable update)
+        {
+            if (string.IsNullOrWhiteSpace(update.PackageDownloadUrl))
+                throw new InvalidDataException("Update package URL is empty");
+
+            SetStatus($"Downloading TCAMP {update.TagName}...");
+            string expectedPluginSha = ParseSha256(update.ExpectedPluginSha256);
+            byte[] packageBytes = DownloadBytes(update.PackageDownloadUrl, MaxPackageBytes);
             byte[] pluginDll = ReadPluginDllFromPackage(packageBytes);
             string newDllSha = ComputeSha256(pluginDll);
+            if (!string.Equals(newDllSha, expectedPluginSha, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException(
+                    $"Plugin DLL SHA256 mismatch: expected {expectedPluginSha}, got {newDllSha}");
+            }
+
             string currentDllPath = GetCurrentPluginPath(_settings.CurrentPluginPath);
             string currentDllSha = File.Exists(currentDllPath)
                 ? ComputeFileSha256(currentDllPath)
@@ -117,16 +173,16 @@ namespace TCAMultiplayer.Updating
 
             if (string.Equals(currentDllSha, newDllSha, StringComparison.OrdinalIgnoreCase))
             {
-                SetStatus($"TCAMP {NormalizeTag(release.TagName)} already matches installed files");
+                SetStatus($"TCAMP {update.TagName} already matches installed files");
                 return;
             }
 
-            var result = StagePluginUpdate(release.TagName, actualPackageSha, newDllSha, currentDllPath, pluginDll);
+            var result = StagePluginUpdate(update.TagName, newDllSha, currentDllPath, pluginDll);
             SetStatus(result.Message);
             OnUpdateReady?.Invoke(result);
         }
 
-        private string GetExpectedPackageSha(GitHubAssetInfo packageAsset, GitHubAssetInfo checksumAsset)
+        private string GetExpectedPluginSha(GitHubAssetInfo checksumAsset)
         {
             if (checksumAsset != null && !string.IsNullOrWhiteSpace(checksumAsset.DownloadUrl))
             {
@@ -134,18 +190,11 @@ namespace TCAMultiplayer.Updating
                 return ParseSha256(shaText);
             }
 
-            if (!string.IsNullOrWhiteSpace(packageAsset?.Digest)
-                && packageAsset.Digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
-            {
-                return ParseSha256(packageAsset.Digest.Substring("sha256:".Length));
-            }
-
-            throw new InvalidDataException("Release has no SHA256 checksum asset");
+            throw new InvalidDataException("Release has no TCAMP.dll SHA256 checksum asset");
         }
 
         private ModUpdateResult StagePluginUpdate(
             string tagName,
-            string packageSha256,
             string pluginSha256,
             string currentDllPath,
             byte[] pluginDll)
@@ -160,15 +209,30 @@ namespace TCAMultiplayer.Updating
             string pendingVersionPath = pendingPath + ".version";
             string scriptPath = Path.Combine(pluginDir, "TCAMP.ApplyUpdate.cmd");
 
+            string restartExePath = GetCurrentProcessExecutablePath();
+            string restartDirectory = Path.GetDirectoryName(restartExePath) ?? "";
+            string restartArguments = GetRestartArguments();
+            string applyLogPath = Path.Combine(pluginDir, "TCAMP.Update.log");
+
             if (File.Exists(pendingPath)
                 && string.Equals(ComputeFileSha256(pendingPath), pluginSha256, StringComparison.OrdinalIgnoreCase))
             {
+                WriteApplyScript(
+                    scriptPath,
+                    pendingPath,
+                    currentDllPath,
+                    pendingShaPath,
+                    pendingVersionPath,
+                    restartExePath,
+                    restartDirectory,
+                    restartArguments,
+                    applyLogPath);
                 return new ModUpdateResult
                 {
                     TagName = NormalizeTag(tagName),
-                    PackageSha256 = packageSha256,
                     PluginSha256 = pluginSha256,
                     PendingPath = pendingPath,
+                    ApplyScriptPath = scriptPath,
                     Message = $"TCAMP {NormalizeTag(tagName)} is already staged. Restart the game to finish updating.",
                     RebootRequired = true
                 };
@@ -178,16 +242,24 @@ namespace TCAMultiplayer.Updating
             File.WriteAllText(pendingShaPath, pluginSha256 + "  " + PluginDllName + Environment.NewLine, Encoding.ASCII);
             File.WriteAllText(pendingVersionPath, NormalizeTag(tagName) + Environment.NewLine, Encoding.ASCII);
 
-            WriteApplyScript(scriptPath, pendingPath, currentDllPath, pendingShaPath, pendingVersionPath);
-            StartApplyScript(scriptPath);
+            WriteApplyScript(
+                scriptPath,
+                pendingPath,
+                currentDllPath,
+                pendingShaPath,
+                pendingVersionPath,
+                restartExePath,
+                restartDirectory,
+                restartArguments,
+                applyLogPath);
 
             return new ModUpdateResult
             {
                 TagName = NormalizeTag(tagName),
-                PackageSha256 = packageSha256,
                 PluginSha256 = pluginSha256,
                 PendingPath = pendingPath,
-                Message = $"TCAMP {NormalizeTag(tagName)} downloaded and verified. Close the game, then launch it again to finish updating.",
+                ApplyScriptPath = scriptPath,
+                Message = $"TCAMP {NormalizeTag(tagName)} downloaded and verified. Restart the game to finish updating.",
                 RebootRequired = true
             };
         }
@@ -197,49 +269,186 @@ namespace TCAMultiplayer.Updating
             string pendingPath,
             string targetPath,
             string pendingShaPath,
-            string pendingVersionPath)
+            string pendingVersionPath,
+            string restartExePath,
+            string restartDirectory,
+            string restartArguments,
+            string applyLogPath)
         {
             int pid = Process.GetCurrentProcess().Id;
             string script = "@echo off\r\n"
-                + "setlocal\r\n"
+                + "setlocal EnableExtensions EnableDelayedExpansion\r\n"
                 + $"set \"TCAMP_PID={pid}\"\r\n"
-                + $"set \"PENDING={pendingPath}\"\r\n"
-                + $"set \"TARGET={targetPath}\"\r\n"
-                + $"set \"PENDING_SHA={pendingShaPath}\"\r\n"
-                + $"set \"PENDING_VERSION={pendingVersionPath}\"\r\n"
+                + $"set \"PENDING={EscapeBatchValue(pendingPath)}\"\r\n"
+                + $"set \"TARGET={EscapeBatchValue(targetPath)}\"\r\n"
+                + $"set \"PENDING_SHA={EscapeBatchValue(pendingShaPath)}\"\r\n"
+                + $"set \"PENDING_VERSION={EscapeBatchValue(pendingVersionPath)}\"\r\n"
+                + $"set \"RESTART_EXE={EscapeBatchValue(restartExePath)}\"\r\n"
+                + $"set \"RESTART_DIR={EscapeBatchValue(restartDirectory)}\"\r\n"
+                + $"set \"RESTART_ARGS={EscapeBatchArgumentList(restartArguments)}\"\r\n"
+                + $"set \"APPLY_LOG={EscapeBatchValue(applyLogPath)}\"\r\n"
+                + "echo [%DATE% %TIME%] Waiting for game PID %TCAMP_PID%>>\"%APPLY_LOG%\"\r\n"
                 + ":wait_for_game\r\n"
                 + "tasklist /FI \"PID eq %TCAMP_PID%\" 2>NUL | find \"%TCAMP_PID%\" >NUL\r\n"
                 + "if not errorlevel 1 (\r\n"
                 + "  timeout /t 1 /nobreak >NUL\r\n"
                 + "  goto wait_for_game\r\n"
                 + ")\r\n"
-                + "if exist \"%PENDING%\" copy /Y \"%PENDING%\" \"%TARGET%\" >NUL\r\n"
+                + "set COPY_TRIES=0\r\n"
+                + ":copy_retry\r\n"
+                + "if not exist \"%PENDING%\" goto launch_game\r\n"
+                + "copy /Y \"%PENDING%\" \"%TARGET%\" >>\"%APPLY_LOG%\" 2>&1\r\n"
+                + "if errorlevel 1 (\r\n"
+                + "  set /A COPY_TRIES+=1\r\n"
+                + "  if !COPY_TRIES! LSS 30 (\r\n"
+                + "    timeout /t 1 /nobreak >NUL\r\n"
+                + "    goto copy_retry\r\n"
+                + "  )\r\n"
+                + "  echo [%DATE% %TIME%] Failed to replace TCAMP.dll>>\"%APPLY_LOG%\"\r\n"
+                + "  goto finish\r\n"
+                + ")\r\n"
+                + "echo [%DATE% %TIME%] TCAMP.dll replaced>>\"%APPLY_LOG%\"\r\n"
                 + "if exist \"%PENDING%\" del /F /Q \"%PENDING%\" >NUL\r\n"
                 + "if exist \"%PENDING_SHA%\" del /F /Q \"%PENDING_SHA%\" >NUL\r\n"
                 + "if exist \"%PENDING_VERSION%\" del /F /Q \"%PENDING_VERSION%\" >NUL\r\n"
+                + ":launch_game\r\n"
+                + "echo [%DATE% %TIME%] Restart exe: \"%RESTART_EXE%\">>\"%APPLY_LOG%\"\r\n"
+                + "echo [%DATE% %TIME%] Restart dir: \"%RESTART_DIR%\">>\"%APPLY_LOG%\"\r\n"
+                + "echo [%DATE% %TIME%] Restart args: %RESTART_ARGS%>>\"%APPLY_LOG%\"\r\n"
+                + "echo [%DATE% %TIME%] Doorstop env before relaunch:>>\"%APPLY_LOG%\"\r\n"
+                + "set DOORSTOP >>\"%APPLY_LOG%\" 2>&1\r\n"
+                + "for /F \"tokens=1 delims==\" %%E in ('set DOORSTOP 2^>NUL') do set \"%%E=\"\r\n"
+                + "set \"BEPINEX_DOORSTOP_DISABLE=\"\r\n"
+                + "echo [%DATE% %TIME%] Doorstop env after cleanup:>>\"%APPLY_LOG%\"\r\n"
+                + "set DOORSTOP >>\"%APPLY_LOG%\" 2>&1\r\n"
+                + "timeout /t 3 /nobreak >NUL\r\n"
+                + "if not exist \"%RESTART_EXE%\" (\r\n"
+                + "  echo [%DATE% %TIME%] Restart exe missing>>\"%APPLY_LOG%\"\r\n"
+                + "  goto finish\r\n"
+                + ")\r\n"
+                + "pushd \"%RESTART_DIR%\" >>\"%APPLY_LOG%\" 2>&1\r\n"
+                + "if errorlevel 1 (\r\n"
+                + "  echo [%DATE% %TIME%] Failed to enter restart dir>>\"%APPLY_LOG%\"\r\n"
+                + "  goto finish\r\n"
+                + ")\r\n"
+                + "start \"\" \"%RESTART_EXE%\" %RESTART_ARGS%\r\n"
+                + "echo [%DATE% %TIME%] Relaunch requested>>\"%APPLY_LOG%\"\r\n"
+                + "timeout /t 3 /nobreak >NUL\r\n"
+                + "tasklist /FI \"IMAGENAME eq Arena.exe\" >>\"%APPLY_LOG%\" 2>&1\r\n"
+                + "popd\r\n"
+                + ":finish\r\n"
                 + "del /F /Q \"%~f0\" >NUL\r\n";
 
             File.WriteAllText(scriptPath, script, Encoding.ASCII);
         }
 
-        private static void StartApplyScript(string scriptPath)
+        public bool TryApplyStagedUpdateAndRestart(ModUpdateResult result)
+        {
+            if (result == null || string.IsNullOrWhiteSpace(result.ApplyScriptPath))
+            {
+                SetStatus("Update restart failed: no staged update was found");
+                return false;
+            }
+
+            if (!File.Exists(result.PendingPath) || !File.Exists(result.ApplyScriptPath))
+            {
+                SetStatus("Update restart failed: staged update files are missing");
+                return false;
+            }
+
+            if (!StartApplyScript(result.ApplyScriptPath))
+            {
+                SetStatus("Update restart failed: apply helper could not start");
+                return false;
+            }
+
+            SetStatus("Restarting TCAMP to apply update...");
+            return true;
+        }
+
+        private static bool StartApplyScript(string scriptPath)
         {
             try
             {
                 var start = new ProcessStartInfo
                 {
                     FileName = "cmd.exe",
-                    Arguments = "/c start \"\" /min \"" + scriptPath + "\"",
+                    Arguments = "/d /c \"" + scriptPath + "\"",
                     CreateNoWindow = true,
                     UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden
+                    WindowStyle = ProcessWindowStyle.Hidden,
+                    WorkingDirectory = Path.GetDirectoryName(scriptPath) ?? ""
                 };
+                RemoveDoorstopEnvironment(start);
                 Process.Start(start);
+                return true;
             }
             catch (Exception ex)
             {
                 Log.Warning(Tag, $"Update was staged, but the apply script could not be started: {ex.Message}");
+                return false;
             }
+        }
+
+        private static void RemoveDoorstopEnvironment(ProcessStartInfo start)
+        {
+            if (start == null)
+                return;
+
+            var keys = start.EnvironmentVariables.Keys
+                .Cast<string>()
+                .Where(key =>
+                    key.StartsWith("DOORSTOP", StringComparison.OrdinalIgnoreCase)
+                    || key.Equals("BEPINEX_DOORSTOP_DISABLE", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            foreach (string key in keys)
+                start.EnvironmentVariables.Remove(key);
+        }
+
+        private static string GetCurrentProcessExecutablePath()
+        {
+            try
+            {
+                string path = Process.GetCurrentProcess().MainModule?.FileName;
+                if (!string.IsNullOrWhiteSpace(path))
+                    return path;
+            }
+            catch
+            {
+                // Fall back to argv[0] below.
+            }
+
+            var args = Environment.GetCommandLineArgs();
+            return args != null && args.Length > 0 ? args[0] : "";
+        }
+
+        private static string GetRestartArguments()
+        {
+            var args = Environment.GetCommandLineArgs();
+            if (args == null || args.Length <= 1)
+                return "";
+
+            return string.Join(" ", args.Skip(1).Select(QuoteBatchArgument));
+        }
+
+        private static string QuoteBatchArgument(string value)
+        {
+            value = (value ?? "").Replace("%", "%%").Replace("\r", "").Replace("\n", "");
+            value = value.Replace("\"", "\\\"");
+            return value.Length == 0 || value.Any(char.IsWhiteSpace)
+                ? "\"" + value + "\""
+                : value;
+        }
+
+        private static string EscapeBatchValue(string value)
+        {
+            return (value ?? "").Replace("%", "%%").Replace("\"", "");
+        }
+
+        private static string EscapeBatchArgumentList(string value)
+        {
+            return (value ?? "").Replace("%", "%%").Replace("\r", "").Replace("\n", "");
         }
 
         private string DownloadString(string url)
@@ -315,11 +524,11 @@ namespace TCAMultiplayer.Updating
         public static bool TryChooseReleaseAssets(
             GitHubReleaseInfo release,
             out GitHubAssetInfo packageAsset,
-            out GitHubAssetInfo checksumAsset,
+            out GitHubAssetInfo dllChecksumAsset,
             out string error)
         {
             packageAsset = null;
-            checksumAsset = null;
+            dllChecksumAsset = null;
             error = "";
 
             var assets = release?.Assets ?? new List<GitHubAssetInfo>();
@@ -338,20 +547,22 @@ namespace TCAMultiplayer.Updating
                 return false;
             }
 
-            string expectedShaAssetName = packageAsset.Name + ".sha256";
-            checksumAsset = assets.FirstOrDefault(a =>
-                    string.Equals(a?.Name, expectedShaAssetName, StringComparison.OrdinalIgnoreCase)
+            string expectedDllShaAssetName = Regex.Replace(
+                packageAsset.Name,
+                @"\.zip$",
+                DllChecksumSuffix,
+                RegexOptions.IgnoreCase);
+            dllChecksumAsset = assets.FirstOrDefault(a =>
+                    string.Equals(a?.Name, expectedDllShaAssetName, StringComparison.OrdinalIgnoreCase)
                     && !string.IsNullOrWhiteSpace(a.DownloadUrl))
                 ?? assets.FirstOrDefault(a =>
                     !string.IsNullOrWhiteSpace(a?.Name)
-                    && a.Name.EndsWith(".zip.sha256", StringComparison.OrdinalIgnoreCase)
+                    && a.Name.EndsWith(DllChecksumSuffix, StringComparison.OrdinalIgnoreCase)
                     && !string.IsNullOrWhiteSpace(a.DownloadUrl));
 
-            if (checksumAsset == null
-                && (string.IsNullOrWhiteSpace(packageAsset.Digest)
-                    || !packageAsset.Digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase)))
+            if (dllChecksumAsset == null)
             {
-                error = "Latest TCAMP release has no plugin zip SHA256 checksum";
+                error = "Latest TCAMP release has no TCAMP.dll SHA256 checksum";
                 return false;
             }
 
@@ -475,12 +686,24 @@ namespace TCAMultiplayer.Updating
         public int TimeoutMilliseconds = 15000;
     }
 
+    public sealed class ModUpdateAvailable
+    {
+        public string TagName;
+        public string CurrentVersion;
+        public string PackageName;
+        public string PackageDownloadUrl;
+        public string DllChecksumDownloadUrl;
+        public string ExpectedPluginSha256;
+        public string CurrentPluginSha256;
+        public bool IsNewerVersion;
+    }
+
     public sealed class ModUpdateResult
     {
         public string TagName;
-        public string PackageSha256;
         public string PluginSha256;
         public string PendingPath;
+        public string ApplyScriptPath;
         public string Message;
         public bool RebootRequired;
     }
