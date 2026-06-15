@@ -21,6 +21,13 @@ namespace TCAMultiplayer.UI
         private const string Tag = "MP-MENU";
         private const string Green = "#00FF40";
         private const string DimGreen = "#007A28";
+        private static readonly Color ModSyncPrimaryFill = new Color(0f, 0.34f, 0.10f, 0.95f);
+        private static readonly Color ModSyncPrimaryHover = new Color(0f, 0.58f, 0.17f, 1f);
+        private static readonly Color ModSyncPrimaryPressed = new Color(0f, 0.24f, 0.08f, 1f);
+        private static readonly Color ModSyncSecondaryFill = new Color(0f, 0f, 0f, 0.38f);
+        private static readonly Color ModSyncSecondaryHover = new Color(0f, 0.18f, 0.06f, 0.65f);
+        private static readonly Color ModSyncSecondaryPressed = new Color(0f, 0.10f, 0.04f, 0.8f);
+        private static readonly Color ModSyncDisabledFill = new Color(0f, 0.05f, 0.02f, 0.45f);
 
         private enum Screen { MainMenu, HostSetup, DirectConnect, Lobby }
         private Screen _currentScreen = Screen.MainMenu;
@@ -905,10 +912,16 @@ namespace TCAMultiplayer.UI
             noteText.GetComponent<LayoutElement>().preferredHeight = 30f;
 
             UIFactory.CreateSpacer(panel.transform, 8, 1f);
-            var sync = Track(UIFactory.CreateNativeButton(canSync ? "SYNC FROM HOST" : "SYNC UNAVAILABLE", panel.transform, 52));
+
+            var actions = UIFactory.CreateHorizontalRow(panel.transform, 52, 12);
+            actions.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = true;
+
+            var sync = Track(UIFactory.CreateNativeButton(canSync ? "SYNC FROM HOST" : "SYNC UNAVAILABLE", actions.transform, 52));
             if (sync != null)
             {
+                UIFactory.SetFlexible(sync.gameObject);
                 sync.interactable = canSync;
+                StyleModSyncPrimaryAction(sync, canSync);
                 sync.onClick.AddListener(() =>
                 {
                     _modSyncInProgress = true;
@@ -921,9 +934,11 @@ namespace TCAMultiplayer.UI
                 });
             }
 
-            var cancelButton = Track(UIFactory.CreateNativeButton("CANCEL JOIN", panel.transform, 46));
+            var cancelButton = Track(UIFactory.CreateNativeButton("CANCEL JOIN", actions.transform, 52));
             if (cancelButton != null)
             {
+                UIFactory.SetFlexible(cancelButton.gameObject);
+                StyleModSyncSecondaryAction(cancelButton);
                 cancelButton.onClick.AddListener(() =>
                 {
                     _modMismatch = null;
@@ -931,6 +946,56 @@ namespace TCAMultiplayer.UI
                     _connection?.Disconnect();
                     SetScreen(Screen.MainMenu);
                 });
+            }
+        }
+
+        private static void StyleModSyncPrimaryAction(Button button, bool enabled)
+        {
+            if (button == null) return;
+
+            var colors = button.colors;
+            colors.normalColor = enabled ? ModSyncPrimaryFill : ModSyncDisabledFill;
+            colors.highlightedColor = enabled ? ModSyncPrimaryHover : ModSyncDisabledFill;
+            colors.selectedColor = enabled ? ModSyncPrimaryHover : ModSyncDisabledFill;
+            colors.pressedColor = enabled ? ModSyncPrimaryPressed : ModSyncDisabledFill;
+            colors.disabledColor = ModSyncDisabledFill;
+            colors.colorMultiplier = 1f;
+            colors.fadeDuration = 0.08f;
+            button.colors = colors;
+
+            var image = button.GetComponent<Image>();
+            if (image != null)
+                image.color = enabled ? ModSyncPrimaryFill : ModSyncDisabledFill;
+
+            foreach (var tmp in button.GetComponentsInChildren<TextMeshProUGUI>(true))
+            {
+                tmp.color = enabled ? UIFactory.AccentColor : UIFactory.MutedTextColor;
+                tmp.fontStyle |= FontStyles.Bold;
+            }
+        }
+
+        private static void StyleModSyncSecondaryAction(Button button)
+        {
+            if (button == null) return;
+
+            var colors = button.colors;
+            colors.normalColor = ModSyncSecondaryFill;
+            colors.highlightedColor = ModSyncSecondaryHover;
+            colors.selectedColor = ModSyncSecondaryHover;
+            colors.pressedColor = ModSyncSecondaryPressed;
+            colors.disabledColor = ModSyncDisabledFill;
+            colors.colorMultiplier = 1f;
+            colors.fadeDuration = 0.08f;
+            button.colors = colors;
+
+            var image = button.GetComponent<Image>();
+            if (image != null)
+                image.color = ModSyncSecondaryFill;
+
+            foreach (var tmp in button.GetComponentsInChildren<TextMeshProUGUI>(true))
+            {
+                tmp.color = UIFactory.MutedTextColor;
+                tmp.fontStyle = FontStyles.Normal;
             }
         }
 
