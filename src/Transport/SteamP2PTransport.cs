@@ -162,6 +162,29 @@ namespace TCAMultiplayer.Transport
             Log.Info(Tag, "Disconnected from Steam P2P session");
         }
 
+        /// <inheritdoc />
+        public void DisconnectPeer(ulong peerId)
+        {
+            if (!_isRunning || peerId == 0)
+                return;
+
+            if (IsHost)
+            {
+                if (!_peerSteamIds.TryGetValue(peerId, out var steamId))
+                    return;
+
+                SteamNetworking.SendP2PPacket(
+                    steamId, new byte[] { 0x02 }, 1, CH_RELIABLE, P2PSend.Reliable);
+                SteamNetworking.CloseP2PSessionWithUser(steamId);
+                RemovePeer(peerId);
+                _eventQueue.Enqueue(TransportEvent.PeerDisconnected(peerId));
+                return;
+            }
+
+            if (peerId == 1)
+                Disconnect();
+        }
+
         // ═══════════════════════════════════════════════════════════════
         // ITransport — Send / Broadcast (thread-safe)
         // ═══════════════════════════════════════════════════════════════

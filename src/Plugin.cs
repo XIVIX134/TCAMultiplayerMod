@@ -203,6 +203,7 @@ namespace TCAMultiplayer
                 _modManifest?.SendManifest();
             }
 
+            _modManifest?.Update(Time.deltaTime);
             _lobby?.Update();
             _respawnManager?.Update();
 
@@ -691,7 +692,9 @@ namespace TCAMultiplayer
             _remoteManager = new RemoteAircraftManager(session, _aircraftSpawner, _originService);
             _stateReader = new LocalAircraftStateReader(_originService);
             _modManifest = new ModManifestCollector(session, _connection, router);
-            _modManifest.OnCompatibilityResult += HandleModCompatibilityResult;
+            _modManifest.OnCompatibilityAccepted += HandleModCompatibilityAccepted;
+            _modManifest.OnCompatibilityMismatch += HandleModCompatibilityMismatch;
+            _modManifest.OnSyncStatus += HandleModSyncStatus;
 
             // Register AircraftState packet handler — routes incoming state to RemoteAircraftManager
             router.Register(PacketType.AircraftState, HandleAircraftStateRaw);
@@ -732,6 +735,7 @@ namespace TCAMultiplayer
 
             // Wire UI to session-scoped systems
             _menu.SetLobby(_lobby);
+            _menu.SetModManifest(_modManifest);
             _scoreboard.Init(session, _scoreTracker);
             _respawnScreen.Init(_respawnManager, _spawnManager, session, _lobby);
 
@@ -1439,17 +1443,33 @@ namespace TCAMultiplayer
             Log.Info(Tag, $"Cleaned up disconnected peer {peerId}");
         }
 
-        private void HandleModCompatibilityResult(bool isCompatible, string reason)
+        private void HandleModCompatibilityAccepted()
         {
-            if (isCompatible)
+            if (_activeSession?.IsHost == true)
+                return;
+
+            var local = _activeSession?.GetLocalPlayer();
+            if (local != null)
+                local.IsModsVerified = true;
+
+            Log.Info(Tag, "Mod compatibility accepted by host");
+            _connection?.SetStatusMessage("Mods verified");
+            _lobby?.AnnounceLocalPlayer();
+        }
+
+        private void HandleModCompatibilityMismatch(ModManifestCollector.ModMismatchInfo info)
+        {
+            string reason = info?.Reason ?? "Mod files mismatch";
+            Log.Warning(Tag, $"Mod compatibility rejected by host: {reason}");
+            _connection?.SetStatusMessage("Mod mismatch - sync or cancel");
+        }
+
+        private void HandleModSyncStatus(string message)
+        {
+            if (!string.IsNullOrWhiteSpace(message))
             {
-                Log.Info(Tag, "Mod compatibility accepted by host");
-            }
-            else
-            {
-                Log.Warning(Tag, $"Mod compatibility rejected by host: {reason}");
-                _connection?.Disconnect();
-                _connection?.SetStatusMessage($"Connected, but mod mismatch: {reason}");
+                Log.Info(Tag, message);
+                _connection?.SetStatusMessage(message);
             }
         }
 
@@ -1513,7 +1533,9 @@ namespace TCAMultiplayer
             // Game flow
             if (_modManifest != null)
             {
-                _modManifest.OnCompatibilityResult -= HandleModCompatibilityResult;
+                _modManifest.OnCompatibilityAccepted -= HandleModCompatibilityAccepted;
+                _modManifest.OnCompatibilityMismatch -= HandleModCompatibilityMismatch;
+                _modManifest.OnSyncStatus -= HandleModSyncStatus;
                 _modManifest.Dispose();
                 _modManifest = null;
             }

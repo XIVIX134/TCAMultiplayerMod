@@ -55,6 +55,12 @@ namespace TCAMultiplayer.Transport
         void Disconnect();
 
         /// <summary>
+        /// Disconnect one peer. Hosts use this to reject a specific client
+        /// without ending the whole session. Clients may only target peer 1.
+        /// </summary>
+        void DisconnectPeer(ulong peerId);
+
+        /// <summary>
         /// Send data to a specific peer.
         /// Thread-safe — may be called from any thread.
         /// </summary>

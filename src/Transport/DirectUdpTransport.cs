@@ -232,6 +232,28 @@ namespace TCAMultiplayer.Transport
             Log.Info(Tag, "Disconnected");
         }
 
+        /// <inheritdoc />
+        public void DisconnectPeer(ulong peerId)
+        {
+            if (!_isRunning || peerId == 0)
+                return;
+
+            if (IsHost)
+            {
+                if (!_peerEndpoints.TryGetValue(peerId, out var endpoint))
+                    return;
+
+                SendRawTo(new byte[] { PKT_DISCONNECT }, endpoint);
+                RemovePeer(peerId);
+                SetStatus($"Peer {peerId} disconnected");
+                OnPeerDisconnected?.Invoke(peerId);
+                return;
+            }
+
+            if (peerId == 1)
+                Disconnect();
+        }
+
         // ═══════════════════════════════════════════════════════════════
         // ITransport — Send / Broadcast (thread-safe, lock-free)
         // ═══════════════════════════════════════════════════════════════
@@ -979,24 +1001,43 @@ namespace TCAMultiplayer.Transport
             var bindAddressText = _config.LocalBindAddress;
             IPAddress bindAddress = IPAddress.Any;
             _routeDescription = port > 0 ? "listening on all IPv4 adapters" : "OS default route";
+            string ignoredManualBind = null;
+            bool manualBindAccepted = false;
 
             if (!string.IsNullOrWhiteSpace(bindAddressText))
             {
-                if (!IPAddress.TryParse(bindAddressText.Trim(), out bindAddress))
+                if (!IPAddress.TryParse(bindAddressText.Trim(), out var configuredBindAddress))
                     throw new FormatException($"Invalid LocalBindAddress '{bindAddressText}'");
 
-                if (bindAddress.AddressFamily != AddressFamily.InterNetwork)
-                    throw new NotSupportedException($"Only IPv4 bind addresses are supported: {bindAddress}");
+                if (configuredBindAddress.AddressFamily != AddressFamily.InterNetwork)
+                    throw new NotSupportedException($"Only IPv4 bind addresses are supported: {configuredBindAddress}");
 
-                _routeDescription = $"manual local bind {bindAddress}";
+                if (ShouldUseManualBindAddress(configuredBindAddress, remoteAddress, out string ignoreReason))
+                {
+                    bindAddress = configuredBindAddress;
+                    manualBindAccepted = true;
+                    _routeDescription = IPAddress.Any.Equals(bindAddress)
+                        ? "manual all-IPv4 bind"
+                        : $"manual local bind {bindAddress}";
+                }
+                else
+                {
+                    ignoredManualBind = $"ignored LocalBindAddress {configuredBindAddress}: {ignoreReason}";
+                    Log.Warning(Tag, $"Ignoring LocalBindAddress {configuredBindAddress} for remote " +
+                                     $"{(remoteAddress != null ? remoteAddress.ToString() : "<host>")}: {ignoreReason}");
+                }
             }
-            else if (_config.AutoVpnBind && remoteAddress != null
+
+            if (!manualBindAccepted && IPAddress.Any.Equals(bindAddress) && _config.AutoVpnBind && remoteAddress != null
                 && TryChooseLocalAddressForRemote(remoteAddress, out var selectedAddress, out var routeDescription))
             {
                 bindAddress = selectedAddress;
                 _routeDescription = routeDescription;
                 Log.Info(Tag, $"Auto route selected local adapter IP {bindAddress} for remote {remoteAddress} ({routeDescription})");
             }
+
+            if (!string.IsNullOrWhiteSpace(ignoredManualBind))
+                _routeDescription = $"{_routeDescription}; {ignoredManualBind}";
 
             var client = new UdpClient(new IPEndPoint(bindAddress, port));
             try
@@ -1008,6 +1049,122 @@ namespace TCAMultiplayer.Transport
                 // Some platforms reject this after bind. It is only a best-effort hardening knob.
             }
             return client;
+        }
+
+        private static bool ShouldUseManualBindAddress(
+            IPAddress bindAddress,
+            IPAddress remoteAddress,
+            out string ignoreReason)
+        {
+            ignoreReason = "";
+
+            if (bindAddress == null)
+            {
+                ignoreReason = "no bind address was provided";
+                return false;
+            }
+
+            if (IPAddress.Any.Equals(bindAddress))
+                return true;
+
+            if (remoteAddress == null)
+            {
+                if (IPAddress.IsLoopback(bindAddress))
+                    return true;
+
+                if (FindLocalAddressCandidate(bindAddress) != null)
+                    return true;
+
+                ignoreReason = "address is not assigned to an active IPv4 adapter";
+                return false;
+            }
+
+            bool bindLoopback = IPAddress.IsLoopback(bindAddress);
+            bool remoteLoopback = IPAddress.IsLoopback(remoteAddress);
+
+            if (remoteLoopback)
+            {
+                if (bindLoopback)
+                    return true;
+
+                ignoreReason = "loopback targets must use the loopback adapter";
+                return false;
+            }
+
+            if (bindLoopback)
+            {
+                ignoreReason = "loopback bind cannot reach a non-loopback target";
+                return false;
+            }
+
+            LocalAddressCandidate bindCandidate = FindLocalAddressCandidate(bindAddress);
+            if (bindCandidate == null)
+            {
+                ignoreReason = "address is not assigned to an active IPv4 adapter";
+                return false;
+            }
+
+            if (remoteAddress == null)
+                return true;
+
+            byte[] bindBytes = bindAddress.GetAddressBytes();
+            byte[] remoteBytes = remoteAddress.GetAddressBytes();
+            bool bindSpecialVpn = IsSpecialVpnAddress(bindBytes);
+            bool remoteSpecialVpn = IsSpecialVpnAddress(remoteBytes);
+
+            if (remoteSpecialVpn)
+            {
+                if (!bindSpecialVpn)
+                {
+                    ignoreReason = "remote is a VPN-style address but bind address is not";
+                    return false;
+                }
+
+                if (bindBytes[0] != remoteBytes[0])
+                {
+                    ignoreReason = "remote and bind address are on different VPN address families";
+                    return false;
+                }
+
+                return true;
+            }
+
+            if (bindSpecialVpn)
+            {
+                ignoreReason = "bind address is a VPN-style address but remote is not";
+                return false;
+            }
+
+            if (IsRfc1918Address(remoteBytes))
+            {
+                if (!IsRfc1918Address(bindBytes))
+                {
+                    ignoreReason = "remote is a private LAN address but bind address is not";
+                    return false;
+                }
+
+                if (bindCandidate.Mask != null && IsSameSubnet(bindAddress, remoteAddress, bindCandidate.Mask))
+                    return true;
+
+                ignoreReason = "bind address is not on the same LAN subnet as the remote";
+                return false;
+            }
+
+            return true;
+        }
+
+        private static LocalAddressCandidate FindLocalAddressCandidate(IPAddress address)
+        {
+            if (address == null)
+                return null;
+
+            foreach (var candidate in GetLocalAddressCandidates())
+            {
+                if (candidate.Address.Equals(address))
+                    return candidate;
+            }
+
+            return null;
         }
 
         private static bool TryChooseLocalAddressForRemote(

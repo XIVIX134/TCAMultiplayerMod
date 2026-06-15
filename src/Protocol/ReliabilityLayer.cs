@@ -26,25 +26,35 @@ namespace TCAMultiplayer.Protocol
         // Internal packet type markers (never collide with PacketType enum which is 0–102)
         private const byte RELIABLE_DATA = 0xFE;
         private const byte ACK          = 0xFF;
+        private const byte RELIABLE_FRAGMENT = 0xFD;
 
         // ACK packet is always: marker(1) + seq(4) = 5 bytes
         private const int AckPacketSize = 5;
         // Reliable header: marker(1) + seq(4) = 5 bytes before payload
         private const int ReliableHeaderSize = 5;
+        // Fragment payload header: marker(1) + transferId(4) + index(4) + count(4) + totalBytes(4)
+        private const int FragmentHeaderSize = 17;
+        private const int TransportEnvelopeBytes = 16;
+        private const int MinFragmentChunkBytes = 128;
+        private const int MaxFragmentCount = 8192;
+        private const int MaxFragmentedPayloadBytes = 128 * 1024 * 1024;
 
         // Dedup window: sequences within [highestReceived - WindowSize + 1, highestReceived] are tracked
-        private const int DedupWindowSize = 1024;
+        private const int DedupWindowSize = 8192;
 
         private readonly ITransport _transport;
         private readonly TransportConfig _config;
 
         // ── Per-peer send state ───────────────────────────────────────
         private readonly Dictionary<ulong, uint> _sendSequences = new Dictionary<ulong, uint>();
+        private readonly Dictionary<ulong, uint> _sendTransferIds = new Dictionary<ulong, uint>();
         private readonly Dictionary<ulong, Dictionary<uint, PendingPacket>> _pendingByPeer =
             new Dictionary<ulong, Dictionary<uint, PendingPacket>>();
 
         // ── Per-peer receive state ────────────────────────────────────
         private readonly Dictionary<ulong, ReceiveState> _receiveStates = new Dictionary<ulong, ReceiveState>();
+        private readonly Dictionary<ulong, Dictionary<uint, FragmentTransfer>> _incomingFragments =
+            new Dictionary<ulong, Dictionary<uint, FragmentTransfer>>();
 
         private long _totalReliableSent;
         private long _totalReliableAcked;
@@ -76,13 +86,20 @@ namespace TCAMultiplayer.Protocol
                 return;
             }
 
+            int maxReliablePayloadBytes = GetMaxReliablePayloadBytes();
+            if (data.Length > maxReliablePayloadBytes)
+            {
+                SendReliableFragmented(peerId, data, maxReliablePayloadBytes);
+                return;
+            }
+
+            SendReliableFrame(peerId, data);
+        }
+
+        private void SendReliableFrame(ulong peerId, byte[] data)
+        {
             uint seq = NextSendSequence(peerId);
             byte[] framed = FrameReliable(seq, data);
-            if (_config.MaxPacketSize > 0 && framed.Length + 2 > _config.MaxPacketSize)
-            {
-                Log.Warning(Tag, $"Reliable payload seq={seq} to peer {peerId} is {framed.Length + 2} bytes, " +
-                                 $"above MaxPacketSize={_config.MaxPacketSize}. This may fragment or drop on VPN/TUN links.");
-            }
 
             // Store for retransmit
             if (!_pendingByPeer.TryGetValue(peerId, out var pending))
@@ -103,6 +120,37 @@ namespace TCAMultiplayer.Protocol
 
             Interlocked.Increment(ref _totalReliableSent);
             _transport.Send(peerId, framed, false); // send raw over UDP, we handle reliability
+        }
+
+        private void SendReliableFragmented(ulong peerId, byte[] data, int maxReliablePayloadBytes)
+        {
+            int chunkSize = Math.Max(MinFragmentChunkBytes, maxReliablePayloadBytes - FragmentHeaderSize);
+            int fragmentCount = (data.Length + chunkSize - 1) / chunkSize;
+            if (fragmentCount > MaxFragmentCount)
+            {
+                Log.Warning(Tag, $"Reliable payload to peer {peerId} is too large to fragment: " +
+                                 $"{data.Length} bytes in {fragmentCount} fragments");
+                return;
+            }
+
+            uint transferId = NextTransferId(peerId);
+            Log.Info(Tag, $"Fragmenting reliable payload to peer {peerId}: " +
+                          $"{data.Length} bytes in {fragmentCount} fragments");
+
+            for (int index = 0; index < fragmentCount; index++)
+            {
+                int offset = index * chunkSize;
+                int length = Math.Min(chunkSize, data.Length - offset);
+                var fragment = new byte[FragmentHeaderSize + length];
+                fragment[0] = RELIABLE_FRAGMENT;
+                WriteUInt32LE(fragment, 1, transferId);
+                WriteInt32LE(fragment, 5, index);
+                WriteInt32LE(fragment, 9, fragmentCount);
+                WriteInt32LE(fragment, 13, data.Length);
+                Buffer.BlockCopy(data, offset, fragment, FragmentHeaderSize, length);
+
+                SendReliableFrame(peerId, fragment);
+            }
         }
 
         /// <summary>Send data unreliably to a specific peer (pass-through).</summary>
@@ -266,8 +314,10 @@ namespace TCAMultiplayer.Protocol
         public void RemovePeer(ulong peerId)
         {
             _sendSequences.Remove(peerId);
+            _sendTransferIds.Remove(peerId);
             _pendingByPeer.Remove(peerId);
             _receiveStates.Remove(peerId);
+            _incomingFragments.Remove(peerId);
         }
 
         /// <summary>
@@ -276,8 +326,10 @@ namespace TCAMultiplayer.Protocol
         public void Clear()
         {
             _sendSequences.Clear();
+            _sendTransferIds.Clear();
             _pendingByPeer.Clear();
             _receiveStates.Clear();
+            _incomingFragments.Clear();
         }
 
         /// <summary>Number of reliable packets awaiting ACK for a peer.</summary>
@@ -343,7 +395,63 @@ namespace TCAMultiplayer.Protocol
             byte[] payload = new byte[data.Length - ReliableHeaderSize];
             Array.Copy(data, ReliableHeaderSize, payload, 0, payload.Length);
 
+            if (payload.Length > 0 && payload[0] == RELIABLE_FRAGMENT)
+            {
+                HandleReliableFragment(peerId, payload);
+                return;
+            }
+
             OnDataReady?.Invoke(peerId, payload);
+        }
+
+        private void HandleReliableFragment(ulong peerId, byte[] data)
+        {
+            if (data.Length < FragmentHeaderSize)
+            {
+                Log.Warning(Tag, $"Truncated reliable fragment from peer {peerId}: {data.Length} bytes");
+                return;
+            }
+
+            uint transferId = ReadUInt32LE(data, 1);
+            int chunkIndex = ReadInt32LE(data, 5);
+            int chunkCount = ReadInt32LE(data, 9);
+            int totalBytes = ReadInt32LE(data, 13);
+
+            if (transferId == 0
+                || chunkIndex < 0
+                || chunkCount <= 0
+                || chunkCount > MaxFragmentCount
+                || chunkIndex >= chunkCount
+                || totalBytes <= 0
+                || totalBytes > MaxFragmentedPayloadBytes)
+            {
+                Log.Warning(Tag, $"Rejected malformed reliable fragment from peer {peerId}");
+                return;
+            }
+
+            int chunkBytes = data.Length - FragmentHeaderSize;
+            if (!_incomingFragments.TryGetValue(peerId, out var transfers))
+            {
+                transfers = new Dictionary<uint, FragmentTransfer>();
+                _incomingFragments[peerId] = transfers;
+            }
+
+            if (!transfers.TryGetValue(transferId, out var transfer))
+            {
+                transfer = new FragmentTransfer(transferId, chunkCount, totalBytes);
+                transfers[transferId] = transfer;
+                Log.Info(Tag, $"Receiving fragmented reliable payload from peer {peerId}: " +
+                              $"{totalBytes} bytes in {chunkCount} fragments");
+            }
+
+            if (!transfer.TryAdd(chunkIndex, data, FragmentHeaderSize, chunkBytes))
+                return;
+
+            if (!transfer.IsComplete)
+                return;
+
+            transfers.Remove(transferId);
+            OnDataReady?.Invoke(peerId, transfer.Assemble());
         }
 
         private void HandleAck(ulong peerId, byte[] data)
@@ -385,6 +493,21 @@ namespace TCAMultiplayer.Protocol
             return seq;
         }
 
+        private uint NextTransferId(ulong peerId)
+        {
+            if (!_sendTransferIds.TryGetValue(peerId, out uint id))
+                id = 1;
+
+            _sendTransferIds[peerId] = id == uint.MaxValue ? 1 : id + 1;
+            return id;
+        }
+
+        private int GetMaxReliablePayloadBytes()
+        {
+            int maxPacketSize = _config.MaxPacketSize > 0 ? _config.MaxPacketSize : 1400;
+            return Math.Max(MinFragmentChunkBytes, maxPacketSize - TransportEnvelopeBytes - ReliableHeaderSize);
+        }
+
         private static byte[] FrameReliable(uint seq, byte[] payload)
         {
             byte[] framed = new byte[ReliableHeaderSize + payload.Length];
@@ -402,6 +525,24 @@ namespace TCAMultiplayer.Protocol
             buffer[offset + 3] = (byte)(value >> 24);
         }
 
+        private static uint ReadUInt32LE(byte[] buffer, int offset)
+        {
+            return (uint)(buffer[offset]
+                | (buffer[offset + 1] << 8)
+                | (buffer[offset + 2] << 16)
+                | (buffer[offset + 3] << 24));
+        }
+
+        private static void WriteInt32LE(byte[] buffer, int offset, int value)
+        {
+            WriteUInt32LE(buffer, offset, unchecked((uint)value));
+        }
+
+        private static int ReadInt32LE(byte[] buffer, int offset)
+        {
+            return unchecked((int)ReadUInt32LE(buffer, offset));
+        }
+
         // ═══════════════════════════════════════════════════════════════
         //  Internal types
         // ═══════════════════════════════════════════════════════════════
@@ -414,6 +555,62 @@ namespace TCAMultiplayer.Protocol
             public byte[] RawData;      // Original payload (for diagnostics)
             public float TimeSinceSend;
             public int RetryCount;
+        }
+
+        private sealed class FragmentTransfer
+        {
+            private readonly byte[][] _chunks;
+            private int _receivedCount;
+
+            public FragmentTransfer(uint transferId, int chunkCount, int totalBytes)
+            {
+                TransferId = transferId;
+                ChunkCount = chunkCount;
+                TotalBytes = totalBytes;
+                _chunks = new byte[chunkCount][];
+            }
+
+            public uint TransferId { get; }
+            public int ChunkCount { get; }
+            public int TotalBytes { get; }
+            public bool IsComplete => _receivedCount == ChunkCount;
+
+            public bool TryAdd(int index, byte[] source, int offset, int length)
+            {
+                if (index < 0 || index >= ChunkCount || source == null || length < 0)
+                    return false;
+                if (_chunks[index] != null)
+                    return false;
+
+                var chunk = new byte[length];
+                if (length > 0)
+                    Buffer.BlockCopy(source, offset, chunk, 0, length);
+                _chunks[index] = chunk;
+                _receivedCount++;
+                return true;
+            }
+
+            public byte[] Assemble()
+            {
+                var result = new byte[TotalBytes];
+                int offset = 0;
+                for (int i = 0; i < _chunks.Length; i++)
+                {
+                    var chunk = _chunks[i];
+                    if (chunk == null)
+                        throw new InvalidOperationException("Reliable fragment transfer is incomplete");
+                    if (offset + chunk.Length > result.Length)
+                        throw new InvalidOperationException("Reliable fragment transfer overflow");
+
+                    Buffer.BlockCopy(chunk, 0, result, offset, chunk.Length);
+                    offset += chunk.Length;
+                }
+
+                if (offset != result.Length)
+                    throw new InvalidOperationException("Reliable fragment transfer size mismatch");
+
+                return result;
+            }
         }
 
         public struct ReliabilityStats

@@ -176,6 +176,29 @@ namespace TCAMultiplayer.Protocol
         public bool IsCompatible;
         public string RejectionReason;
         public string HostModVersion;
+        public byte[] HostManifestData;
+    }
+
+    /// <summary>
+    /// Mod sync request — sent by client after user accepts overwriting local mods.
+    /// </summary>
+    public struct ModSyncRequestPacket
+    {
+        public ulong PeerId;
+        public string HostManifestHash;
+    }
+
+    /// <summary>
+    /// Chunk of a host mod sync package. Package data is reassembled by TransferId.
+    /// </summary>
+    public struct ModSyncChunkPacket
+    {
+        public ulong PeerId;
+        public uint TransferId;
+        public int ChunkIndex;
+        public int ChunkCount;
+        public int TotalBytes;
+        public byte[] ChunkData;
     }
 
     // ═══════════════════════════════════════════════════════════════

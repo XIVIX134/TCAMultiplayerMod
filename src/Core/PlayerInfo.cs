@@ -13,6 +13,8 @@ namespace TCAMultiplayer.Core
         public bool IsReady { get; set; }
         public bool IsLoaded { get; set; }
         public bool IsHost { get; set; }
+        public bool IsModsVerified { get; set; }
+        public bool IsModSyncing { get; set; }
         public bool IsAlive { get; set; }
         public bool IsAwaitingRespawn { get; set; }
         public uint LifeId { get; set; }

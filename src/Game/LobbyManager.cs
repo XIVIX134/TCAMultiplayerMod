@@ -207,6 +207,9 @@ namespace TCAMultiplayer.Game
         {
             if (!CanHostChangeLobby(nameof(StartGame))) return;
             foreach (var p in _session.Players.Values)
+                if (!p.IsHost && !p.IsModsVerified)
+                { Log.Warning(Tag, $"Cannot start: {p.PlayerName} is still verifying mods"); return; }
+            foreach (var p in _session.Players.Values)
                 if (!p.IsReady && !p.IsHost)
                 { Log.Warning(Tag, $"Cannot start: {p.PlayerName} not ready"); return; }
             if (_session.GameMode == Core.MultiplayerGameMode.TeamDogfight)
@@ -325,6 +328,33 @@ namespace TCAMultiplayer.Game
                 new LobbyRespawnRequestPacket { PeerId = _session.LocalPeerId }));
         }
 
+        public void AnnounceLocalPlayer()
+        {
+            if (_session.IsHost || !IsCurrentState(GameState.ClientLobby))
+                return;
+
+            var local = _session.GetLocalPlayer();
+            if (local == null)
+                return;
+
+            string playerName = GetConfiguredPlayerName(local.PlayerName);
+            local.PlayerName = playerName;
+            var joinPkt = new LobbyPlayerJoinedPacket
+            {
+                PeerId = local.PeerId,
+                PlayerName = playerName
+            };
+            Send(PacketType.LobbyPlayerJoined, PacketSerializer.SerializeLobbyPlayerJoined(joinPkt));
+            Send(PacketType.AircraftSelect, PacketSerializer.SerializeLobbyAircraftSelect(
+                new LobbyAircraftSelectPacket { PeerId = local.PeerId, AircraftName = local.SelectedAircraft ?? "" }));
+            Send(PacketType.LoadoutSelect, PacketSerializer.SerializeLobbyLoadoutSelect(
+                new LobbyLoadoutSelectPacket { PeerId = local.PeerId, LoadoutName = local.SelectedLoadout ?? "" }));
+            Send(PacketType.LobbyAirfieldSelect, PacketSerializer.SerializeLobbyAirfieldSelect(
+                new LobbyAirfieldSelectPacket { PeerId = local.PeerId, AirfieldName = local.SelectedAirfield ?? "" }));
+
+            Log.Info(Tag, $"Announced verified local player {joinPkt.PlayerName} ({local.PeerId})");
+        }
+
         private void HandleLobbyStateRaw(ulong from, byte[] data)
         {
             if (_disposed || _session.IsHost) return;
@@ -363,7 +393,14 @@ namespace TCAMultiplayer.Game
                 foreach (var wp in pkt.Players)
                 {
                     receivedIds.Add(wp.PeerId);
-                    var pi = _session.AddPlayer(wp.PeerId, wp.PlayerName);
+                    string playerName = wp.PlayerName;
+                    if (wp.PeerId == _session.LocalPeerId)
+                    {
+                        var existingLocal = _session.GetLocalPlayer();
+                        playerName = GetConfiguredPlayerName(existingLocal?.PlayerName ?? wp.PlayerName);
+                    }
+
+                    var pi = _session.AddPlayer(wp.PeerId, playerName);
                     bool preserveLocalSelections = wp.PeerId == _session.LocalPeerId
                         && HasLocalSelectionChanged(
                             pi, wp.SelectedAircraft, wp.SelectedAirfield, wp.SelectedLoadout);
@@ -416,6 +453,7 @@ namespace TCAMultiplayer.Game
         private void HandlePlayerReadyRaw(ulong from, byte[] data)
         {
             if (_disposed) return;
+            if (!IsPeerVerifiedForHost(from, "LobbyPlayerReady")) return;
             if (!CanApplyLobbyMutation(from, "LobbyPlayerReady")) return;
             var (_, p) = PacketSerializer.Deserialize(data); if (p == null) return;
             var pkt = PacketSerializer.DeserializeLobbyPlayerReady(p);
@@ -432,6 +470,7 @@ namespace TCAMultiplayer.Game
         private void HandleTeamSelectRaw(ulong from, byte[] data)
         {
             if (_disposed) return;
+            if (!IsPeerVerifiedForHost(from, "LobbyTeamSelect")) return;
             if (!CanApplyLobbyMutation(from, "LobbyTeamSelect")) return;
             var (_, p) = PacketSerializer.Deserialize(data); if (p == null) return;
             var pkt = PacketSerializer.DeserializeLobbyTeamSelect(p);
@@ -449,6 +488,7 @@ namespace TCAMultiplayer.Game
         private void HandleAirfieldSelectRaw(ulong from, byte[] data)
         {
             if (_disposed) return;
+            if (!IsPeerVerifiedForHost(from, "LobbyAirfieldSelect")) return;
             if (!CanApplyLobbyMutation(from, "LobbyAirfieldSelect")) return;
             var (_, p) = PacketSerializer.Deserialize(data); if (p == null) return;
             var pkt = PacketSerializer.DeserializeLobbyAirfieldSelect(p);
@@ -461,6 +501,7 @@ namespace TCAMultiplayer.Game
         private void HandleAircraftSelectRaw(ulong from, byte[] data)
         {
             if (_disposed) return;
+            if (!IsPeerVerifiedForHost(from, "AircraftSelect")) return;
             if (!CanApplySelectionMutation(from, "AircraftSelect")) return;
             var (_, p) = PacketSerializer.Deserialize(data); if (p == null) return;
             var pkt = PacketSerializer.DeserializeLobbyAircraftSelect(p);
@@ -474,6 +515,7 @@ namespace TCAMultiplayer.Game
         private void HandleLoadoutSelectRaw(ulong from, byte[] data)
         {
             if (_disposed) return;
+            if (!IsPeerVerifiedForHost(from, "LoadoutSelect")) return;
             if (!CanApplySelectionMutation(from, "LoadoutSelect")) return;
             var (_, p) = PacketSerializer.Deserialize(data); if (p == null) return;
             var pkt = PacketSerializer.DeserializeLobbyLoadoutSelect(p);
@@ -592,7 +634,7 @@ namespace TCAMultiplayer.Game
             _session.HostName = pkt.HostName;
 
             // Add self to local roster with real username
-            var username = ModConfig.Username?.Value ?? "Player";
+            var username = GetConfiguredPlayerName(_session.GetLocalPlayer()?.PlayerName);
             _session.AddPlayer(pkt.AssignedPeerId, username);
             InitializeLocalSelectionDefaults();
 
@@ -641,6 +683,16 @@ namespace TCAMultiplayer.Game
             return state == GameState.Spawning
                 || state == GameState.InGame
                 || state == GameState.Respawning;
+        }
+
+        private static string GetConfiguredPlayerName(string fallback = null)
+        {
+            string configuredName = ModConfig.Username?.Value;
+            if (!string.IsNullOrWhiteSpace(configuredName))
+                return configuredName.Trim();
+            if (!string.IsNullOrWhiteSpace(fallback))
+                return fallback.Trim();
+            return "Player";
         }
 
         private bool CanHostChangeLobby(string actionName)
@@ -845,6 +897,21 @@ namespace TCAMultiplayer.Game
                 return true;
 
             Log.Warning(Tag, $"Rejected {packetName} from peer {fromPeerId} for peer {targetPeerId}");
+            return false;
+        }
+
+        private bool IsPeerVerifiedForHost(ulong fromPeerId, string packetName)
+        {
+            if (!_session.IsHost)
+                return true;
+            if (fromPeerId == _session.LocalPeerId)
+                return true;
+
+            var player = _session.GetPlayer(fromPeerId);
+            if (player?.IsModsVerified == true)
+                return true;
+
+            Log.Warning(Tag, $"Rejected {packetName} from unverified peer {fromPeerId}");
             return false;
         }
 

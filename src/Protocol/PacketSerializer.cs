@@ -13,6 +13,7 @@ namespace TCAMultiplayer.Protocol
     {
         private const int MaxPlayerCount = 8;
         private const int MaxManifestBytes = 1024 * 1024; // 1 MB
+        private const int MaxModSyncChunkBytes = 64 * 1024;
         private const string Tag = "[PacketSerializer]";
 
         /// <summary>
@@ -1344,6 +1345,9 @@ namespace TCAMultiplayer.Protocol
                 w.Write(packet.IsCompatible);
                 w.Write(packet.RejectionReason ?? "");
                 w.Write(packet.HostModVersion ?? "");
+                w.Write(packet.HostManifestData?.Length ?? 0);
+                if (packet.HostManifestData != null && packet.HostManifestData.Length > 0)
+                    w.Write(packet.HostManifestData);
                 return ms.ToArray();
             }
         }
@@ -1361,6 +1365,84 @@ namespace TCAMultiplayer.Protocol
                 };
 
                 packet.HostModVersion = ReadOptionalString(r);
+                if (r.BaseStream.Position + sizeof(int) <= r.BaseStream.Length)
+                {
+                    int length = r.ReadInt32();
+                    if (length < 0 || length > MaxManifestBytes)
+                    {
+                        LogWarning($"{Tag} Invalid host manifest length: {length}");
+                        return packet;
+                    }
+
+                    if (length > 0)
+                        packet.HostManifestData = r.ReadBytes(length);
+                }
+                return packet;
+            });
+        }
+
+        public static byte[] SerializeModSyncRequest(ModSyncRequestPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var w = new BinaryWriter(ms))
+            {
+                w.Write(packet.PeerId);
+                w.Write(packet.HostManifestHash ?? "");
+                return ms.ToArray();
+            }
+        }
+
+        public static ModSyncRequestPacket DeserializeModSyncRequest(byte[] data)
+        {
+            // PeerId(8) + string(1+) = 9
+            return SafeRead(data, 9, nameof(ModSyncRequestPacket), r => new ModSyncRequestPacket
+            {
+                PeerId = r.ReadUInt64(),
+                HostManifestHash = r.ReadString()
+            });
+        }
+
+        public static byte[] SerializeModSyncChunk(ModSyncChunkPacket packet)
+        {
+            using (var ms = new MemoryStream())
+            using (var w = new BinaryWriter(ms))
+            {
+                w.Write(packet.PeerId);
+                w.Write(packet.TransferId);
+                w.Write(packet.ChunkIndex);
+                w.Write(packet.ChunkCount);
+                w.Write(packet.TotalBytes);
+                w.Write(packet.ChunkData?.Length ?? 0);
+                if (packet.ChunkData != null && packet.ChunkData.Length > 0)
+                    w.Write(packet.ChunkData);
+                return ms.ToArray();
+            }
+        }
+
+        public static ModSyncChunkPacket DeserializeModSyncChunk(byte[] data)
+        {
+            // PeerId(8) + transfer(4) + index(4) + count(4) + total(4) + len(4) = 28
+            return SafeRead(data, 28, nameof(ModSyncChunkPacket), r =>
+            {
+                var packet = new ModSyncChunkPacket
+                {
+                    PeerId = r.ReadUInt64(),
+                    TransferId = r.ReadUInt32(),
+                    ChunkIndex = r.ReadInt32(),
+                    ChunkCount = r.ReadInt32(),
+                    TotalBytes = r.ReadInt32()
+                };
+
+                int length = r.ReadInt32();
+                if (length < 0 || length > MaxModSyncChunkBytes)
+                {
+                    LogWarning($"{Tag} Invalid mod sync chunk length: {length}");
+                    return packet;
+                }
+
+                if (length > 0)
+                    packet.ChunkData = r.ReadBytes(length);
+
                 return packet;
             });
         }

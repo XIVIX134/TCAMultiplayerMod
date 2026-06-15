@@ -181,6 +181,30 @@ namespace TCAMultiplayer.Core
             Log.Info(Tag, "Disconnected");
         }
 
+        /// <summary>
+        /// Host-side peer kick that keeps the host session alive.
+        /// Clients may call this only for peer 1, which is equivalent to Disconnect().
+        /// </summary>
+        public void DisconnectPeer(ulong peerId)
+        {
+            if (_disposed || peerId == 0)
+                return;
+
+            if (!_transport.IsHost)
+            {
+                if (peerId == 1)
+                    Disconnect();
+                return;
+            }
+
+            if (_session != null)
+                _session.RemovePlayer(peerId);
+            _reliability.RemovePeer(peerId);
+            _transport.DisconnectPeer(peerId);
+            SetStatusMessage($"Peer {peerId} disconnected");
+            OnPeerLeft?.Invoke(peerId);
+        }
+
         // ── Update loop ─────────────────────────────────────────────────
 
         /// <summary>

@@ -156,7 +156,7 @@ namespace TCAMultiplayer.Combat
                 return;
             }
 
-            if (string.IsNullOrEmpty(packet.BombType) || !GameDataStores.HasStore(packet.BombType))
+            if (string.IsNullOrEmpty(packet.BombType))
             {
                 Log.Warning(Tag, $"Unknown bomb type '{packet.BombType}'");
                 return;

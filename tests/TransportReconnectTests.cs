@@ -543,6 +543,40 @@ namespace TCAMultiplayer.Tests
         }
 
         [Test]
+        public void LocalBindAddress_StaleVpnBind_IsIgnoredForLoopbackTarget()
+        {
+            int port = _nextPort++;
+            var host = new DirectUdpTransport(MakeConfig());
+            var client = new DirectUdpTransport(new TransportConfig
+            {
+                LocalBindAddress = "26.166.25.187",
+                KeepaliveInterval = 0.05f,
+                TimeoutSeconds = 0.4f,
+                ReconnectGraceSeconds = 1.6f,
+                EndpointRefreshInterval = 0f,
+            });
+
+            try
+            {
+                host.StartHost(port);
+                client.Connect("127.0.0.1", port);
+                Assert.IsTrue(PumpUntil(() => client.IsConnected, host, client, 5.0),
+                    "stale VPN bind should not block loopback connections");
+
+                var quality = client.GetNetworkQuality();
+                Assert.IsTrue(quality.LocalEndpoint.StartsWith("127.0.0.1:", StringComparison.Ordinal),
+                    "client did not fall back to loopback after ignoring stale VPN bind");
+                Assert.IsTrue(quality.RouteDescription.Contains("ignored LocalBindAddress 26.166.25.187"),
+                    "route diagnostics did not explain the ignored stale bind");
+            }
+            finally
+            {
+                client.Dispose();
+                host.Dispose();
+            }
+        }
+
+        [Test]
         public void AutoRoute_LoopbackConnect_UsesLoopbackAndReportsQuality()
         {
             int port = _nextPort++;

@@ -1525,12 +1525,14 @@ namespace TCAMultiplayer.Tests
         [Test]
         public void ModCompatibilityResult_Roundtrip()
         {
+            var hostManifest = new byte[] { 0x10, 0x20, 0x30 };
             var original = new ModCompatibilityResultPacket
             {
                 PeerId = 42,
                 IsCompatible = false,
                 RejectionReason = "Missing mod: CoolPlanes v2.0",
-                HostModVersion = "0.2.1"
+                HostModVersion = "0.2.1",
+                HostManifestData = hostManifest
             };
 
             byte[] data = PacketSerializer.SerializeModCompatibilityResult(original);
@@ -1540,6 +1542,48 @@ namespace TCAMultiplayer.Tests
             Assert.AreEqual(original.IsCompatible, result.IsCompatible);
             Assert.AreEqual(original.RejectionReason, result.RejectionReason);
             Assert.AreEqual(original.HostModVersion, result.HostModVersion);
+            CollectionAssert.AreEqual(hostManifest, result.HostManifestData);
+        }
+
+        [Test]
+        public void ModSyncRequest_Roundtrip()
+        {
+            var original = new ModSyncRequestPacket
+            {
+                PeerId = 7,
+                HostManifestHash = "abcdef0123456789"
+            };
+
+            byte[] data = PacketSerializer.SerializeModSyncRequest(original);
+            var result = PacketSerializer.DeserializeModSyncRequest(data);
+
+            Assert.AreEqual(original.PeerId, result.PeerId);
+            Assert.AreEqual(original.HostManifestHash, result.HostManifestHash);
+        }
+
+        [Test]
+        public void ModSyncChunk_Roundtrip()
+        {
+            var chunk = new byte[] { 1, 2, 3, 4, 5 };
+            var original = new ModSyncChunkPacket
+            {
+                PeerId = 9,
+                TransferId = 123,
+                ChunkIndex = 2,
+                ChunkCount = 4,
+                TotalBytes = 42,
+                ChunkData = chunk
+            };
+
+            byte[] data = PacketSerializer.SerializeModSyncChunk(original);
+            var result = PacketSerializer.DeserializeModSyncChunk(data);
+
+            Assert.AreEqual(original.PeerId, result.PeerId);
+            Assert.AreEqual(original.TransferId, result.TransferId);
+            Assert.AreEqual(original.ChunkIndex, result.ChunkIndex);
+            Assert.AreEqual(original.ChunkCount, result.ChunkCount);
+            Assert.AreEqual(original.TotalBytes, result.TotalBytes);
+            CollectionAssert.AreEqual(chunk, result.ChunkData);
         }
 
         [Test]

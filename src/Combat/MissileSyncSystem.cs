@@ -268,7 +268,7 @@ namespace TCAMultiplayer.Combat
                 Log.Warning(Tag, $"Duplicate missile key={key}");
                 return;
             }
-            if (string.IsNullOrEmpty(packet.MissileType) || !GameDataStores.HasStore(packet.MissileType))
+            if (string.IsNullOrEmpty(packet.MissileType))
             {
                 Log.Warning(Tag, $"Unknown missile type '{packet.MissileType}'");
                 return;
