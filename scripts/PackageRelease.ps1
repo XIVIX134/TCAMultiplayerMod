@@ -46,11 +46,13 @@ if (!(Test-Path -LiteralPath $dllPath)) {
 $packageName = "TCAMP-$($versionInfo.Tag)-plugin"
 $packageDir = Join-Path $outputRootFull $packageName
 $zipPath = Join-Path $outputRootFull "$packageName.zip"
-$shaPath = "$zipPath.sha256"
+$oldZipShaPath = "$zipPath.sha256"
+$dllShaPath = Join-Path $outputRootFull "$packageName.dll.sha256"
 
 Remove-Item -LiteralPath $packageDir -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $shaPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $oldZipShaPath -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $dllShaPath -Force -ErrorAction SilentlyContinue
 
 $pluginsDir = Join-Path $packageDir "BepInEx\plugins"
 New-Item -ItemType Directory -Path $pluginsDir -Force | Out-Null
@@ -72,13 +74,13 @@ Set-Content -LiteralPath (Join-Path $packageDir "README.txt") -Value $readme -En
 $items = Get-ChildItem -LiteralPath $packageDir
 Compress-Archive -Path $items.FullName -DestinationPath $zipPath -Force
 
-$hash = Get-FileHash -LiteralPath $zipPath -Algorithm SHA256
-$hashLine = "$($hash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $zipPath)"
-Set-Content -LiteralPath $shaPath -Value $hashLine -Encoding ASCII
+$dllHash = Get-FileHash -LiteralPath $dllPath -Algorithm SHA256
+$dllHashLine = "$($dllHash.Hash.ToLowerInvariant())  $assemblyName.dll"
+Set-Content -LiteralPath $dllShaPath -Value $dllHashLine -Encoding ASCII
 
 Write-Host "Created package: $zipPath"
-Write-Host "Created checksum: $shaPath"
-Write-Host "SHA256: $($hash.Hash)"
+Write-Host "Created DLL checksum: $dllShaPath"
+Write-Host "DLL SHA256: $($dllHash.Hash)"
 
 $metadata = [pscustomobject]@{
     Tag = $versionInfo.Tag
@@ -86,8 +88,10 @@ $metadata = [pscustomobject]@{
     AssemblyVersion = $versionInfo.AssemblyVersion
     DllPath = $dllPath
     ZipPath = $zipPath
-    Sha256Path = $shaPath
-    Sha256 = $hash.Hash
+    DllSha256Path = $dllShaPath
+    DllSha256 = $dllHash.Hash
+    Sha256Path = $dllShaPath
+    Sha256 = $dllHash.Hash
 }
 
 if (![string]::IsNullOrWhiteSpace($MetadataPath)) {

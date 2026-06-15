@@ -303,6 +303,7 @@ namespace TCAMultiplayer.Compatibility
                 int filesWritten = 0;
                 int filesDeleted = 0;
                 long expandedBytes = 0;
+                string backupPath;
 
                 using (var ms = new MemoryStream(packageData))
                 using (var reader = new BinaryReader(ms, Encoding.UTF8))
@@ -331,6 +332,7 @@ namespace TCAMultiplayer.Compatibility
                     if (fileCount < 0 || fileCount > MaxSyncPackageFiles)
                         return SyncApplyResult.Failed("Invalid mod sync file count");
 
+                    var writes = new List<SyncPackageFile>(fileCount);
                     for (int i = 0; i < fileCount; i++)
                     {
                         string relative = NormalizeManifestPath(reader.ReadString());
@@ -346,22 +348,38 @@ namespace TCAMultiplayer.Compatibility
                         if (bytes.Length != length)
                             return SyncApplyResult.Failed("Truncated mod sync package");
 
-                        string target = ResolveSafePath(rootFull, relative);
-                        Directory.CreateDirectory(Path.GetDirectoryName(target));
-                        File.WriteAllBytes(target, bytes);
-                        filesWritten++;
+                        ResolveSafePath(rootFull, relative);
+                        writes.Add(new SyncPackageFile { RelativePath = relative, Bytes = bytes });
                     }
 
                     int deleteCount = reader.ReadInt32();
                     if (deleteCount < 0 || deleteCount > MaxSyncPackageFiles)
                         return SyncApplyResult.Failed("Invalid mod sync delete count");
 
+                    var deletions = new List<string>(deleteCount);
                     for (int i = 0; i < deleteCount; i++)
                     {
                         string relative = NormalizeManifestPath(reader.ReadString());
                         if (!IsAllowedSyncPath(relative, 0))
                             continue;
 
+                        ResolveSafePath(rootFull, relative);
+                        deletions.Add(relative);
+                    }
+
+                    backupPath = BackupModsFolder(rootFull);
+                    Log.Info(Tag, $"Backed up Mods folder before sync: {backupPath}");
+
+                    foreach (var file in writes)
+                    {
+                        string target = ResolveSafePath(rootFull, file.RelativePath);
+                        Directory.CreateDirectory(Path.GetDirectoryName(target));
+                        File.WriteAllBytes(target, file.Bytes);
+                        filesWritten++;
+                    }
+
+                    foreach (var relative in deletions)
+                    {
                         string target = ResolveSafePath(rootFull, relative);
                         if (File.Exists(target))
                         {
@@ -382,7 +400,8 @@ namespace TCAMultiplayer.Compatibility
                     Success = true,
                     FilesWritten = filesWritten,
                     FilesDeleted = filesDeleted,
-                    Message = $"Synced {filesWritten} file(s), removed {filesDeleted} extra file(s)"
+                    BackupPath = backupPath,
+                    Message = $"Synced {filesWritten} file(s), removed {filesDeleted} extra file(s). Backup: {backupPath}"
                 };
             }
             catch (Exception ex)
@@ -446,6 +465,57 @@ namespace TCAMultiplayer.Compatibility
             if (!target.StartsWith(rootWithSlash, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidDataException($"Mod path escapes Mods folder: {relativePath}");
             return target;
+        }
+
+        private static string BackupModsFolder(string rootFull)
+        {
+            string backupRoot = Path.Combine(GetGameRootFromModsRoot(rootFull), "TCAMP_ModBackups");
+            Directory.CreateDirectory(backupRoot);
+
+            string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+            string target = Path.Combine(backupRoot, "Mods_" + stamp);
+            int suffix = 1;
+            while (Directory.Exists(target))
+            {
+                target = Path.Combine(backupRoot, "Mods_" + stamp + "_" + suffix.ToString("00"));
+                suffix++;
+            }
+
+            Directory.CreateDirectory(target);
+            CopyDirectory(rootFull, target);
+            return target;
+        }
+
+        private static string GetGameRootFromModsRoot(string rootFull)
+        {
+            string trimmed = rootFull.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string parent = Path.GetDirectoryName(trimmed);
+            return string.IsNullOrWhiteSpace(parent) ? rootFull : parent;
+        }
+
+        private static void CopyDirectory(string source, string destination)
+        {
+            foreach (var directory in Directory.GetDirectories(source, "*", SearchOption.AllDirectories))
+            {
+                string relative = GetSafeRelativePath(source, directory);
+                Directory.CreateDirectory(Path.Combine(destination, relative.Replace('/', Path.DirectorySeparatorChar)));
+            }
+
+            foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+            {
+                string relative = GetSafeRelativePath(source, file);
+                string target = Path.Combine(destination, relative.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(Path.GetDirectoryName(target));
+                File.Copy(file, target, overwrite: false);
+
+                var sourceInfo = new FileInfo(file);
+                var targetInfo = new FileInfo(target);
+                targetInfo.Attributes = FileAttributes.Normal;
+                targetInfo.CreationTimeUtc = sourceInfo.CreationTimeUtc;
+                targetInfo.LastWriteTimeUtc = sourceInfo.LastWriteTimeUtc;
+                targetInfo.LastAccessTimeUtc = sourceInfo.LastAccessTimeUtc;
+                targetInfo.Attributes = sourceInfo.Attributes;
+            }
         }
 
         private static string AppendDirectorySeparator(string path)
@@ -519,12 +589,19 @@ namespace TCAMultiplayer.Compatibility
             public bool Success;
             public int FilesWritten;
             public int FilesDeleted;
+            public string BackupPath;
             public string Message;
 
             public static SyncApplyResult Failed(string message)
             {
                 return new SyncApplyResult { Success = false, Message = message ?? "Sync failed" };
             }
+        }
+
+        private sealed class SyncPackageFile
+        {
+            public string RelativePath;
+            public byte[] Bytes;
         }
     }
 }

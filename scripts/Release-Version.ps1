@@ -77,6 +77,7 @@ try {
     }
 
     $projectPath = Resolve-TcampRepositoryPath -Path "src\TCAMP.csproj" -Root $root
+    $pluginMetadataPath = Resolve-TcampRepositoryPath -Path "src\Core\PluginMetadata.cs" -Root $root
     $readmePath = Resolve-TcampRepositoryPath -Path "README.md" -Root $root
     $changelogPath = Resolve-TcampRepositoryPath -Path "CHANGELOG.md" -Root $root
 
@@ -103,6 +104,10 @@ try {
     $projectText = $projectText -replace '<InformationalVersion>[^<]+</InformationalVersion>', "<InformationalVersion>$packageVersion</InformationalVersion>"
     Write-TcampUtf8NoBom -Path $projectPath -Content $projectText
 
+    $pluginMetadataText = [System.IO.File]::ReadAllText($pluginMetadataPath)
+    $pluginMetadataText = $pluginMetadataText -replace 'public const string Version = "[^"]+";', "public const string Version = `"$packageVersion`";"
+    Write-TcampUtf8NoBom -Path $pluginMetadataPath -Content $pluginMetadataText
+
     $readmeText = [System.IO.File]::ReadAllText($readmePath)
     $readmeText = [regex]::Replace(
         $readmeText,
@@ -122,7 +127,7 @@ try {
         1)
     Write-TcampUtf8NoBom -Path $changelogPath -Content $changelogText
 
-    Invoke-TcampCheckedCommand -FilePath "git" -Arguments @("add", "CHANGELOG.md", "README.md", "src/TCAMP.csproj")
+    Invoke-TcampCheckedCommand -FilePath "git" -Arguments @("add", "CHANGELOG.md", "README.md", "src/TCAMP.csproj", "src/Core/PluginMetadata.cs")
     if (!$StagedOnly) {
         Invoke-TcampCheckedCommand -FilePath "git" -Arguments @("add", "-A")
     }
@@ -177,7 +182,7 @@ try {
 
     if ($releaseExists) {
         Invoke-TcampCheckedCommand -FilePath "gh" -Arguments @(
-            "release", "upload", $tag, $package.ZipPath, $package.Sha256Path, "--clobber")
+            "release", "upload", $tag, $package.ZipPath, $package.DllSha256Path, "--clobber")
         Invoke-TcampCheckedCommand -FilePath "gh" -Arguments @(
             "release", "edit", $tag, "--notes", $releaseNotes)
     }
@@ -185,7 +190,7 @@ try {
         $releaseArgs = @(
             "release", "create", $tag,
             $package.ZipPath,
-            $package.Sha256Path,
+            $package.DllSha256Path,
             "--title", $tag,
             "--notes", $releaseNotes,
             "--verify-tag")
