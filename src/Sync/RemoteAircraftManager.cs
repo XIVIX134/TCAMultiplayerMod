@@ -128,6 +128,7 @@ namespace TCAMultiplayer.Sync
             // Spawn aircraft on first valid packet if not yet spawned
             if (!peer.IsSpawned)
             {
+                Log.Info(Tag, $"First state packet from peer {peer.PeerId} — spawning remote aircraft ({peer.AircraftType})");
                 SpawnRemote(peer, packet);
             }
         }
@@ -137,10 +138,12 @@ namespace TCAMultiplayer.Sync
         /// </summary>
         private void SpawnRemote(RemotePeerState peer, AircraftStatePacket packet)
         {
+            Log.Info(Tag, $"SpawnRemote called for peer {peer.PeerId}, type={peer.AircraftType}, pos=({packet.PosX},{packet.PosY},{packet.PosZ})");
             try
             {
                 var localPos = _originService.AbsoluteToLocal(packet.PosX, packet.PosY, packet.PosZ);
                 var rot = new Quaternion(packet.RotX, packet.RotY, packet.RotZ, packet.RotW);
+                Log.Debug(Tag, $"  localPos={localPos}, rot={rot}");
 
                 peer.Aircraft = _spawner.SpawnRemoteAircraft(
                     peer.PeerId, peer.AircraftType, localPos, rot);

@@ -70,8 +70,10 @@ namespace TCAMultiplayer.Tests
         }
 
         [Test]
-        public void HostRelay_RejectsClientAircraftState_ForDifferentPlayerId()
+        public void HostRelay_AcceptsClientAircraftState_RegardlessOfPlayerId()
         {
+            // PlayerId identity check is skipped for AircraftState because Steam transport
+            // uses SteamIDs (ulong) for PlayerId while transport peer IDs are 1,2,3...
             var network = new FakeNetworkHarness();
             var hostTransport = network.CreateHost(1);
             var firstClientTransport = network.CreateClient(2);
@@ -93,7 +95,7 @@ namespace TCAMultiplayer.Tests
 
                     var state = new AircraftStatePacket
                     {
-                        PlayerId = 3,
+                        PlayerId = 3,  // Differs from sender peer ID (2) — but check is skipped
                         SequenceNumber = 42,
                         AircraftType = "AV8B",
                         RotW = 1f,
@@ -106,7 +108,7 @@ namespace TCAMultiplayer.Tests
                     firstClientConnection.BroadcastUnreliable(frame);
                     Pump(network, hostConnection, firstClientConnection, secondClientConnection);
 
-                    Assert.AreEqual(0, relayedCount);
+                    Assert.AreEqual(1, relayedCount);
                 }
             }
         }

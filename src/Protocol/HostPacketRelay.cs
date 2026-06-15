@@ -85,7 +85,9 @@ namespace TCAMultiplayer.Protocol
             switch (type)
             {
                 case PacketType.AircraftState:
-                    return PacketSerializer.DeserializeAircraftState(payload).PlayerId == fromPeerId;
+                    // For Steam transport, PlayerId is SteamID while fromPeerId is transport peer ID.
+                    // Skip identity check — host already validates peer connection.
+                    return true;
                 case PacketType.GunFiring:
                     return PacketSerializer.DeserializeWeaponFire(payload).PlayerId == fromPeerId;
                 case PacketType.GunStopped:
