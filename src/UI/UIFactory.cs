@@ -247,6 +247,35 @@ namespace TCAMultiplayer.UI
             tmp.text = text ?? string.Empty;
         }
 
+        private static void StyleDestructiveButton(Button button)
+        {
+            if (button == null) return;
+
+            var normal = new Color(0.42f, 0f, 0f, 0.95f);
+            var hover = new Color(0.72f, 0.04f, 0.04f, 1f);
+            var pressed = new Color(0.28f, 0f, 0f, 1f);
+            var text = new Color(1f, 0.22f, 0.22f, 1f);
+
+            var colors = button.colors;
+            colors.normalColor = normal;
+            colors.highlightedColor = hover;
+            colors.selectedColor = hover;
+            colors.pressedColor = pressed;
+            colors.colorMultiplier = 1f;
+            colors.fadeDuration = 0.08f;
+            button.colors = colors;
+
+            var image = button.GetComponent<Image>();
+            if (image != null)
+                image.color = normal;
+
+            foreach (var tmp in button.GetComponentsInChildren<TextMeshProUGUI>(true))
+            {
+                tmp.color = text;
+                tmp.fontStyle |= FontStyles.Bold;
+            }
+        }
+
         public static TextMeshProUGUI CreateNativeText(
             string text,
             Transform parent,
@@ -663,6 +692,110 @@ namespace TCAMultiplayer.UI
         {
             ShowNativeLoadoutSelectorAsync(
                 aircraft, selectableAircraft, loadout, ammoBelt, onSelected).Forget();
+        }
+
+        public static void ShowConfirmDialog(
+            string title,
+            string message,
+            string confirmLabel,
+            string cancelLabel,
+            Action onConfirmed,
+            Action onCancelled = null,
+            bool destructive = false)
+        {
+            EnsureEventSystem();
+            NativeDialogActiveChanged?.Invoke(true);
+
+            GameObject canvasGo = null;
+            try
+            {
+                canvasGo = new GameObject(
+                    "TCAMP_ConfirmDialog",
+                    typeof(RectTransform),
+                    typeof(Canvas),
+                    typeof(CanvasScaler),
+                    typeof(GraphicRaycaster));
+                var canvasRect = canvasGo.GetComponent<RectTransform>();
+                Stretch(canvasRect);
+
+                var canvas = canvasGo.GetComponent<Canvas>();
+                canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+                canvas.overrideSorting = true;
+                canvas.sortingOrder = 1200;
+
+                var scaler = canvasGo.GetComponent<CanvasScaler>();
+                scaler.uiScaleMode = CanvasScaler.ScaleMode.ScaleWithScreenSize;
+                scaler.referenceResolution = new Vector2(1920f, 1080f);
+                scaler.screenMatchMode = CanvasScaler.ScreenMatchMode.MatchWidthOrHeight;
+                scaler.matchWidthOrHeight = 0.5f;
+
+                var blocker = new GameObject("Blocker", typeof(RectTransform), typeof(Image));
+                blocker.transform.SetParent(canvasGo.transform, false);
+                Stretch(blocker.GetComponent<RectTransform>());
+                var blockerImage = blocker.GetComponent<Image>();
+                blockerImage.color = new Color(0f, 0f, 0f, 0.72f);
+                blockerImage.raycastTarget = true;
+
+                var panel = CreateNativePanel(blocker.transform, 24, 12);
+                panel.name = "ConfirmPanel";
+                var panelRect = panel.GetComponent<RectTransform>();
+                panelRect.anchorMin = new Vector2(0.5f, 0.5f);
+                panelRect.anchorMax = new Vector2(0.5f, 0.5f);
+                panelRect.pivot = new Vector2(0.5f, 0.5f);
+                panelRect.anchoredPosition = Vector2.zero;
+                panelRect.sizeDelta = new Vector2(640f, 320f);
+
+                string warningColor = destructive ? "#FF3838" : "#007A28";
+                string titleText = destructive
+                    ? $"<color={warningColor}>{title ?? "CONFIRM"}</color>"
+                    : title ?? "CONFIRM";
+                CreateNativeText(titleText, panel.transform, 24, TextAlignmentOptions.Center);
+                CreateDivider(panel.transform, 0.18f);
+
+                var body = CreateNativeText(
+                    $"<color={warningColor}>{message ?? string.Empty}</color>",
+                    panel.transform, 17, TextAlignmentOptions.Center);
+                var bodyLayout = body.GetComponent<LayoutElement>();
+                bodyLayout.minHeight = 126f;
+                bodyLayout.preferredHeight = 126f;
+
+                CreateSpacer(panel.transform, 4, 1f);
+
+                var actions = CreateHorizontalRow(panel.transform, 52, 12);
+                actions.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = true;
+
+                var confirm = CreateNativeButton(confirmLabel ?? "CONFIRM", actions.transform, 52);
+                SetFlexible(confirm.gameObject);
+                if (destructive)
+                    StyleDestructiveButton(confirm);
+                var cancel = CreateNativeButton(cancelLabel ?? "CANCEL", actions.transform, 52);
+                SetFlexible(cancel.gameObject);
+
+                bool closed = false;
+                void Close(bool confirmed)
+                {
+                    if (closed) return;
+                    closed = true;
+                    if (canvasGo != null)
+                        UnityEngine.Object.Destroy(canvasGo);
+                    NativeDialogActiveChanged?.Invoke(false);
+
+                    if (confirmed)
+                        onConfirmed?.Invoke();
+                    else
+                        onCancelled?.Invoke();
+                }
+
+                confirm.onClick.AddListener(() => Close(true));
+                cancel.onClick.AddListener(() => Close(false));
+            }
+            catch (Exception ex)
+            {
+                if (canvasGo != null)
+                    UnityEngine.Object.Destroy(canvasGo);
+                NativeDialogActiveChanged?.Invoke(false);
+                Log.Error(Tag, $"Confirm dialog error: {ex}");
+            }
         }
 
         private static async UniTask ShowNativeMapSelectorAsync(string currentMap, Action<string> onSelected)

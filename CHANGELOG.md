@@ -11,6 +11,7 @@ All notable changes to TCAMP are tracked here.
 - Added host/client TCAMP version checks so mismatched builds are rejected with a clear status message.
 - Added Mods folder compatibility checks before clients can ready up or mutate lobby selections.
 - Added one-click client mod sync from the host for safe mod data files, including chunked transfer progress and game-data reload after sync.
+- Added a red confirmation warning before mod sync overwrites changed mod files or removes extra sync-safe files.
 - Added lobby UI states for mod verification, sync progress, sync cancellation, and blocked/unsyncable mod mismatches.
 - Improved direct UDP connection diagnostics with user-facing route/status messages, RTT/traffic snapshots, and version-rejection reporting.
 - Improved direct UDP reliability on VPN/TUN and unstable links with automatic local route selection, endpoint refresh handshakes, reconnect grace handling, and low-bandwidth transport presets.

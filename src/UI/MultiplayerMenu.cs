@@ -21,6 +21,9 @@ namespace TCAMultiplayer.UI
         private const string Tag = "MP-MENU";
         private const string Green = "#00FF40";
         private const string DimGreen = "#007A28";
+        private const string ModSyncWarning =
+            "Syncing from the host will overwrite changed mod files and remove extra sync-safe files in your Mods folder.\n\n" +
+            "Executable and plugin files are blocked from sync and will not be copied.";
         private static readonly Color ModSyncPrimaryFill = new Color(0f, 0.34f, 0.10f, 0.95f);
         private static readonly Color ModSyncPrimaryHover = new Color(0f, 0.58f, 0.17f, 1f);
         private static readonly Color ModSyncPrimaryPressed = new Color(0f, 0.24f, 0.08f, 1f);
@@ -922,16 +925,7 @@ namespace TCAMultiplayer.UI
                 UIFactory.SetFlexible(sync.gameObject);
                 sync.interactable = canSync;
                 StyleModSyncPrimaryAction(sync, canSync);
-                sync.onClick.AddListener(() =>
-                {
-                    _modSyncInProgress = true;
-                    _modSyncReceived = 0;
-                    _modSyncTotal = 0;
-                    _statusMessage = "Requesting mod sync from host...";
-                    _modMismatch = null;
-                    _modManifest?.RequestSyncFromHost();
-                    RefreshUI();
-                });
+                sync.onClick.AddListener(ShowModSyncWarning);
             }
 
             var cancelButton = Track(UIFactory.CreateNativeButton("CANCEL JOIN", actions.transform, 52));
@@ -1091,6 +1085,34 @@ namespace TCAMultiplayer.UI
             _modSyncReceived = 0;
             _modSyncTotal = 0;
             _lastModSyncUiRefreshTime = 0f;
+        }
+
+        private void ShowModSyncWarning()
+        {
+            if (_modSyncInProgress || _modMismatch?.CanSync != true)
+                return;
+
+            UIFactory.ShowConfirmDialog(
+                "SYNC MODS FROM HOST?",
+                ModSyncWarning,
+                "SYNC ANYWAY",
+                "CANCEL",
+                StartModSyncFromHost,
+                destructive: true);
+        }
+
+        private void StartModSyncFromHost()
+        {
+            if (_modSyncInProgress || _modManifest == null)
+                return;
+
+            _modSyncInProgress = true;
+            _modSyncReceived = 0;
+            _modSyncTotal = 0;
+            _statusMessage = "Requesting mod sync from host...";
+            _modMismatch = null;
+            _modManifest.RequestSyncFromHost();
+            RefreshUI();
         }
 
         private static string BuildModMismatchSummary(ModManifestCollector.ModMismatchInfo info)
