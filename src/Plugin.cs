@@ -36,7 +36,7 @@ namespace TCAMultiplayer
         {
             Log.Init(Logger);
             ModConfig.Bind(Config);
-            Log.Info(Tag, "TCAMP v0.2.2 initializing...");
+            Log.Info(Tag, $"TCAMP v{PluginMetadata.Version} initializing...");
 
             _harmony = new Harmony("com.tcamp.mod");
             _harmony.PatchAll(typeof(Plugin).Assembly);

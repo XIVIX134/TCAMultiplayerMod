@@ -12,7 +12,7 @@ Combat Arena, Unity, BepInEx, Harmony, or other third-party/game assemblies.
 ## Current Status
 
 This is a work-in-progress mod. It is playable enough for local host/client
-testing. The current public source release is `v0.2.2`.
+testing. The current public source release is `v0.2.3`.
 
 ## Requirements
 
@@ -87,11 +87,12 @@ GitHub CLI authenticated:
 .\scripts\Release-Version.ps1 -Version v0.3 -Message "Release v0.3"
 ```
 
-The release helper bumps `src\TCAMP.csproj` and this README, stages all
-non-ignored changes, promotes the `CHANGELOG.md` `Unreleased` section into the
-new version, builds `TCAMP.dll`, creates `release\TCAMP-v0.3-plugin.zip`,
-commits, tags, pushes `main` and the tag, and creates the GitHub release with
-the changelog notes, zip, and SHA256 checksum attached.
+The release helper bumps `src\TCAMP.csproj`, `src\Core\PluginMetadata.cs`, and
+this README, stages all non-ignored changes, promotes the `CHANGELOG.md`
+`Unreleased` section into the new version, builds `TCAMP.dll`, creates
+`release\TCAMP-v0.3-plugin.zip`, commits, tags, pushes `main` and the tag, and
+creates the GitHub release with the changelog notes, zip, and TCAMP.dll SHA256
+checksum attached.
 
 Before running it, replace the placeholder under `CHANGELOG.md` `Unreleased`
 with the release notes for the next version.
