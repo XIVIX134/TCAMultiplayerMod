@@ -8,10 +8,10 @@ All notable changes to TCAMP are tracked here.
 
 ## v0.2.3 - 2026-06-15
 
-- Added an optional in-game updater that checks the latest GitHub release on launch, compares the installed TCAMP.dll SHA256 against the release DLL hash, and prompts before downloading an update.
+- Added an optional in-game updater that checks the latest GitHub release on launch.
 - Added update staging with DLL verification, backup/pending files, and a restart prompt that applies the new plugin and relaunches the game.
 - Changed release packaging to publish a `TCAMP.dll` SHA256 asset instead of a zip checksum, matching the updater's DLL-based hash check.
-- Added a Mods folder backup before client mod sync and expanded the red sync warning popup to explain the backup, overwrite, and deletion behavior.
+- Added a Mods folder backup before client mod sync.
 - Added the loaded TCAMP version beside the game's native bottom-left version label on the main menu.
 - Improved confirmation popup sizing and text autosizing so longer warnings are not cut off.
 - Added updater tests for release version comparison, GitHub asset selection, SHA256 parsing, and plugin DLL extraction from release zips.
