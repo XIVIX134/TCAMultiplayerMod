@@ -1,7 +1,4 @@
-Fork of XIVIX134/TCAMultiplayerMod.
-Original description:
-
-# TCAMP
+ TCAMP
 
 TCAMP (Tiny Combat Arena Multiplayer) is a BepInEx/Harmony mod for Tiny Combat
 Arena that adds local direct-UDP multiplayer sessions. The current focus is
@@ -15,7 +12,7 @@ Combat Arena, Unity, BepInEx, Harmony, or other third-party/game assemblies.
 ## Current Status
 
 This is a work-in-progress mod. It is playable enough for local host/client
-testing. The current public source release is `v0.2.3`.
+testing. The current public source release is `v0.3.0`.
 
 ## Requirements
 
