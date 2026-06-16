@@ -753,9 +753,11 @@ namespace TCAMultiplayer.UI
             string curAircraft = session?.GetLocalPlayer()?.SelectedAircraft
                 ?? ModConfig.LastAircraft?.Value ?? "AV8B";
             var aircraftNames = LoadoutHelper.GetAircraftNames();
+            curAircraft = LoadoutHelper.ResolveAvailableAircraft(curAircraft);
 
             string curLoadout = session?.GetLocalPlayer()?.SelectedLoadout
                 ?? ModConfig.LastLoadout?.Value ?? "Clean";
+            curLoadout = LoadoutHelper.ResolveLoadoutForAircraft(curAircraft, curLoadout);
             if (aircraftNames.Count > 0)
             {
                 var loadoutButton = Track(UIFactory.CreateLabeledButton(
@@ -1352,9 +1354,21 @@ namespace TCAMultiplayer.UI
 
             if (string.IsNullOrEmpty(local.SelectedAircraft) && !string.IsNullOrEmpty(ModConfig.LastAircraft?.Value))
                 _lobby?.SetAircraft(ModConfig.LastAircraft.Value);
+            else if (!string.IsNullOrEmpty(local.SelectedAircraft)
+                && !LoadoutHelper.IsAircraftAvailable(local.SelectedAircraft))
+                _lobby?.SetAircraft(local.SelectedAircraft);
 
             if (string.IsNullOrEmpty(local.SelectedLoadout) && !string.IsNullOrEmpty(ModConfig.LastLoadout?.Value))
                 _lobby?.SetLoadout(ModConfig.LastLoadout.Value);
+            else if (!string.IsNullOrEmpty(local.SelectedAircraft)
+                && !string.IsNullOrEmpty(local.SelectedLoadout))
+            {
+                string resolvedLoadout = LoadoutHelper.ResolveLoadoutForAircraft(
+                    local.SelectedAircraft,
+                    local.SelectedLoadout);
+                if (!string.Equals(local.SelectedLoadout, resolvedLoadout, StringComparison.Ordinal))
+                    _lobby?.SetLoadout(resolvedLoadout);
+            }
 
             string currentMap = session?.MapName ?? MapHelper.GetDefaultMapName();
             if (string.IsNullOrEmpty(local.SelectedAirfield)

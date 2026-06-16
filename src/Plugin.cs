@@ -586,7 +586,11 @@ namespace TCAMultiplayer
                 string aircraft = ModConfig.LastAircraft?.Value;
                 if (string.IsNullOrWhiteSpace(aircraft))
                     aircraft = "AV8B";
-                _lobby.SetAircraft(aircraft);
+                _lobby.SetAircraft(LoadoutHelper.ResolveAvailableAircraft(aircraft));
+            }
+            else if (!LoadoutHelper.IsAircraftAvailable(local.SelectedAircraft))
+            {
+                _lobby.SetAircraft(local.SelectedAircraft);
             }
 
             if (string.IsNullOrWhiteSpace(local.SelectedLoadout))
@@ -598,6 +602,12 @@ namespace TCAMultiplayer
                     loadout = LoadoutHelper.GetDefaultLoadoutForAircraft(aircraft);
                 }
                 _lobby.SetLoadout(string.IsNullOrWhiteSpace(loadout) ? "Clean" : loadout);
+            }
+            else
+            {
+                string resolvedLoadout = LoadoutHelper.ResolveLoadoutForAircraft(local.SelectedAircraft, local.SelectedLoadout);
+                if (!string.Equals(local.SelectedLoadout, resolvedLoadout, StringComparison.Ordinal))
+                    _lobby.SetLoadout(resolvedLoadout);
             }
 
             if (string.IsNullOrWhiteSpace(local.SelectedAirfield)
@@ -827,6 +837,7 @@ namespace TCAMultiplayer
             _modManifest.OnCompatibilityAccepted += HandleModCompatibilityAccepted;
             _modManifest.OnCompatibilityMismatch += HandleModCompatibilityMismatch;
             _modManifest.OnSyncStatus += HandleModSyncStatus;
+            _modManifest.OnCompatibilityStateChanged += HandleModCompatibilityStateChanged;
 
             // Register AircraftState packet handler — routes incoming state to RemoteAircraftManager
             router.Register(PacketType.AircraftState, HandleAircraftStateRaw);
@@ -1078,117 +1089,130 @@ namespace TCAMultiplayer
         {
             Log.Info(Tag, "All players loaded — spawning local aircraft");
             var aircraft = _spawnManager?.SpawnLocalPlayer();
-            if (aircraft != null)
+            if (aircraft == null)
             {
-                // CRITICAL: Tell FlightGame this is the player's aircraft.
-                // Without this, the game stays in spectator/free camera mode.
-                var flightGame = Falcon.Game2.FlightGame.Instance;
-                if (flightGame != null)
+                HandleLocalSpawnFailure("Failed to spawn local aircraft");
+                return;
+            }
+
+            // CRITICAL: Tell FlightGame this is the player's aircraft.
+            // Without this, the game stays in spectator/free camera mode.
+            var flightGame = Falcon.Game2.FlightGame.Instance;
+            if (flightGame == null)
+            {
+                HandleLocalSpawnFailure("FlightGame.Instance is null — cannot attach player to aircraft");
+                return;
+            }
+
+            flightGame.SetNewPlayerAircraft(aircraft);
+            Log.Info(Tag, "FlightGame.SetNewPlayerAircraft — camera + controls attached");
+
+            // Reset latched flight input from any previous session/life
+            // (native StartFlight does this; we bypass it). Prevents a
+            // stale IsEjecting flag from instantly ejecting the new aircraft.
+            ResetPlayerFlightInput(flightGame);
+
+            // Initialize flight state that StartFlight() normally provides
+            // We bypass StartFlight() (it's private and runs an async game loop)
+            // but we need its critical side effects:
+
+            // 1. CRITICAL: Set FloatingOrigin reference so origin shifts happen
+            // Without this, player at 31km from origin → float precision loss → cockpit jitter
+            if (flightGame.FloatingOrigin != null)
+            {
+                flightGame.FloatingOrigin.ReferenceObject = aircraft.transform;
+                Log.Info(Tag, "FloatingOrigin.ReferenceObject set to player aircraft");
+            }
+
+            // 2. Set game mode to Freeflight (FFA sandbox — full combat, no AI waves or objectives)
+            // Mode has private setter — minimal reflection justified for critical correctness
+            try
+            {
+                // Standard reflection fails for private setters in Unity Mono.
+                // Use Harmony's Traverse which is purpose-built for this.
+                HarmonyLib.Traverse.Create(flightGame).Property("Mode").SetValue(Falcon.Game2.FlightGame.FlightType.Freeflight);
+                Log.Info(Tag, $"FlightGame.Mode set to Freeflight (verify: {flightGame.Mode})");
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(Tag, $"Failed to set FlightGame.Mode: {ex.Message}");
+            }
+
+            // 3. Set IsMissionInProgress so game systems function correctly
+            try
+            {
+                var missionProp = typeof(Falcon.Game2.FlightGame).GetProperty("IsMissionInProgress",
+                    BindingFlags.Public | BindingFlags.Instance);
+                missionProp?.SetValue(flightGame, true);
+                Log.Info(Tag, "FlightGame.IsMissionInProgress set to true");
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(Tag, $"Failed to set IsMissionInProgress: {ex.Message}");
+            }
+
+            // 4. Ensure weapon input is not blocked
+            if (flightGame.PlayerInput != null)
+            {
+                flightGame.PlayerInput.IsInputBlockedFromGame = false;
+                Log.Info(Tag, "PlayerInput.IsInputBlockedFromGame set to false");
+            }
+
+            // 4b. Register the pause-menu keys (native StartFlight does
+            // this, but we bypass it). Esc opens the native pause menu;
+            // GamePausePatch keeps the simulation running underneath.
+            RegisterPauseMenuInput();
+
+            // 5. Initialize flight state that StartFlight() normally provides
+            // We bypass StartFlight() (private + runs async loop) but need its side effects
+            try
+            {
+                // Hide arena strategic target icons/attrition UI (StartFlight calls this)
+                var setIconsMethod = typeof(Falcon.Game2.FlightGame).GetMethod("SetArenaIconsVisible",
+                    BindingFlags.NonPublic | BindingFlags.Instance);
+                setIconsMethod?.Invoke(flightGame, new object[] { false, true });
+
+                // Tell HUD we're NOT in Arena mode
+                var gameHud = Falcon.Game2.UI.HUD.GameHUD.Instance;
+                if (gameHud != null)
                 {
-                    flightGame.SetNewPlayerAircraft(aircraft);
-                    Log.Info(Tag, "FlightGame.SetNewPlayerAircraft — camera + controls attached");
-
-                    // Reset latched flight input from any previous session/life
-                    // (native StartFlight does this; we bypass it). Prevents a
-                    // stale IsEjecting flag from instantly ejecting the new aircraft.
-                    ResetPlayerFlightInput(flightGame);
-
-                    // Initialize flight state that StartFlight() normally provides
-                    // We bypass StartFlight() (it's private and runs an async game loop)
-                    // but we need its critical side effects:
-
-                    // 1. CRITICAL: Set FloatingOrigin reference so origin shifts happen
-                    // Without this, player at 31km from origin → float precision loss → cockpit jitter
-                    if (flightGame.FloatingOrigin != null)
-                    {
-                        flightGame.FloatingOrigin.ReferenceObject = aircraft.transform;
-                        Log.Info(Tag, "FloatingOrigin.ReferenceObject set to player aircraft");
-                    }
-
-                    // 2. Set game mode to Freeflight (FFA sandbox — full combat, no AI waves or objectives)
-                    // Mode has private setter — minimal reflection justified for critical correctness
-                    try
-                    {
-                        // Standard reflection fails for private setters in Unity Mono.
-                        // Use Harmony's Traverse which is purpose-built for this.
-                        HarmonyLib.Traverse.Create(flightGame).Property("Mode").SetValue(Falcon.Game2.FlightGame.FlightType.Freeflight);
-                        Log.Info(Tag, $"FlightGame.Mode set to Freeflight (verify: {flightGame.Mode})");
-                    }
-                    catch (System.Exception ex)
-                    {
-                        Log.Warning(Tag, $"Failed to set FlightGame.Mode: {ex.Message}");
-                    }
-
-                    // 3. Set IsMissionInProgress so game systems function correctly
-                    try
-                    {
-                        var missionProp = typeof(Falcon.Game2.FlightGame).GetProperty("IsMissionInProgress",
-                            BindingFlags.Public | BindingFlags.Instance);
-                        missionProp?.SetValue(flightGame, true);
-                        Log.Info(Tag, "FlightGame.IsMissionInProgress set to true");
-                    }
-                    catch (System.Exception ex)
-                    {
-                        Log.Warning(Tag, $"Failed to set IsMissionInProgress: {ex.Message}");
-                    }
-
-                    // 4. Ensure weapon input is not blocked
-                    if (flightGame.PlayerInput != null)
-                    {
-                        flightGame.PlayerInput.IsInputBlockedFromGame = false;
-                        Log.Info(Tag, "PlayerInput.IsInputBlockedFromGame set to false");
-                    }
-
-                    // 4b. Register the pause-menu keys (native StartFlight does
-                    // this, but we bypass it). Esc opens the native pause menu;
-                    // GamePausePatch keeps the simulation running underneath.
-                    RegisterPauseMenuInput();
-
-                    // 5. Initialize flight state that StartFlight() normally provides
-                    // We bypass StartFlight() (private + runs async loop) but need its side effects
-                    try
-                    {
-                        // Hide arena strategic target icons/attrition UI (StartFlight calls this)
-                        var setIconsMethod = typeof(Falcon.Game2.FlightGame).GetMethod("SetArenaIconsVisible",
-                            BindingFlags.NonPublic | BindingFlags.Instance);
-                        setIconsMethod?.Invoke(flightGame, new object[] { false, true });
-
-                        // Tell HUD we're NOT in Arena mode
-                        var gameHud = Falcon.Game2.UI.HUD.GameHUD.Instance;
-                        if (gameHud != null)
-                        {
-                            gameHud.StartFlight(false); // false = not Arena
-                            Log.Info(Tag, "GameHUD.StartFlight(false) called");
-                        }
-
-                        _loadingScreen?.Close(true).Forget();
-                        _loadingScreen = null;
-
-                    }
-                    catch (System.Exception ex)
-                    {
-                        Log.Warning(Tag, $"Failed to init flight state: {ex.Message}");
-                    }
+                    gameHud.StartFlight(false); // false = not Arena
+                    Log.Info(Tag, "GameHUD.StartFlight(false) called");
                 }
-                else
-                {
-                    Log.Error(Tag, "FlightGame.Instance is null — cannot attach player to aircraft!");
-                }
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(Tag, $"Failed to init flight state: {ex.Message}");
+            }
 
-                _activeSession?.StateMachine.TryTransition(GameState.InGame);
+            _loadingScreen?.Close(true).Forget();
+            _loadingScreen = null;
 
-                // Lock the cursor for flight (native StartFlight callers do this —
-                // see QuickMissionGame.RunQuickMission — but we bypass that path).
-                // Locked auto-hides the pointer; visible stays true so menus that
-                // only set LockState=None (the native pattern) show the cursor.
-                TinyCursor.LockState = CursorLockMode.Locked;
-                Cursor.visible = true;
+            _activeSession?.StateMachine.TryTransition(GameState.InGame);
 
-                Log.Info(Tag, $"Local player spawned: {aircraft.name}");
+            // Lock the cursor for flight (native StartFlight callers do this —
+            // see QuickMissionGame.RunQuickMission — but we bypass that path).
+            // Locked auto-hides the pointer; visible stays true so menus that
+            // only set LockState=None (the native pattern) show the cursor.
+            TinyCursor.LockState = CursorLockMode.Locked;
+            Cursor.visible = true;
+
+            Log.Info(Tag, $"Local player spawned: {aircraft.name}");
+        }
+
+        private void HandleLocalSpawnFailure(string reason)
+        {
+            Log.Error(Tag, reason);
+            _loadingScreen?.Close(true).Forget();
+            _loadingScreen = null;
+
+            if (_activeSession?.IsHost == true)
+            {
+                _lobby?.ReturnToLobby();
             }
             else
             {
-                Log.Error(Tag, "Failed to spawn local aircraft!");
+                _connection?.Disconnect();
             }
         }
 
@@ -1605,6 +1629,12 @@ namespace TCAMultiplayer
             }
         }
 
+        private void HandleModCompatibilityStateChanged()
+        {
+            _lobby?.PublishLobbyState();
+            _menu?.RefreshIfVisible();
+        }
+
         /// <summary>
         /// Tear down all session-scoped systems. Called on disconnect or before creating a new session.
         /// </summary>
@@ -1668,6 +1698,7 @@ namespace TCAMultiplayer
                 _modManifest.OnCompatibilityAccepted -= HandleModCompatibilityAccepted;
                 _modManifest.OnCompatibilityMismatch -= HandleModCompatibilityMismatch;
                 _modManifest.OnSyncStatus -= HandleModSyncStatus;
+                _modManifest.OnCompatibilityStateChanged -= HandleModCompatibilityStateChanged;
                 _modManifest.Dispose();
                 _modManifest = null;
             }

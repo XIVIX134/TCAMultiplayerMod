@@ -4,6 +4,7 @@ using UnityEngine;
 using Falcon;
 using Falcon.UniversalAircraft;
 using Falcon.Factions;
+using Falcon.Utilities;
 using TCAMultiplayer.Core;
 
 namespace TCAMultiplayer.Game
@@ -18,10 +19,6 @@ namespace TCAMultiplayer.Game
         private const string Tag = "SPAWN-MGR";
         private const string DefaultAircraftType = "F-16C";
 
-        // Known airfield spawn positions (local Unity coordinates).
-        // Runway positions are at low altitude; air spawns are high.
-        private static readonly Vector3 ActionIslandRunwayPos = new Vector3(0f, 10f, 0f);
-        private static readonly Quaternion RunwayRotation = Quaternion.Euler(0f, 0f, 0f);
         private static readonly Vector3 AirSpawnDefault = new Vector3(0f, 1000f, 0f);
         private static readonly Quaternion AirSpawnRotation = Quaternion.Euler(0f, 0f, 0f);
 
@@ -124,14 +121,35 @@ namespace TCAMultiplayer.Game
                 aircraftType = allAircraft.Count > 0 ? allAircraft[0] : "F16C";
                 Log.Warning(Tag, $"No aircraft selected — using first available: {aircraftType}");
             }
+            string resolvedAircraft = LoadoutHelper.ResolveAvailableAircraft(aircraftType, DefaultAircraftType);
+            if (!string.Equals(aircraftType, resolvedAircraft, StringComparison.Ordinal))
+            {
+                Log.Warning(Tag, $"Selected aircraft '{aircraftType}' unavailable, using '{resolvedAircraft}'");
+                aircraftType = resolvedAircraft;
+                player.SelectedAircraft = resolvedAircraft;
+            }
+            string loadoutName = LoadoutHelper.ResolveLoadoutForAircraft(aircraftType, player.SelectedLoadout);
+            if (!string.Equals(player.SelectedLoadout, loadoutName, StringComparison.Ordinal))
+            {
+                Log.Warning(Tag, $"Selected loadout '{player.SelectedLoadout}' unavailable for '{aircraftType}', using '{loadoutName}'");
+                player.SelectedLoadout = loadoutName;
+            }
             Log.Info(Tag, $"Spawning aircraft: {aircraftType}, airfield: {player.SelectedAirfield}, spawn: {_session.SpawnType}");
 
             // Resolve spawn position from airfield or session spawn type
             bool isAirStart = _session.SpawnType == LobbySpawnType.InAir;
             Vector3 position;
             Quaternion rotation;
-            GetSpawnPosition(player.SelectedAirfield, isAirStart, out position, out rotation);
-            ApplyMultiplayerSpawnOffset(player.PeerId, ref position, rotation, isAirStart);
+            int spawnSlot = GetSpawnSlot(player.PeerId, player.SelectedAirfield);
+            int spawnCount = GetSpawnSlotCount(player.SelectedAirfield);
+            if (!TryGetSpawnPosition(player.SelectedAirfield, isAirStart, spawnSlot, spawnCount, out position, out rotation))
+            {
+                Log.Error(Tag, $"Cannot spawn on ground: no native spawn point for airfield '{player.SelectedAirfield}'");
+                return null;
+            }
+
+            if (isAirStart)
+                ApplyMultiplayerSpawnOffset(player.PeerId, spawnSlot, ref position, rotation);
 
             // Spawn via direct game API
             UniAircraft aircraft = TrySpawn(aircraftType, position, rotation, isAirStart);
@@ -150,7 +168,7 @@ namespace TCAMultiplayer.Game
             }
 
             // Apply loadout post-spawn
-            ApplyLoadout(aircraft, player.SelectedLoadout);
+            ApplyLoadout(aircraft, loadoutName);
 
             // Subscribe to destruction event for death detection
             aircraft.OnAircraftDestroyed += HandleAircraftDestroyed;
@@ -228,24 +246,40 @@ namespace TCAMultiplayer.Game
         public void GetSpawnPosition(string airfieldName, bool isAirStart,
             out Vector3 position, out Quaternion rotation)
         {
+            TryGetSpawnPosition(airfieldName, isAirStart, 0, 1, out position, out rotation);
+        }
+
+        private bool TryGetSpawnPosition(
+            string airfieldName,
+            bool isAirStart,
+            int spawnSlot,
+            int spawnCount,
+            out Vector3 position,
+            out Quaternion rotation)
+        {
             // Use AirfieldHelper to resolve real airfield positions from game scene data.
-            // This finds the actual Airfield2 component and calls GetRunwaySpawn/GetRampSpawn.
+            // This finds the actual Airfield2 component and uses native runway/ramp slots.
             var spawnType = _session.SpawnType;
 
             if (!string.IsNullOrEmpty(airfieldName))
             {
                 try
                 {
-                    var (pos, rot) = AirfieldHelper.GetSpawnPoint(airfieldName, spawnType);
-                    if (pos != Vector3.zero)
+                    if (AirfieldHelper.TryGetSpawnPoint(
+                            airfieldName,
+                            spawnType,
+                            spawnSlot,
+                            spawnCount,
+                            out var pos,
+                            out var rot))
                     {
                         position = pos;
                         rotation = rot;
                         // NOTE: AirfieldHelper.GetSpawnPoint already applies InAir offset (+300m up, -2000m back)
                         // Do NOT apply it again here — was previously causing double offset
 
-                        Log.Info(Tag, $"Resolved airfield '{airfieldName}' → pos={position}, rot={rotation.eulerAngles}");
-                        return;
+                        Log.Info(Tag, $"Resolved airfield '{airfieldName}' slot {spawnSlot + 1}/{spawnCount} → pos={position}, rot={rotation.eulerAngles}");
+                        return true;
                     }
                 }
                 catch (System.Exception ex)
@@ -254,34 +288,32 @@ namespace TCAMultiplayer.Game
                 }
             }
 
-            // Fallback: air spawn at 1000m or ground at origin
             if (isAirStart)
             {
                 position = AirSpawnDefault;
                 rotation = AirSpawnRotation;
+                return true;
             }
-            else
-            {
-                Log.Warning(Tag, $"Could not resolve airfield '{airfieldName}' — using fallback position");
-                position = ActionIslandRunwayPos;
-                rotation = RunwayRotation;
-            }
+
+            Log.Warning(Tag, $"Could not resolve native ground spawn for airfield '{airfieldName}'");
+            position = Vector3.zero;
+            rotation = Quaternion.identity;
+            return false;
         }
 
         private void ApplyMultiplayerSpawnOffset(
             ulong peerId,
+            int slot,
             ref Vector3 position,
-            Quaternion rotation,
-            bool isAirStart)
+            Quaternion rotation)
         {
-            int slot = GetSpawnSlot(peerId);
             if (slot == 0)
                 return;
 
             float side = (slot % 2 == 0) ? -1f : 1f;
             int row = (slot + 1) / 2;
-            float lateralSpacing = isAirStart ? 250f : 35f;
-            float trailSpacing = isAirStart ? 450f : 55f;
+            const float lateralSpacing = 250f;
+            const float trailSpacing = 450f;
 
             Vector3 right = rotation * Vector3.right;
             Vector3 back = -(rotation * Vector3.forward);
@@ -289,12 +321,46 @@ namespace TCAMultiplayer.Game
             Log.Info(Tag, $"Applied spawn slot {slot} offset for peer {peerId}: pos={position}");
         }
 
-        private int GetSpawnSlot(ulong peerId)
+        private int GetSpawnSlot(ulong peerId, string airfieldName)
         {
-            var peerIds = new List<ulong>(_session.Players.Keys);
+            var peerIds = GetSpawnPeerIdsForAirfield(airfieldName);
             peerIds.Sort();
             int slot = peerIds.IndexOf(peerId);
             return slot >= 0 ? slot : 0;
+        }
+
+        private int GetSpawnSlotCount(string airfieldName)
+        {
+            int count = GetSpawnPeerIdsForAirfield(airfieldName).Count;
+            return Mathf.Max(1, count);
+        }
+
+        private List<ulong> GetSpawnPeerIdsForAirfield(string airfieldName)
+        {
+            var peerIds = new List<ulong>();
+            string normalizedAirfield = NormalizeAirfieldName(airfieldName);
+            foreach (var player in _session.Players.Values)
+            {
+                if (player == null) continue;
+                if (NormalizeAirfieldName(player.SelectedAirfield) != normalizedAirfield) continue;
+                peerIds.Add(player.PeerId);
+            }
+
+            if (peerIds.Count == 0)
+                peerIds.Add(_session.LocalPeerId);
+            return peerIds;
+        }
+
+        private static string NormalizeAirfieldName(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+            var chars = new List<char>(value.Length);
+            foreach (char c in value)
+            {
+                if (char.IsWhiteSpace(c) || c == '_' || c == '-') continue;
+                chars.Add(char.ToLowerInvariant(c));
+            }
+            return new string(chars.ToArray());
         }
 
         // ── Private helpers ─────────────────────────────────────────────────
@@ -309,16 +375,20 @@ namespace TCAMultiplayer.Game
             try
             {
                 string name = $"MP_Local_{aircraftType}";
+                Vector3 spawnPosition = GetNativeSpawnPosition(aircraftType, position, isAirStart);
 
                 UniAircraft aircraft = GameDataAircraft.SpawnAircraft(
                     name,
                     aircraftType,
                     _localFaction,
                     PilotSkill.Ace,
-                    position,
+                    spawnPosition,
                     rotation,
                     isAirStart
                 );
+
+                if (aircraft != null && !isAirStart)
+                    ApplyNativeGroundSpawnState(aircraft);
 
                 return aircraft;
             }
@@ -326,6 +396,38 @@ namespace TCAMultiplayer.Game
             {
                 Log.Warning(Tag, $"SpawnAircraft threw for '{aircraftType}': {ex.Message}");
                 return null;
+            }
+        }
+
+        private static Vector3 GetNativeSpawnPosition(string aircraftType, Vector3 position, bool isAirStart)
+        {
+            if (isAirStart)
+                return position;
+
+            var aircraftData = GameDataAircraft.GetByName(aircraftType);
+            if (aircraftData == null)
+                return position;
+
+            position.y = TerrainTools.GetTerrainHeightAtPosition(position);
+            position.y -= aircraftData.SpawnOffset;
+            return position;
+        }
+
+        private static void ApplyNativeGroundSpawnState(UniAircraft aircraft)
+        {
+            if (aircraft == null)
+                return;
+
+            try
+            {
+                if (aircraft.Data != null)
+                    aircraft.transform.Rotate(Vector3.right * (0f - aircraft.Data.SpawnRotation), Space.Self);
+                if (aircraft.Rigidbody != null)
+                    aircraft.Rigidbody.velocity = Vector3.zero;
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"Failed to apply native ground spawn state: {ex.Message}");
             }
         }
 

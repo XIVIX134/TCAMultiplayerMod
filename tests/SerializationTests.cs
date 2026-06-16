@@ -612,7 +612,9 @@ namespace TCAMultiplayer.Tests
                         IsReady = true,
                         IsLoaded = false,
                         IsHost = true,
-                        Team = MultiplayerTeam.Team1
+                        Team = MultiplayerTeam.Team1,
+                        IsModsVerified = true,
+                        IsModSyncing = false
                     },
                     new LobbyPlayerInfo
                     {
@@ -624,7 +626,9 @@ namespace TCAMultiplayer.Tests
                         IsReady = true,
                         IsLoaded = true,
                         IsHost = false,
-                        Team = MultiplayerTeam.Team4
+                        Team = MultiplayerTeam.Team4,
+                        IsModsVerified = true,
+                        IsModSyncing = true
                     }
                 }
             };
@@ -658,6 +662,9 @@ namespace TCAMultiplayer.Tests
             Assert.IsFalse(result.Players[0].IsLoaded);
             Assert.IsTrue(result.Players[0].IsHost);
             Assert.AreEqual(MultiplayerTeam.Team1, result.Players[0].Team);
+            Assert.IsTrue(result.Players[0].HasModCompatibilityState);
+            Assert.IsTrue(result.Players[0].IsModsVerified);
+            Assert.IsFalse(result.Players[0].IsModSyncing);
 
             // Player 1
             Assert.AreEqual(2UL, result.Players[1].PeerId);
@@ -669,6 +676,9 @@ namespace TCAMultiplayer.Tests
             Assert.IsTrue(result.Players[1].IsLoaded);
             Assert.IsFalse(result.Players[1].IsHost);
             Assert.AreEqual(MultiplayerTeam.Team4, result.Players[1].Team);
+            Assert.IsTrue(result.Players[1].HasModCompatibilityState);
+            Assert.IsTrue(result.Players[1].IsModsVerified);
+            Assert.IsTrue(result.Players[1].IsModSyncing);
         }
 
         [Test]

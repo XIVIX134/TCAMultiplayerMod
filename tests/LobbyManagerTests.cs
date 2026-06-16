@@ -17,6 +17,7 @@ namespace TCAMultiplayer.Tests
         {
             if (!Log.IsInitialized)
                 Log.Init(new ManualLogSource("Test"));
+            LobbyManager.TimeProvider = () => 0f;
         }
 
         [Test]
@@ -244,6 +245,60 @@ namespace TCAMultiplayer.Tests
 
                 Assert.AreEqual(3, session.TeamCount);
                 Assert.AreEqual(Core.MultiplayerTeam.Team3, session.GetPlayer(3)?.Team);
+            }
+        }
+
+        [Test]
+        public void ClientLobbyStateMerge_CopiesModVerificationState()
+        {
+            using (var session = new GameSession(isHost: false))
+            using (var transport = new FakeTransport())
+            using (var connection = new ConnectionManager(transport))
+            {
+                session.LocalPeerId = 2;
+                session.StateMachine.TryTransition(GameState.ClientLobby);
+                var router = new PacketRouter();
+                using (new LobbyManager(session, connection, router))
+                {
+                    router.Route(1, LobbyStateFrame(new LobbyStatePacket
+                    {
+                        HostName = "TCA Server",
+                        MapName = "ActionIsland",
+                        Players = new[]
+                        {
+                            new LobbyPlayerInfo
+                            {
+                                PeerId = 1,
+                                PlayerName = "Host",
+                                IsHost = true,
+                                IsModsVerified = true,
+                                HasModCompatibilityState = true
+                            },
+                            new LobbyPlayerInfo
+                            {
+                                PeerId = 2,
+                                PlayerName = "Client",
+                                IsModsVerified = true,
+                                IsModSyncing = false,
+                                HasModCompatibilityState = true
+                            },
+                            new LobbyPlayerInfo
+                            {
+                                PeerId = 3,
+                                PlayerName = "Syncing",
+                                IsModsVerified = false,
+                                IsModSyncing = true,
+                                HasModCompatibilityState = true
+                            }
+                        }
+                    }));
+                }
+
+                Assert.AreEqual(true, session.GetPlayer(1)?.IsModsVerified);
+                Assert.AreEqual(true, session.GetPlayer(2)?.IsModsVerified);
+                Assert.AreEqual(false, session.GetPlayer(2)?.IsModSyncing);
+                Assert.AreEqual(false, session.GetPlayer(3)?.IsModsVerified);
+                Assert.AreEqual(true, session.GetPlayer(3)?.IsModSyncing);
             }
         }
 
@@ -588,6 +643,36 @@ namespace TCAMultiplayer.Tests
                 Assert.AreEqual(2, session.PlayerCount);
                 Assert.GreaterOrEqual(changedCount, 1);
                 Assert.Contains(PacketType.LobbyState, transport.SentReliablePacketTypes);
+            }
+        }
+
+        [Test]
+        public void HostLoading_RechecksAllLoadedWhenPeerDisconnects()
+        {
+            using (var session = new GameSession(isHost: true))
+            using (var transport = new FakeTransport())
+            using (var connection = new ConnectionManager(transport))
+            {
+                session.LocalPeerId = 1;
+                session.StateMachine.TryTransition(GameState.HostingLobby);
+                var host = session.AddPlayer(1, "Host");
+                var loadedPeer = session.AddPlayer(2, "Loaded");
+                var missingPeer = session.AddPlayer(3, "Missing");
+                host.IsLoaded = true;
+                loadedPeer.IsLoaded = true;
+                missingPeer.IsLoaded = false;
+                session.StateMachine.TryTransition(GameState.Loading);
+
+                var router = new PacketRouter();
+                int allLoadedCount = 0;
+                using (var lobby = new LobbyManager(session, connection, router))
+                {
+                    lobby.OnAllPlayersLoaded += () => allLoadedCount++;
+                    session.RemovePlayer(3);
+                }
+
+                Assert.AreEqual(GameState.Spawning, session.StateMachine.CurrentState);
+                Assert.AreEqual(1, allLoadedCount);
             }
         }
 

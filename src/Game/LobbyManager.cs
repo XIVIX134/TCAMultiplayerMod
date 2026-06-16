@@ -22,6 +22,7 @@ namespace TCAMultiplayer.Game
         private uint _stateRevision;
         private uint _lastAppliedStateRevision;
         private bool _disposed;
+        internal static Func<float> TimeProvider = () => Time.time;
 
         public event Action OnLobbyStateChanged;
         public event Action<string> OnGameStarting;
@@ -64,7 +65,7 @@ namespace TCAMultiplayer.Game
             // Only broadcast lobby state while actually in lobby
             var state = _session.StateMachine.CurrentState;
             if (state != GameState.HostingLobby && state != GameState.ClientLobby) return;
-            float now = Time.time;
+            float now = GetTime();
             if (now - _lastBroadcastTime < LobbyBroadcastInterval) return;
             _lastBroadcastTime = now;
             int hash = ComputeStateHash();
@@ -246,19 +247,40 @@ namespace TCAMultiplayer.Game
             Log.Info(Tag, "Returned to lobby");
         }
 
+        public void PublishLobbyState()
+        {
+            if (_disposed) return;
+            if (_session.IsHost && IsInLobbyState())
+                BroadcastLobbyState();
+            OnLobbyStateChanged?.Invoke();
+        }
+
         public void SetAircraft(string name)
         {
             // Allowed in lobby and during gameplay (the respawn screen lets a
             // dead player pick a different aircraft for their next life)
             if (!CanChangeAircraftSelection(nameof(SetAircraft))) return;
             var local = _session.GetLocalPlayer(); if (local == null) return;
+            name = LoadoutHelper.ResolveAvailableAircraft(name);
             bool changed = !string.Equals(local.SelectedAircraft, name, StringComparison.Ordinal);
-            if (changed && IsInLobbyState())
-                ClearReadyForSelectionChange(local, notifyIfLocal: true);
             local.SelectedAircraft = name;
             PersistAircraft(name);
+            string resolvedLoadout = LoadoutHelper.ResolveLoadoutForAircraft(name, local.SelectedLoadout);
+            bool loadoutChanged = !string.Equals(local.SelectedLoadout, resolvedLoadout, StringComparison.Ordinal);
+            if ((changed || loadoutChanged) && IsInLobbyState())
+                ClearReadyForSelectionChange(local, notifyIfLocal: true);
+            if (loadoutChanged)
+            {
+                local.SelectedLoadout = resolvedLoadout;
+                PersistLoadout(resolvedLoadout);
+            }
             Send(PacketType.AircraftSelect, PacketSerializer.SerializeLobbyAircraftSelect(
                 new LobbyAircraftSelectPacket { PeerId = _session.LocalPeerId, AircraftName = name }));
+            if (loadoutChanged)
+            {
+                Send(PacketType.LoadoutSelect, PacketSerializer.SerializeLobbyLoadoutSelect(
+                    new LobbyLoadoutSelectPacket { PeerId = _session.LocalPeerId, LoadoutName = resolvedLoadout }));
+            }
             OnLobbyStateChanged?.Invoke();
         }
 
@@ -280,6 +302,7 @@ namespace TCAMultiplayer.Game
         {
             if (!CanChangeAircraftSelection(nameof(SetLoadout))) return;
             var local = _session.GetLocalPlayer(); if (local == null) return;
+            name = LoadoutHelper.ResolveLoadoutForAircraft(local.SelectedAircraft, name);
             bool changed = !string.Equals(local.SelectedLoadout, name, StringComparison.Ordinal);
             if (changed && IsInLobbyState())
                 ClearReadyForSelectionChange(local, notifyIfLocal: true);
@@ -416,6 +439,16 @@ namespace TCAMultiplayer.Game
 
                     pi.IsReady = wp.IsReady; pi.IsLoaded = wp.IsLoaded; pi.IsHost = wp.IsHost;
                     pi.Team = GameSession.ClampTeam(FromWire(wp.Team), _session.TeamCount);
+                    if (wp.IsHost)
+                    {
+                        pi.IsModsVerified = true;
+                        pi.IsModSyncing = false;
+                    }
+                    else if (wp.HasModCompatibilityState)
+                    {
+                        pi.IsModsVerified = wp.IsModsVerified;
+                        pi.IsModSyncing = wp.IsModSyncing;
+                    }
                 }
             foreach (var id in _session.Players.Keys)
                 if (!receivedIds.Contains(id)) _session.RemovePlayer(id);
@@ -795,6 +828,8 @@ namespace TCAMultiplayer.Game
 
             if (_session.IsHost && IsInLobbyState())
                 BroadcastLobbyState();
+            if (_session.IsHost && IsCurrentState(GameState.Loading))
+                CheckAllLoaded();
 
             Log.Info(Tag, $"Player left: {player.PlayerName} ({player.PeerId})");
         }
@@ -852,7 +887,12 @@ namespace TCAMultiplayer.Game
             if (string.IsNullOrWhiteSpace(local.SelectedAircraft))
             {
                 string aircraft = ModConfig.LastAircraft?.Value;
-                local.SelectedAircraft = string.IsNullOrWhiteSpace(aircraft) ? "AV8B" : aircraft;
+                local.SelectedAircraft = LoadoutHelper.ResolveAvailableAircraft(aircraft);
+                changed = true;
+            }
+            else if (!LoadoutHelper.IsAircraftAvailable(local.SelectedAircraft))
+            {
+                local.SelectedAircraft = LoadoutHelper.ResolveAvailableAircraft(local.SelectedAircraft);
                 changed = true;
             }
 
@@ -861,8 +901,23 @@ namespace TCAMultiplayer.Game
                 string loadout = ModConfig.LastLoadout?.Value;
                 if (string.IsNullOrWhiteSpace(loadout))
                     loadout = LoadoutHelper.GetDefaultLoadoutForAircraft(local.SelectedAircraft);
-                local.SelectedLoadout = string.IsNullOrWhiteSpace(loadout) ? "Clean" : loadout;
+                local.SelectedLoadout = LoadoutHelper.ResolveLoadoutForAircraft(local.SelectedAircraft, loadout);
                 changed = true;
+            }
+            else
+            {
+                string loadout = LoadoutHelper.ResolveLoadoutForAircraft(local.SelectedAircraft, local.SelectedLoadout);
+                if (!string.Equals(local.SelectedLoadout, loadout, StringComparison.Ordinal))
+                {
+                    local.SelectedLoadout = loadout;
+                    changed = true;
+                }
+            }
+
+            if (changed)
+            {
+                PersistAircraft(local.SelectedAircraft);
+                PersistLoadout(local.SelectedLoadout);
             }
 
             string mapName = _session.MapName ?? MapHelper.GetDefaultMapName();
@@ -992,7 +1047,10 @@ namespace TCAMultiplayer.Game
                     SelectedAircraft = p.SelectedAircraft ?? "", SelectedAirfield = p.SelectedAirfield ?? "",
                     SelectedLoadout = p.SelectedLoadout ?? "",
                     IsReady = p.IsReady, IsLoaded = p.IsLoaded, IsHost = p.IsHost,
-                    Team = ToWire(p.Team)
+                    Team = ToWire(p.Team),
+                    IsModsVerified = p.IsModsVerified,
+                    IsModSyncing = p.IsModSyncing,
+                    HasModCompatibilityState = true
                 };
             var state = _session.StateMachine.CurrentState;
             var pkt = new LobbyStatePacket
@@ -1047,10 +1105,22 @@ namespace TCAMultiplayer.Game
             foreach (var p in _session.Players.Values)
                 if (!p.IsLoaded) return;
             Send(PacketType.LobbySpawnPlayers, PacketSerializer.SerializeLobbySpawnPlayers(
-                new LobbySpawnPlayersPacket { Timestamp = Time.time }));
+                new LobbySpawnPlayersPacket { Timestamp = GetTime() }));
             _session.StateMachine.TryTransition(GameState.Spawning);
             OnAllPlayersLoaded?.Invoke();
             Log.Info(Tag, "All loaded — triggering spawn");
+        }
+
+        private static float GetTime()
+        {
+            try
+            {
+                return TimeProvider?.Invoke() ?? 0f;
+            }
+            catch
+            {
+                return 0f;
+            }
         }
 
         private void ResetPlayersForLobby()
@@ -1077,6 +1147,7 @@ namespace TCAMultiplayer.Game
                 hash = hash * 31 + (p.SelectedLoadout?.GetHashCode() ?? 0);
                 hash = hash * 31 + (int)p.Team;
                 hash = hash * 31 + (p.IsReady ? 1 : 0) + (p.IsLoaded ? 2 : 0);
+                hash = hash * 31 + (p.IsModsVerified ? 1 : 0) + (p.IsModSyncing ? 2 : 0);
             }
             return hash;
         }

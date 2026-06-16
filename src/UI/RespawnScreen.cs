@@ -196,6 +196,8 @@ namespace TCAMultiplayer.UI
                 Log.Warning(Tag, "No aircraft names available for selector");
                 return;
             }
+            curAircraft = LoadoutHelper.ResolveAvailableAircraft(curAircraft, "F-16C");
+            curLoadout = LoadoutHelper.ResolveLoadoutForAircraft(curAircraft, curLoadout);
 
             // Hide the respawn overlay while the native selector is up so the
             // dialog isn't buried under this canvas (sortingOrder 1000)

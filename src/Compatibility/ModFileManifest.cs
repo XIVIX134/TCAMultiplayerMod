@@ -4,7 +4,9 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using BepInEx;
+using Falcon;
 using TCAMultiplayer.Core;
 
 namespace TCAMultiplayer.Compatibility
@@ -16,14 +18,27 @@ namespace TCAMultiplayer.Compatibility
     public sealed class ModFileManifest
     {
         private const string Tag = "MOD-FILES";
-        private const int FormatVersion = 1;
+        private const int FormatVersion = 2;
+        private const int MinSupportedFormatVersion = 1;
         private const string PackageMagic = "TCAMP_MOD_SYNC";
+        private const string ModLoadOrderFileName = "ModLoadOrder.json";
         private const int MaxManifestEntries = 8192;
         private const int MaxSyncPackageFiles = 8192;
         private const long MaxSyncFileBytes = 64L * 1024L * 1024L;
+        private const long MaxMetadataFileBytes = 1024L * 1024L;
         public const int MaxSyncPackageBytes = 128 * 1024 * 1024;
         private const long MaxPackageBytes = MaxSyncPackageBytes;
         private const long MaxExpandedPackageBytes = MaxSyncPackageBytes;
+
+        internal static Func<string> GameRootResolver = ResolveGameRootPath;
+        internal static Func<string, IEnumerable<ExternalModSource>> ExternalModSourceResolver =
+            ResolveLoadedGameModSources;
+
+        internal static void ResetResolversForTests()
+        {
+            GameRootResolver = ResolveGameRootPath;
+            ExternalModSourceResolver = ResolveLoadedGameModSources;
+        }
 
         private static readonly HashSet<string> BlockedSyncExtensions =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -58,70 +73,108 @@ namespace TCAMultiplayer.Compatibility
 
         public string ManifestHash => ComputeManifestHash(Serialize());
 
-        public static string ModsRoot
-        {
-            get
-            {
-                try
-                {
-                    string gameRoot = Paths.GameRootPath;
-                    if (!string.IsNullOrWhiteSpace(gameRoot))
-                        return Path.Combine(gameRoot, "Mods");
-                }
-                catch
-                {
-                }
-
-                try
-                {
-                    string cwd = Environment.CurrentDirectory;
-                    return string.IsNullOrWhiteSpace(cwd) ? null : Path.Combine(cwd, "Mods");
-                }
-                catch
-                {
-                    return null;
-                }
-            }
-        }
+        public static string ModsRoot => GetModsRoot();
 
         public static ModFileManifest Collect()
         {
+            return Collect(null);
+        }
+
+        private static ModFileManifest Collect(ISet<string> suppressedExternalDestinations)
+        {
             var manifest = new ModFileManifest();
+            var seenPaths = new HashSet<string>(StringComparer.Ordinal);
             string root = ModsRoot;
-            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+            string rootFull = null;
+            if (!string.IsNullOrWhiteSpace(root) && Directory.Exists(root))
+            {
+                rootFull = Path.GetFullPath(root);
+                foreach (var path in Directory.GetFiles(rootFull, "*", SearchOption.AllDirectories))
+                {
+                    try
+                    {
+                        AddFileEntry(manifest, seenPaths, rootFull, path, null);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warning(Tag, $"Skipping mod file '{path}': {ex.Message}");
+                    }
+                }
+            }
+            else
             {
                 Log.Warning(Tag, $"Mods folder not found: {root ?? "(unknown)"}");
-                return manifest;
             }
 
-            string rootFull = Path.GetFullPath(root);
-            foreach (var path in Directory.GetFiles(rootFull, "*", SearchOption.AllDirectories))
+            AddExternalModSources(manifest, seenPaths, rootFull, suppressedExternalDestinations);
+            AddModLoadOrder(manifest, seenPaths);
+
+            manifest.Files.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
+            Log.Info(Tag, $"Collected {manifest.Files.Count} mod files from {root ?? "(unknown)"}");
+            return manifest;
+        }
+
+        private static void AddExternalModSources(
+            ModFileManifest manifest,
+            HashSet<string> seenPaths,
+            string modsRootFull,
+            ISet<string> suppressedExternalDestinations)
+        {
+            IEnumerable<ExternalModSource> sources;
+            try
             {
+                sources = ExternalModSourceResolver?.Invoke(modsRootFull) ?? Enumerable.Empty<ExternalModSource>();
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"Could not enumerate loaded Workshop mods: {ex.Message}");
+                return;
+            }
+
+            foreach (var source in sources)
+            {
+                if (source == null || string.IsNullOrWhiteSpace(source.SourceRoot))
+                    continue;
+                if (string.IsNullOrWhiteSpace(source.DestinationFolder))
+                    continue;
+
                 try
                 {
-                    string relativePath = GetSafeRelativePath(rootFull, path);
-                    if (!IsAllowedManifestPath(relativePath))
+                    string sourceRootFull = Path.GetFullPath(source.SourceRoot);
+                    if (!Directory.Exists(sourceRootFull))
+                        continue;
+                    if (!string.IsNullOrWhiteSpace(modsRootFull) && IsSameOrUnder(sourceRootFull, modsRootFull))
                         continue;
 
-                    var info = new FileInfo(path);
-                    var entry = new ModFileEntry
+                    string destinationFolder = NormalizeManifestPath(source.DestinationFolder);
+                    if (destinationFolder.Contains("/") || !IsSafePathSegment(destinationFolder))
                     {
-                        Path = relativePath,
-                        Size = info.Length,
-                        Sha256 = ComputeFileHash(path),
-                        SyncAllowed = IsAllowedSyncPath(relativePath, info.Length)
-                    };
-                    manifest.Files.Add(entry);
+                        Log.Warning(Tag, $"Skipping external mod with unsafe target '{source.DestinationFolder}'");
+                        continue;
+                    }
+                    if (suppressedExternalDestinations != null
+                        && suppressedExternalDestinations.Contains(destinationFolder))
+                    {
+                        continue;
+                    }
+
+                    foreach (var path in Directory.GetFiles(sourceRootFull, "*", SearchOption.AllDirectories))
+                    {
+                        try
+                        {
+                            AddFileEntry(manifest, seenPaths, sourceRootFull, path, destinationFolder);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Warning(Tag, $"Skipping external mod file '{path}': {ex.Message}");
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
-                    Log.Warning(Tag, $"Skipping mod file '{path}': {ex.Message}");
+                    Log.Warning(Tag, $"Skipping external mod source '{source.SourceRoot}': {ex.Message}");
                 }
             }
-
-            manifest.Files.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
-            Log.Info(Tag, $"Collected {manifest.Files.Count} mod files from {rootFull}");
-            return manifest;
         }
 
         public byte[] Serialize()
@@ -153,7 +206,7 @@ namespace TCAMultiplayer.Compatibility
             using (var r = new BinaryReader(ms, Encoding.UTF8))
             {
                 int version = r.ReadInt32();
-                if (version != FormatVersion)
+                if (version < MinSupportedFormatVersion || version > FormatVersion)
                     throw new InvalidDataException($"Unsupported mod manifest version {version}");
 
                 manifest.RootLabel = r.ReadString();
@@ -203,8 +256,9 @@ namespace TCAMultiplayer.Compatibility
                     continue;
                 }
 
+                bool sizeChanged = !IsModLoadOrderPath(hostFile.Path) && localFile.Size != hostFile.Size;
                 if (!string.Equals(localFile.Sha256, hostFile.Sha256, StringComparison.Ordinal)
-                    || localFile.Size != hostFile.Size)
+                    || sizeChanged)
                 {
                     diff.Changed.Add(hostFile);
                     if (!hostFile.SyncAllowed)
@@ -214,6 +268,8 @@ namespace TCAMultiplayer.Compatibility
 
             foreach (var localFile in Files)
             {
+                if (IsModLoadOrderPath(localFile.Path) && !hostByPath.ContainsKey(localFile.Path))
+                    continue;
                 if (!hostByPath.ContainsKey(localFile.Path))
                     diff.Extra.Add(localFile);
             }
@@ -254,7 +310,7 @@ namespace TCAMultiplayer.Compatibility
                     if (!IsAllowedSyncPath(file.Path, file.Size))
                         throw new InvalidOperationException($"Unsafe sync file: {file.Path}");
 
-                    string sourcePath = ResolveSafePath(rootFull, file.Path);
+                    string sourcePath = ResolveSourcePath(rootFull, file);
                     if (!File.Exists(sourcePath))
                         throw new FileNotFoundException($"Host mod file missing during sync: {file.Path}", sourcePath);
                     if (new FileInfo(sourcePath).Length != file.Size)
@@ -270,7 +326,7 @@ namespace TCAMultiplayer.Compatibility
                 }
 
                 var deletions = diff.Extra
-                    .Where(extra => IsAllowedSyncPath(extra.Path, extra.Size))
+                    .Where(extra => !IsModLoadOrderPath(extra.Path) && IsAllowedSyncPath(extra.Path, extra.Size))
                     .ToList();
                 writer.Write(deletions.Count);
                 foreach (var extra in deletions)
@@ -348,7 +404,7 @@ namespace TCAMultiplayer.Compatibility
                         if (bytes.Length != length)
                             return SyncApplyResult.Failed("Truncated mod sync package");
 
-                        ResolveSafePath(rootFull, relative);
+                        ResolveApplyPath(rootFull, relative);
                         writes.Add(new SyncPackageFile { RelativePath = relative, Bytes = bytes });
                     }
 
@@ -360,10 +416,10 @@ namespace TCAMultiplayer.Compatibility
                     for (int i = 0; i < deleteCount; i++)
                     {
                         string relative = NormalizeManifestPath(reader.ReadString());
-                        if (!IsAllowedSyncPath(relative, 0))
+                        if (IsModLoadOrderPath(relative) || !IsAllowedSyncPath(relative, 0))
                             continue;
 
-                        ResolveSafePath(rootFull, relative);
+                        ResolveModsSafePath(rootFull, relative);
                         deletions.Add(relative);
                     }
 
@@ -372,7 +428,7 @@ namespace TCAMultiplayer.Compatibility
 
                     foreach (var file in writes)
                     {
-                        string target = ResolveSafePath(rootFull, file.RelativePath);
+                        string target = ResolveApplyPath(rootFull, file.RelativePath);
                         Directory.CreateDirectory(Path.GetDirectoryName(target));
                         File.WriteAllBytes(target, file.Bytes);
                         filesWritten++;
@@ -380,7 +436,7 @@ namespace TCAMultiplayer.Compatibility
 
                     foreach (var relative in deletions)
                     {
-                        string target = ResolveSafePath(rootFull, relative);
+                        string target = ResolveModsSafePath(rootFull, relative);
                         if (File.Exists(target))
                         {
                             File.Delete(target);
@@ -388,8 +444,9 @@ namespace TCAMultiplayer.Compatibility
                         }
                     }
 
+                    var disabledExternalMods = DisableExternalModsForDeletedPaths(deletions, rootFull);
                     var hostManifest = Deserialize(hostManifestData);
-                    var localManifest = Collect();
+                    var localManifest = Collect(disabledExternalMods.DestinationFolders);
                     var remaining = localManifest.CompareTo(hostManifest);
                     if (!remaining.IsCompatible)
                         return SyncApplyResult.Failed("Local mods still differ after sync");
@@ -412,6 +469,8 @@ namespace TCAMultiplayer.Compatibility
 
         public static bool IsAllowedSyncPath(string path, long size)
         {
+            if (IsModLoadOrderPath(path))
+                return size >= 0 && size <= MaxMetadataFileBytes;
             if (!IsAllowedManifestPath(path))
                 return false;
             if (size < 0 || size > MaxSyncFileBytes)
@@ -425,6 +484,9 @@ namespace TCAMultiplayer.Compatibility
         {
             if (string.IsNullOrWhiteSpace(path))
                 return false;
+            path = NormalizeManifestPath(path);
+            if (IsModLoadOrderPath(path))
+                return true;
             if (Path.IsPathRooted(path))
                 return false;
             if (path.IndexOf(':') >= 0)
@@ -436,6 +498,68 @@ namespace TCAMultiplayer.Compatibility
             // files out while allowing normal TCA mod data, metadata, audio,
             // images, and Unity asset payloads such as "assets<mod name>".
             return path.Split('/').Length >= 2;
+        }
+
+        private static void AddFileEntry(
+            ModFileManifest manifest,
+            HashSet<string> seenPaths,
+            string sourceRootFull,
+            string sourcePath,
+            string destinationFolder)
+        {
+            string relativePath = GetSafeRelativePath(sourceRootFull, sourcePath);
+            if (!string.IsNullOrWhiteSpace(destinationFolder))
+                relativePath = NormalizeManifestPath(destinationFolder + "/" + relativePath);
+
+            if (!IsAllowedManifestPath(relativePath))
+                return;
+
+            var info = new FileInfo(sourcePath);
+            var entry = new ModFileEntry
+            {
+                Path = relativePath,
+                Size = info.Length,
+                Sha256 = ComputeFileHash(sourcePath),
+                SyncAllowed = IsAllowedSyncPath(relativePath, info.Length),
+                SourcePath = sourcePath
+            };
+            AddEntry(manifest, seenPaths, entry);
+        }
+
+        private static void AddModLoadOrder(ModFileManifest manifest, HashSet<string> seenPaths)
+        {
+            string loadOrderPath = ModLoadOrderPath;
+            if (string.IsNullOrWhiteSpace(loadOrderPath) || !File.Exists(loadOrderPath))
+                return;
+
+            try
+            {
+                var info = new FileInfo(loadOrderPath);
+                var entry = new ModFileEntry
+                {
+                    Path = ModLoadOrderFileName,
+                    Size = info.Length,
+                    Sha256 = ComputeModLoadOrderHash(loadOrderPath),
+                    SyncAllowed = IsAllowedSyncPath(ModLoadOrderFileName, info.Length),
+                    SourcePath = loadOrderPath
+                };
+                AddEntry(manifest, seenPaths, entry);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"Skipping {ModLoadOrderFileName}: {ex.Message}");
+            }
+        }
+
+        private static void AddEntry(
+            ModFileManifest manifest,
+            HashSet<string> seenPaths,
+            ModFileEntry entry)
+        {
+            entry.Path = NormalizeManifestPath(entry.Path);
+            if (!seenPaths.Add(entry.Path))
+                return;
+            manifest.Files.Add(entry);
         }
 
         private static string GetSafeRelativePath(string rootFull, string fullPath)
@@ -454,10 +578,183 @@ namespace TCAMultiplayer.Compatibility
             return path;
         }
 
-        private static string ResolveSafePath(string rootFull, string relativePath)
+        private static string ResolveSourcePath(string modsRootFull, ModFileEntry file)
+        {
+            if (file == null)
+                throw new ArgumentNullException(nameof(file));
+            if (IsModLoadOrderPath(file.Path))
+            {
+                string path = ModLoadOrderPath;
+                if (string.IsNullOrWhiteSpace(path))
+                    throw new InvalidDataException($"{ModLoadOrderFileName} path is unavailable");
+                return path;
+            }
+            if (!string.IsNullOrWhiteSpace(file.SourcePath))
+                return Path.GetFullPath(file.SourcePath);
+            return ResolveModsSafePath(modsRootFull, file.Path);
+        }
+
+        private static string ResolveApplyPath(string modsRootFull, string relativePath)
         {
             relativePath = NormalizeManifestPath(relativePath);
-            if (!IsAllowedManifestPath(relativePath))
+            if (IsModLoadOrderPath(relativePath))
+            {
+                string path = ModLoadOrderPath;
+                if (string.IsNullOrWhiteSpace(path))
+                    throw new InvalidDataException($"{ModLoadOrderFileName} path is unavailable");
+                return path;
+            }
+            return ResolveModsSafePath(modsRootFull, relativePath);
+        }
+
+        private static ExternalModDisablePlan DisableExternalModsForDeletedPaths(
+            IEnumerable<string> deletedRelativePaths,
+            string modsRootFull)
+        {
+            var plan = BuildExternalModDisablePlan(deletedRelativePaths, modsRootFull);
+            if (plan.ModNames.Count == 0)
+                return plan;
+
+            string loadOrderPath = ModLoadOrderPath;
+            if (string.IsNullOrWhiteSpace(loadOrderPath))
+                return plan;
+
+            if (!TryReadModLoadOrder(loadOrderPath, out var loadOrder))
+                return plan;
+
+            bool changed = false;
+            foreach (string modName in plan.ModNames)
+            {
+                if (string.IsNullOrWhiteSpace(modName))
+                    continue;
+
+                var entry = loadOrder.Mods
+                    .FirstOrDefault(mod => mod != null && string.Equals(mod.Name, modName, StringComparison.Ordinal));
+                if (entry == null)
+                {
+                    loadOrder.Mods.Add(new ModLoadOrder.LoadableMod
+                    {
+                        Name = modName,
+                        IsEnabled = false
+                    });
+                    plan.EntriesChanged++;
+                    changed = true;
+                }
+                else if (entry.IsEnabled)
+                {
+                    entry.IsEnabled = false;
+                    plan.EntriesChanged++;
+                    changed = true;
+                }
+            }
+
+            if (!changed)
+                return plan;
+
+            string loadOrderDirectory = Path.GetDirectoryName(loadOrderPath);
+            if (!string.IsNullOrWhiteSpace(loadOrderDirectory))
+                Directory.CreateDirectory(loadOrderDirectory);
+            File.WriteAllText(loadOrderPath, SerializeModLoadOrder(loadOrder));
+            Log.Info(Tag, $"Disabled {plan.EntriesChanged} extra Workshop mod(s) in {ModLoadOrderFileName}");
+            return plan;
+        }
+
+        private static ExternalModDisablePlan BuildExternalModDisablePlan(
+            IEnumerable<string> deletedRelativePaths,
+            string modsRootFull)
+        {
+            var plan = new ExternalModDisablePlan();
+            var deletedTopFolders = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string relativePath in deletedRelativePaths ?? Enumerable.Empty<string>())
+            {
+                string topFolder = GetTopLevelManifestFolder(relativePath);
+                if (!string.IsNullOrWhiteSpace(topFolder))
+                    deletedTopFolders.Add(topFolder);
+            }
+
+            if (deletedTopFolders.Count == 0)
+                return plan;
+
+            foreach (var source in ResolveExternalModSourcesSafely(modsRootFull))
+            {
+                if (source == null || string.IsNullOrWhiteSpace(source.DestinationFolder))
+                    continue;
+
+                string destinationFolder = NormalizeManifestPath(source.DestinationFolder);
+                if (!deletedTopFolders.Contains(destinationFolder))
+                    continue;
+
+                string sourceRootFull = null;
+                try
+                {
+                    sourceRootFull = string.IsNullOrWhiteSpace(source.SourceRoot)
+                        ? null
+                        : Path.GetFullPath(source.SourceRoot);
+                }
+                catch
+                {
+                }
+
+                if (string.IsNullOrWhiteSpace(sourceRootFull)
+                    || !Directory.Exists(sourceRootFull)
+                    || (!string.IsNullOrWhiteSpace(modsRootFull) && IsSameOrUnder(sourceRootFull, modsRootFull)))
+                {
+                    continue;
+                }
+
+                plan.DestinationFolders.Add(destinationFolder);
+                string modName = !string.IsNullOrWhiteSpace(source.ModName)
+                    ? source.ModName
+                    : TryReadModName(sourceRootFull);
+                if (!string.IsNullOrWhiteSpace(modName))
+                    plan.ModNames.Add(modName);
+            }
+
+            return plan;
+        }
+
+        private static IEnumerable<ExternalModSource> ResolveExternalModSourcesSafely(string modsRootFull)
+        {
+            try
+            {
+                return ExternalModSourceResolver?.Invoke(modsRootFull) ?? Enumerable.Empty<ExternalModSource>();
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"Could not enumerate loaded Workshop mods: {ex.Message}");
+                return Enumerable.Empty<ExternalModSource>();
+            }
+        }
+
+        private static string GetTopLevelManifestFolder(string relativePath)
+        {
+            relativePath = NormalizeManifestPath(relativePath);
+            int slash = relativePath.IndexOf('/');
+            return slash <= 0 ? null : relativePath.Substring(0, slash);
+        }
+
+        private static string TryReadModName(string sourceRootFull)
+        {
+            try
+            {
+                string modDefinitionPath = Path.Combine(sourceRootFull, "Mod.json");
+                if (!File.Exists(modDefinitionPath))
+                    return null;
+
+                return TryReadJsonStringProperty(File.ReadAllText(modDefinitionPath), "Name", out string name)
+                    ? name
+                    : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string ResolveModsSafePath(string rootFull, string relativePath)
+        {
+            relativePath = NormalizeManifestPath(relativePath);
+            if (!IsAllowedManifestPath(relativePath) || IsModLoadOrderPath(relativePath))
                 throw new InvalidDataException($"Unsafe mod path '{relativePath}'");
 
             string target = Path.GetFullPath(Path.Combine(rootFull, relativePath.Replace('/', Path.DirectorySeparatorChar)));
@@ -483,7 +780,18 @@ namespace TCAMultiplayer.Compatibility
 
             Directory.CreateDirectory(target);
             CopyDirectory(rootFull, target);
+            CopyModLoadOrderToBackup(target);
             return target;
+        }
+
+        private static void CopyModLoadOrderToBackup(string backupPath)
+        {
+            string loadOrderPath = ModLoadOrderPath;
+            if (string.IsNullOrWhiteSpace(loadOrderPath) || !File.Exists(loadOrderPath))
+                return;
+
+            string target = Path.Combine(backupPath, ModLoadOrderFileName);
+            File.Copy(loadOrderPath, target, overwrite: false);
         }
 
         private static string GetGameRootFromModsRoot(string rootFull)
@@ -537,6 +845,258 @@ namespace TCAMultiplayer.Compatibility
             }
         }
 
+        private static string ComputeModLoadOrderHash(string path)
+        {
+            if (!TryReadModLoadOrder(path, out var loadOrder))
+                return ComputeFileHash(path);
+
+            var sb = new StringBuilder();
+            sb.Append("enabled-order-v1\n");
+            if (loadOrder.Mods != null)
+            {
+                foreach (var mod in loadOrder.Mods)
+                {
+                    if (mod == null || !mod.IsEnabled || string.IsNullOrWhiteSpace(mod.Name))
+                        continue;
+                    sb.Append(mod.Name).Append('\n');
+                }
+            }
+
+            return ComputeManifestHash(Encoding.UTF8.GetBytes(sb.ToString()));
+        }
+
+        private static bool TryReadModLoadOrder(string path, out ModLoadOrder loadOrder)
+        {
+            loadOrder = new ModLoadOrder();
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                    return true;
+
+                string json = File.ReadAllText(path);
+                if (string.IsNullOrWhiteSpace(json))
+                    return true;
+
+                return TryParseModLoadOrder(json, out loadOrder);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"Could not parse {ModLoadOrderFileName}: {ex.Message}");
+                loadOrder = new ModLoadOrder();
+                return false;
+            }
+        }
+
+        private static bool TryParseModLoadOrder(string json, out ModLoadOrder loadOrder)
+        {
+            loadOrder = new ModLoadOrder();
+            if (loadOrder.Mods == null)
+                loadOrder.Mods = new List<ModLoadOrder.LoadableMod>();
+
+            if (string.IsNullOrWhiteSpace(json))
+                return true;
+            if (!TryGetJsonArrayBody(json, "Mods", out string modsBody))
+                return false;
+
+            foreach (Match match in Regex.Matches(modsBody, @"\{[^{}]*\}"))
+            {
+                string entryJson = match.Value;
+                TryReadJsonStringProperty(entryJson, "Name", out string name);
+                bool isEnabled = true;
+                TryReadJsonBoolProperty(entryJson, "IsEnabled", out isEnabled);
+
+                loadOrder.Mods.Add(new ModLoadOrder.LoadableMod
+                {
+                    Name = name ?? "",
+                    IsEnabled = isEnabled
+                });
+            }
+
+            return true;
+        }
+
+        private static string SerializeModLoadOrder(ModLoadOrder loadOrder)
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("{");
+            sb.AppendLine("  \"Mods\": [");
+            var mods = loadOrder?.Mods ?? new List<ModLoadOrder.LoadableMod>();
+            for (int i = 0; i < mods.Count; i++)
+            {
+                var mod = mods[i] ?? new ModLoadOrder.LoadableMod();
+                sb.AppendLine("    {");
+                sb.Append("      \"Name\": ");
+                AppendJsonString(sb, mod.Name ?? "");
+                sb.AppendLine(",");
+                sb.Append("      \"IsEnabled\": ");
+                sb.AppendLine(mod.IsEnabled ? "true" : "false");
+                sb.Append("    }");
+                if (i < mods.Count - 1)
+                    sb.Append(",");
+                sb.AppendLine();
+            }
+            sb.AppendLine("  ]");
+            sb.AppendLine("}");
+            return sb.ToString();
+        }
+
+        private static bool TryGetJsonArrayBody(string json, string propertyName, out string body)
+        {
+            body = null;
+            var match = Regex.Match(json ?? "", "\"" + Regex.Escape(propertyName) + "\"\\s*:");
+            if (!match.Success)
+                return false;
+
+            int start = json.IndexOf('[', match.Index + match.Length);
+            if (start < 0)
+                return false;
+
+            bool inString = false;
+            bool escaped = false;
+            int depth = 0;
+            for (int i = start; i < json.Length; i++)
+            {
+                char c = json[i];
+                if (inString)
+                {
+                    if (escaped)
+                    {
+                        escaped = false;
+                    }
+                    else if (c == '\\')
+                    {
+                        escaped = true;
+                    }
+                    else if (c == '"')
+                    {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (c == '"')
+                {
+                    inString = true;
+                    continue;
+                }
+                if (c == '[')
+                {
+                    depth++;
+                    continue;
+                }
+                if (c == ']')
+                {
+                    depth--;
+                    if (depth == 0)
+                    {
+                        body = json.Substring(start + 1, i - start - 1);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryReadJsonStringProperty(string json, string propertyName, out string value)
+        {
+            value = null;
+            var match = Regex.Match(
+                json ?? "",
+                "\"" + Regex.Escape(propertyName) + "\"\\s*:\\s*\"((?:\\\\.|[^\"\\\\])*)\"");
+            if (!match.Success)
+                return false;
+
+            value = UnescapeJsonString(match.Groups[1].Value);
+            return true;
+        }
+
+        private static bool TryReadJsonBoolProperty(string json, string propertyName, out bool value)
+        {
+            value = false;
+            var match = Regex.Match(
+                json ?? "",
+                "\"" + Regex.Escape(propertyName) + "\"\\s*:\\s*(true|false)",
+                RegexOptions.IgnoreCase);
+            if (!match.Success)
+                return false;
+
+            value = string.Equals(match.Groups[1].Value, "true", StringComparison.OrdinalIgnoreCase);
+            return true;
+        }
+
+        private static void AppendJsonString(StringBuilder sb, string value)
+        {
+            sb.Append('"');
+            foreach (char c in value ?? "")
+            {
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (c < ' ')
+                            sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else
+                            sb.Append(c);
+                        break;
+                }
+            }
+            sb.Append('"');
+        }
+
+        private static string UnescapeJsonString(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.IndexOf('\\') < 0)
+                return value ?? "";
+
+            var sb = new StringBuilder(value.Length);
+            for (int i = 0; i < value.Length; i++)
+            {
+                char c = value[i];
+                if (c != '\\' || i + 1 >= value.Length)
+                {
+                    sb.Append(c);
+                    continue;
+                }
+
+                char escaped = value[++i];
+                switch (escaped)
+                {
+                    case '"': sb.Append('"'); break;
+                    case '\\': sb.Append('\\'); break;
+                    case '/': sb.Append('/'); break;
+                    case 'b': sb.Append('\b'); break;
+                    case 'f': sb.Append('\f'); break;
+                    case 'n': sb.Append('\n'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case 't': sb.Append('\t'); break;
+                    case 'u':
+                        if (i + 4 < value.Length
+                            && int.TryParse(
+                                value.Substring(i + 1, 4),
+                                System.Globalization.NumberStyles.HexNumber,
+                                System.Globalization.CultureInfo.InvariantCulture,
+                                out int codePoint))
+                        {
+                            sb.Append((char)codePoint);
+                            i += 4;
+                        }
+                        break;
+                    default:
+                        sb.Append(escaped);
+                        break;
+                }
+            }
+
+            return sb.ToString();
+        }
+
         private static string ComputeManifestHash(byte[] data)
         {
             using (var sha = SHA256.Create())
@@ -559,6 +1119,7 @@ namespace TCAMultiplayer.Compatibility
             public string Sha256;
             public long Size;
             public bool SyncAllowed;
+            internal string SourcePath;
         }
 
         public sealed class ModManifestDiff
@@ -602,6 +1163,171 @@ namespace TCAMultiplayer.Compatibility
         {
             public string RelativePath;
             public byte[] Bytes;
+        }
+
+        private sealed class ExternalModDisablePlan
+        {
+            public HashSet<string> DestinationFolders { get; } = new HashSet<string>(StringComparer.Ordinal);
+            public HashSet<string> ModNames { get; } = new HashSet<string>(StringComparer.Ordinal);
+            public int EntriesChanged;
+        }
+
+        internal sealed class ExternalModSource
+        {
+            public string SourceRoot;
+            public string DestinationFolder;
+            public string ModName;
+        }
+
+        private static string GetModsRoot()
+        {
+            string gameRoot = GetGameRoot();
+            return string.IsNullOrWhiteSpace(gameRoot) ? null : Path.Combine(gameRoot, "Mods");
+        }
+
+        private static string ModLoadOrderPath
+        {
+            get
+            {
+                string gameRoot = GetGameRoot();
+                return string.IsNullOrWhiteSpace(gameRoot)
+                    ? null
+                    : Path.Combine(gameRoot, ModLoadOrderFileName);
+            }
+        }
+
+        private static string GetGameRoot()
+        {
+            try
+            {
+                return GameRootResolver?.Invoke();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string ResolveGameRootPath()
+        {
+            try
+            {
+                string gameRoot = Paths.GameRootPath;
+                if (!string.IsNullOrWhiteSpace(gameRoot))
+                    return gameRoot;
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                string cwd = Environment.CurrentDirectory;
+                return string.IsNullOrWhiteSpace(cwd) ? null : cwd;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static IEnumerable<ExternalModSource> ResolveLoadedGameModSources(string modsRootFull)
+        {
+            var result = new List<ExternalModSource>();
+            try
+            {
+                foreach (var mod in GameData.Mods)
+                {
+                    if (mod == null || mod.Paths == null || mod.Definition == null)
+                        continue;
+                    if (!mod.IsEnabled)
+                        continue;
+
+                    string sourceRoot = mod.Paths.BasePath;
+                    if (string.IsNullOrWhiteSpace(sourceRoot) || !Directory.Exists(sourceRoot))
+                        continue;
+                    if (!string.IsNullOrWhiteSpace(modsRootFull) && IsSameOrUnder(sourceRoot, modsRootFull))
+                        continue;
+
+                    string destinationFolder = GetDestinationFolderForLoadedMod(mod);
+                    if (string.IsNullOrWhiteSpace(destinationFolder))
+                        continue;
+
+                    result.Add(new ExternalModSource
+                    {
+                        SourceRoot = sourceRoot,
+                        DestinationFolder = destinationFolder,
+                        ModName = mod.Definition.Name
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"Loaded Workshop mod enumeration failed: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        private static string GetDestinationFolderForLoadedMod(GameMod mod)
+        {
+            if (mod.Definition.Id != 0)
+                return mod.Definition.Id.ToString();
+
+            string name = mod.Definition.Name;
+            if (string.IsNullOrWhiteSpace(name) && mod.Paths != null)
+                name = new DirectoryInfo(mod.Paths.BasePath).Name;
+            return SanitizeFolderName(name);
+        }
+
+        private static string SanitizeFolderName(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return null;
+
+            var invalid = Path.GetInvalidFileNameChars();
+            var sb = new StringBuilder(value.Length);
+            foreach (char c in value.Trim())
+            {
+                if (invalid.Contains(c) || c == '/' || c == '\\' || c == ':')
+                    sb.Append('_');
+                else
+                    sb.Append(c);
+            }
+
+            string result = sb.ToString().Trim('.', ' ');
+            if (result.Length > 96)
+                result = result.Substring(0, 96).Trim('.', ' ');
+            return string.IsNullOrWhiteSpace(result) ? null : result;
+        }
+
+        private static bool IsSafePathSegment(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                return false;
+            if (value == "." || value == "..")
+                return false;
+            if (value.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+                return false;
+            return value.IndexOf('/') < 0 && value.IndexOf('\\') < 0 && value.IndexOf(':') < 0;
+        }
+
+        private static bool IsModLoadOrderPath(string path)
+        {
+            return string.Equals(NormalizeManifestPath(path), ModLoadOrderFileName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsSameOrUnder(string path, string root)
+        {
+            if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(root))
+                return false;
+
+            string fullPath = Path.GetFullPath(path);
+            string fullRoot = AppendDirectorySeparator(Path.GetFullPath(root));
+            return fullPath.StartsWith(fullRoot, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    fullRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                    StringComparison.OrdinalIgnoreCase);
         }
     }
 }

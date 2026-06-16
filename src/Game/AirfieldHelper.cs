@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Reflection;
 using UnityEngine;
@@ -21,8 +22,13 @@ namespace TCAMultiplayer.Game
         private static PropertyInfo _loadedMapProp;
         private static MethodInfo _getAirfieldByNameMethod;
         private static FieldInfo _displayNameField;
+        private static FieldInfo _runwaysField;
+        private static FieldInfo _rampSpawnsField;
         private static MethodInfo _getRunwaySpawnMethod;
+        private static MethodInfo _getRunwaySpawnIndexedMethod;
         private static MethodInfo _getRampSpawnMethod;
+        private static MethodInfo _getRampSpawnTransformMethod;
+        private static MethodInfo _getMultipleLineUpPointsMethod;
         
         private static bool _initialized = false;
         
@@ -49,10 +55,17 @@ namespace TCAMultiplayer.Game
                 if (_airfield2Type != null)
                 {
                     _displayNameField = _airfield2Type.GetField("DisplayName", flags);
+                    _runwaysField = _airfield2Type.GetField("Runways", flags);
+                    _rampSpawnsField = _airfield2Type.GetField("RampSpawns", flags);
                     _getRunwaySpawnMethod = _airfield2Type.GetMethod("GetRunwaySpawn", flags, null, new Type[0], null);
+                    _getRunwaySpawnIndexedMethod = _airfield2Type.GetMethod("GetRunwaySpawn", flags, null, new[] { typeof(int) }, null);
                     _getRampSpawnMethod = _airfield2Type.GetMethod("GetRampSpawn", flags, null, new Type[0], null);
+                    _getRampSpawnTransformMethod = _airfield2Type.GetMethod("GetRampSpawnTransform", flags, null, new[] { typeof(int) }, null);
+
+                    var runwayType = Type.GetType("Falcon.Game2.Airfields.Runway, Assembly-CSharp");
+                    _getMultipleLineUpPointsMethod = runwayType?.GetMethod("GetMultipleLineUpPoints", flags, null, new[] { typeof(int) }, null);
                     
-                    Log.Info(Tag, $"[AirfieldHelper] Airfield2 type found: DisplayName={_displayNameField != null}, GetRunwaySpawn={_getRunwaySpawnMethod != null}");
+                    Log.Info(Tag, $"[AirfieldHelper] Airfield2 type found: DisplayName={_displayNameField != null}, GetRunwaySpawn={_getRunwaySpawnMethod != null}, GetRunwaySpawn(int)={_getRunwaySpawnIndexedMethod != null}, RampSpawns={_rampSpawnsField != null}");
                 }
                 else
                 {
@@ -203,13 +216,36 @@ namespace TCAMultiplayer.Game
             try
             {
                 // includeInactive=true is important during async scene load/spawn phases.
-                return UnityEngine.Object.FindObjectsOfType(_airfield2Type, includeInactive) as Component[];
+                var inactiveMode = includeInactive
+                    ? FindObjectsInactive.Include
+                    : FindObjectsInactive.Exclude;
+                var results = UnityEngine.Object.FindObjectsByType(
+                    _airfield2Type,
+                    inactiveMode,
+                    FindObjectsSortMode.None);
+                return ToComponents(results);
             }
             catch
             {
-                // Fallback for Unity variants without the includeInactive overload.
-                return UnityEngine.Object.FindObjectsOfType(_airfield2Type) as Component[];
+                var results = UnityEngine.Object.FindObjectsByType(
+                    _airfield2Type,
+                    FindObjectsSortMode.None);
+                return ToComponents(results);
             }
+        }
+
+        private static Component[] ToComponents(UnityEngine.Object[] objects)
+        {
+            if (objects == null || objects.Length == 0)
+                return new Component[0];
+
+            var components = new List<Component>(objects.Length);
+            foreach (var obj in objects)
+            {
+                if (obj is Component component && component != null)
+                    components.Add(component);
+            }
+            return components.ToArray();
         }
         
         /// <summary>
@@ -440,16 +476,40 @@ namespace TCAMultiplayer.Game
         /// </summary>
         public static (Vector3 position, Quaternion rotation) GetSpawnPoint(string airfieldName, Core.LobbySpawnType spawnType)
         {
+            return TryGetSpawnPoint(airfieldName, spawnType, out var position, out var rotation)
+                ? (position, rotation)
+                : (Vector3.zero, Quaternion.identity);
+        }
+
+        public static bool TryGetSpawnPoint(
+            string airfieldName,
+            Core.LobbySpawnType spawnType,
+            out Vector3 position,
+            out Quaternion rotation)
+        {
+            return TryGetSpawnPoint(airfieldName, spawnType, 0, 1, out position, out rotation);
+        }
+
+        public static bool TryGetSpawnPoint(
+            string airfieldName,
+            Core.LobbySpawnType spawnType,
+            int spawnSlot,
+            int spawnCount,
+            out Vector3 position,
+            out Quaternion rotation)
+        {
             Initialize();
-            
+
             var airfield = GetAirfield(airfieldName);
             if (airfield == null)
             {
                 Log.Warning(Tag, $"[AirfieldHelper] Airfield not found: {airfieldName}");
-                return (Vector3.zero, Quaternion.identity);
+                position = Vector3.zero;
+                rotation = Quaternion.identity;
+                return false;
             }
-            
-            return GetSpawnPoint(airfield, spawnType);
+
+            return TryGetSpawnPoint(airfield, spawnType, spawnSlot, spawnCount, out position, out rotation);
         }
         
         /// <summary>
@@ -457,57 +517,78 @@ namespace TCAMultiplayer.Game
         /// </summary>
         public static (Vector3 position, Quaternion rotation) GetSpawnPoint(object airfield, Core.LobbySpawnType spawnType)
         {
-            if (airfield == null) return (Vector3.zero, Quaternion.identity);
+            return TryGetSpawnPoint(airfield, spawnType, out var position, out var rotation)
+                ? (position, rotation)
+                : (Vector3.zero, Quaternion.identity);
+        }
+
+        public static bool TryGetSpawnPoint(
+            object airfield,
+            Core.LobbySpawnType spawnType,
+            out Vector3 position,
+            out Quaternion rotation)
+        {
+            return TryGetSpawnPoint(airfield, spawnType, 0, 1, out position, out rotation);
+        }
+
+        public static bool TryGetSpawnPoint(
+            object airfield,
+            Core.LobbySpawnType spawnType,
+            int spawnSlot,
+            int spawnCount,
+            out Vector3 position,
+            out Quaternion rotation)
+        {
+            position = Vector3.zero;
+            rotation = Quaternion.identity;
+            if (airfield == null) return false;
             
             try
             {
-                MethodInfo spawnMethod = null;
-                
-                switch (spawnType)
+                spawnSlot = Mathf.Max(0, spawnSlot);
+                spawnCount = Mathf.Max(1, spawnCount);
+
+                if (spawnType == Core.LobbySpawnType.Ramp)
                 {
-                    case Core.LobbySpawnType.InAir:
-                    case Core.LobbySpawnType.Runway:
-                        spawnMethod = _getRunwaySpawnMethod;
-                        break;
+                    if (TryGetRampSpawnPoint(airfield, spawnSlot, out position, out rotation))
+                        return true;
+
+                    Log.Warning(Tag, $"[AirfieldHelper] Ramp slot {spawnSlot} unavailable; falling back to runway line-up");
                 }
-                
-                if (spawnMethod == null)
+
+                if (TryGetRunwaySpawnPoint(airfield, spawnSlot, spawnCount, out position, out rotation))
                 {
-                    Log.Warning(Tag, "[AirfieldHelper] Spawn method not found");
-                    
-                    // Fallback to airfield transform
-                    if (airfield is Component comp)
+                    if (spawnType == Core.LobbySpawnType.InAir)
                     {
-                        return (comp.transform.position, comp.transform.rotation);
+                        position += Vector3.up * 300f;
+                        position -= rotation * Vector3.forward * 2000f;
                     }
-                    return (Vector3.zero, Quaternion.identity);
+
+                    return true;
                 }
-                
-                // Call GetRunwaySpawn or GetRampSpawn - returns ValueTuple<Vector3, Quaternion>
-                var result = spawnMethod.Invoke(airfield, null);
-                
-                if (result != null)
+
+                MethodInfo spawnMethod = spawnType == Core.LobbySpawnType.Ramp
+                    ? _getRampSpawnMethod
+                    : _getRunwaySpawnMethod;
+                if (TryInvokeSpawnTuple(spawnMethod, airfield, null, out position, out rotation))
                 {
-                    // Handle ValueTuple<Vector3, Quaternion>
-                    var tupleType = result.GetType();
-                    var item1Field = tupleType.GetField("Item1");
-                    var item2Field = tupleType.GetField("Item2");
-                    
-                    if (item1Field != null && item2Field != null)
+                    if (spawnType == Core.LobbySpawnType.InAir)
                     {
-                        Vector3 position = (Vector3)item1Field.GetValue(result);
-                        Quaternion rotation = (Quaternion)item2Field.GetValue(result);
-                        
-                        // For Air spawn, adjust position
-                        if (spawnType == Core.LobbySpawnType.InAir)
-                        {
-                            // 300m above, 2000m behind (same as game's logic)
-                            position += Vector3.up * 300f;
-                            position -= rotation * Vector3.forward * 2000f;
-                        }
-                        
-                        return (position, rotation);
+                        position += Vector3.up * 300f;
+                        position -= rotation * Vector3.forward * 2000f;
                     }
+
+                    return true;
+                }
+
+                Log.Warning(Tag, "[AirfieldHelper] Spawn method not found");
+
+                // Air starts can tolerate a generic transform fallback; ground starts must use native slots.
+                if (spawnType == Core.LobbySpawnType.InAir && airfield is Component comp)
+                {
+                    position = comp.transform.position;
+                    rotation = comp.transform.rotation;
+                    return true;
                 }
             }
             catch (Exception ex)
@@ -515,14 +596,16 @@ namespace TCAMultiplayer.Game
                 Log.Error(Tag, $"[AirfieldHelper] GetSpawnPoint error: {ex.Message}");
             }
             
-            // Fallback
-            if (airfield is Component comp2 && comp2 != null)
+            // Fallback only for air starts. Ground/ramp callers should fail instead of spawning off surface.
+            if (spawnType == Core.LobbySpawnType.InAir && airfield is Component comp2 && comp2 != null)
             {
                 try
                 {
                     if (comp2.gameObject != null)
                     {
-                        return (comp2.transform.position, comp2.transform.rotation);
+                        position = comp2.transform.position;
+                        rotation = comp2.transform.rotation;
+                        return true;
                     }
                 }
                 catch
@@ -531,7 +614,143 @@ namespace TCAMultiplayer.Game
                 }
             }
             
-            return (Vector3.zero, Quaternion.identity);
+            return false;
+        }
+
+        private static bool TryGetRunwaySpawnPoint(
+            object airfield,
+            int spawnSlot,
+            int spawnCount,
+            out Vector3 position,
+            out Quaternion rotation)
+        {
+            position = Vector3.zero;
+            rotation = Quaternion.identity;
+
+            if (TryGetRunwayLineUpPoint(airfield, spawnSlot, spawnCount, out position, out rotation))
+                return true;
+
+            int runwayCount = GetListCount(_runwaysField?.GetValue(airfield));
+            int runwayIndex = runwayCount > 0 ? spawnSlot % runwayCount : spawnSlot;
+            if (TryInvokeSpawnTuple(_getRunwaySpawnIndexedMethod, airfield, new object[] { runwayIndex }, out position, out rotation))
+                return true;
+
+            return TryInvokeSpawnTuple(_getRunwaySpawnMethod, airfield, null, out position, out rotation);
+        }
+
+        private static bool TryGetRunwayLineUpPoint(
+            object airfield,
+            int spawnSlot,
+            int spawnCount,
+            out Vector3 position,
+            out Quaternion rotation)
+        {
+            position = Vector3.zero;
+            rotation = Quaternion.identity;
+
+            if (spawnCount <= 1)
+                return false;
+            if (_runwaysField == null || _getMultipleLineUpPointsMethod == null)
+                return false;
+
+            var runways = _runwaysField.GetValue(airfield) as IList;
+            if (runways == null || runways.Count == 0)
+                return false;
+
+            int runwayIndex = spawnSlot % runways.Count;
+            int localSlot = spawnSlot / runways.Count;
+            int localCount = Mathf.Max(localSlot + 1, Mathf.CeilToInt(spawnCount / (float)runways.Count));
+            object runway = runways[runwayIndex];
+            if (runway == null)
+                return false;
+
+            try
+            {
+                var result = _getMultipleLineUpPointsMethod.Invoke(runway, new object[] { localCount });
+                if (!(result is Vector3[] points) || localSlot >= points.Length)
+                    return false;
+
+                position = points[localSlot];
+                if (runway is Component comp && comp != null)
+                {
+                    rotation = comp.transform.rotation;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"[AirfieldHelper] Runway line-up spawn failed: {ex.Message}");
+            }
+
+            return false;
+        }
+
+        private static bool TryGetRampSpawnPoint(
+            object airfield,
+            int spawnSlot,
+            out Vector3 position,
+            out Quaternion rotation)
+        {
+            position = Vector3.zero;
+            rotation = Quaternion.identity;
+
+            var rampSpawns = _rampSpawnsField?.GetValue(airfield) as IList;
+            int rampCount = GetListCount(rampSpawns);
+            if (rampCount <= 0 || spawnSlot >= rampCount)
+                return false;
+
+            if (TryInvokeSpawnTuple(_getRampSpawnTransformMethod, airfield, new object[] { spawnSlot }, out position, out rotation))
+                return true;
+
+            if (rampSpawns[spawnSlot] is Transform spawnTransform && spawnTransform != null)
+            {
+                position = spawnTransform.position;
+                rotation = spawnTransform.rotation;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryInvokeSpawnTuple(
+            MethodInfo method,
+            object target,
+            object[] args,
+            out Vector3 position,
+            out Quaternion rotation)
+        {
+            position = Vector3.zero;
+            rotation = Quaternion.identity;
+            if (method == null || target == null)
+                return false;
+
+            object result;
+            try
+            {
+                result = method.Invoke(target, args);
+                if (result == null)
+                    return false;
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"[AirfieldHelper] Native spawn method '{method.Name}' failed: {ex.Message}");
+                return false;
+            }
+
+            var tupleType = result.GetType();
+            var item1Field = tupleType.GetField("Item1");
+            var item2Field = tupleType.GetField("Item2");
+            if (item1Field == null || item2Field == null)
+                return false;
+
+            position = (Vector3)item1Field.GetValue(result);
+            rotation = (Quaternion)item2Field.GetValue(result);
+            return true;
+        }
+
+        private static int GetListCount(object value)
+        {
+            return value is IList list ? list.Count : 0;
         }
         
         /// <summary>

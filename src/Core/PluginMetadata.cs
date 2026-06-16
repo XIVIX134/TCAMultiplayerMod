@@ -4,6 +4,6 @@ namespace TCAMultiplayer.Core
     {
         public const string Guid = "com.tcamp.mod";
         public const string Name = "TCAMP";
-        public const string Version = "0.2.3";
+        public const string Version = "0.2.4";
     }
 }

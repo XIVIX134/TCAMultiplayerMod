@@ -9,6 +9,7 @@ using UnityEngine;
 using UnityEngine.EventSystems;
 using UnityEngine.UI;
 using TCAMultiplayer.Core;
+using TCAMultiplayer.Game;
 
 namespace TCAMultiplayer.UI
 {
@@ -842,8 +843,14 @@ namespace TCAMultiplayer.UI
             if (selectableAircraft == null || selectableAircraft.Count == 0)
                 selectableAircraft = new List<string> { aircraft };
 
+            aircraft = LoadoutHelper.ResolveAvailableAircraft(aircraft);
+            if (!selectableAircraft.Contains(aircraft))
+                selectableAircraft = LoadoutHelper.GetAircraftNames();
+            if (selectableAircraft == null || selectableAircraft.Count == 0)
+                selectableAircraft = new List<string> { aircraft };
             if (string.IsNullOrEmpty(aircraft))
                 aircraft = selectableAircraft[0];
+            loadout = LoadoutHelper.ResolveLoadoutForAircraft(aircraft, loadout);
 
             HideNestedLoadoutDialogs(dialog);
             var nestedSelector = GetPrivateField<MultiSelectDialog>(dialog, "MultiSelect");

@@ -114,6 +114,62 @@ namespace TCAMultiplayer.Game
                 return new List<string>();
             }
         }
+
+        public static bool IsAircraftAvailable(string aircraftName)
+        {
+            var aircraft = GetAircraftNames();
+            if (aircraft.Count == 0)
+                return !string.IsNullOrWhiteSpace(aircraftName);
+            return !string.IsNullOrWhiteSpace(FindInList(aircraft, aircraftName));
+        }
+
+        public static string ResolveAvailableAircraft(string preferred, string fallback = "AV8B")
+        {
+            var aircraft = GetAircraftNames();
+            if (aircraft.Count == 0)
+                return string.IsNullOrWhiteSpace(preferred) ? fallback : preferred;
+
+            string resolved = FindInList(aircraft, preferred);
+            if (!string.IsNullOrEmpty(resolved))
+                return resolved;
+
+            resolved = FindInList(aircraft, fallback);
+            if (!string.IsNullOrEmpty(resolved))
+                return resolved;
+
+            return aircraft[0];
+        }
+
+        public static string ResolveLoadoutForAircraft(string aircraftName, string preferredLoadout)
+        {
+            var loadouts = GetLoadoutNamesForAircraft(aircraftName);
+            if (loadouts.Count == 0)
+                return string.IsNullOrWhiteSpace(preferredLoadout) ? "Clean" : preferredLoadout;
+
+            string resolved = FindInList(loadouts, preferredLoadout);
+            if (!string.IsNullOrEmpty(resolved))
+                return resolved;
+
+            resolved = FindInList(loadouts, "Clean");
+            if (!string.IsNullOrEmpty(resolved))
+                return resolved;
+
+            return loadouts[0];
+        }
+
+        private static string FindInList(List<string> values, string value)
+        {
+            if (values == null || string.IsNullOrWhiteSpace(value))
+                return null;
+
+            for (int i = 0; i < values.Count; i++)
+            {
+                if (string.Equals(values[i], value, StringComparison.OrdinalIgnoreCase))
+                    return values[i];
+            }
+
+            return null;
+        }
         
         /// <summary>
         /// Get the display name for an aircraft (e.g., "F-16C Viper" instead of "F16C").

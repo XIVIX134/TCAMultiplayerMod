@@ -37,6 +37,16 @@ namespace TCAMultiplayer.Protocol
         public bool IsLoaded;
         public bool IsHost;
         public MultiplayerTeam Team;
+        public bool IsModsVerified;
+        public bool IsModSyncing;
+
+        /// <summary>
+        /// True when the sender included mod compatibility fields in this
+        /// lobby state. Older peers omit them, so receivers should preserve
+        /// their local compatibility state instead of treating omitted fields
+        /// as false.
+        /// </summary>
+        public bool HasModCompatibilityState;
     }
 
     /// <summary>

@@ -34,6 +34,7 @@ namespace TCAMultiplayer.Compatibility
         public event Action OnCompatibilityAccepted;
         public event Action<ModMismatchInfo> OnCompatibilityMismatch;
         public event Action<string> OnSyncStatus;
+        public event Action OnCompatibilityStateChanged;
 
         public ModManifestCollector(
             GameSession session,
@@ -168,8 +169,8 @@ namespace TCAMultiplayer.Compatibility
             if (player != null)
             {
                 player.IsModsVerified = isCompatible;
-                if (isCompatible)
-                    player.IsModSyncing = false;
+                player.IsModSyncing = false;
+                OnCompatibilityStateChanged?.Invoke();
             }
 
             if (isCompatible)
@@ -274,13 +275,19 @@ namespace TCAMultiplayer.Compatibility
 
             var player = _session.GetPlayer(fromPeerId);
             if (player != null)
+            {
                 player.IsModSyncing = true;
+                OnCompatibilityStateChanged?.Invoke();
+            }
 
             if (!_clientManifests.TryGetValue(fromPeerId, out var clientManifest))
             {
                 Log.Warning(Tag, $"Peer {fromPeerId} requested sync before sending a manifest");
                 if (player != null)
+                {
                     player.IsModSyncing = false;
+                    OnCompatibilityStateChanged?.Invoke();
+                }
                 return;
             }
 
@@ -292,7 +299,10 @@ namespace TCAMultiplayer.Compatibility
                     Log.Warning(Tag, $"Peer {fromPeerId} requested stale host manifest {packet.HostManifestHash}");
                     SendRejectedResult(fromPeerId, "Host mods changed. Try joining again.", hostManifest);
                     if (player != null)
+                    {
                         player.IsModSyncing = false;
+                        OnCompatibilityStateChanged?.Invoke();
+                    }
                     return;
                 }
 
@@ -303,7 +313,10 @@ namespace TCAMultiplayer.Compatibility
                         $"Mod files mismatch ({diff.ToSummary()}). Remove blocked files manually, then sync again.",
                         hostManifest);
                     if (player != null)
+                    {
                         player.IsModSyncing = false;
+                        OnCompatibilityStateChanged?.Invoke();
+                    }
                     return;
                 }
 
@@ -316,7 +329,10 @@ namespace TCAMultiplayer.Compatibility
                 Log.Warning(Tag, $"Failed to build sync package for peer {fromPeerId}: {ex.Message}");
                 SendRejectedResult(fromPeerId, $"Mod sync failed on host: {ex.Message}", ModFileManifest.Collect());
                 if (player != null)
+                {
                     player.IsModSyncing = false;
+                    OnCompatibilityStateChanged?.Invoke();
+                }
             }
         }
 
@@ -488,6 +504,7 @@ namespace TCAMultiplayer.Compatibility
             OnCompatibilityAccepted = null;
             OnCompatibilityMismatch = null;
             OnSyncStatus = null;
+            OnCompatibilityStateChanged = null;
             Log.Info(Tag, "Disposed");
         }
 

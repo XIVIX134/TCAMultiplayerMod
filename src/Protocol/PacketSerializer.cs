@@ -951,6 +951,15 @@ namespace TCAMultiplayer.Protocol
                 w.Write(packet.TeamCount);
                 w.Write(packet.Revision);
 
+                if (packet.Players != null)
+                {
+                    foreach (var player in packet.Players)
+                    {
+                        w.Write(player.IsModsVerified);
+                        w.Write(player.IsModSyncing);
+                    }
+                }
+
                 return ms.ToArray();
             }
         }
@@ -1014,6 +1023,16 @@ namespace TCAMultiplayer.Protocol
                     packet.TeamCount = r.ReadInt32();
                 if (r.BaseStream.Position + sizeof(uint) <= r.BaseStream.Length)
                     packet.Revision = r.ReadUInt32();
+
+                if (r.BaseStream.Position + playerCount * 2 <= r.BaseStream.Length)
+                {
+                    for (int i = 0; i < playerCount; i++)
+                    {
+                        packet.Players[i].IsModsVerified = r.ReadBoolean();
+                        packet.Players[i].IsModSyncing = r.ReadBoolean();
+                        packet.Players[i].HasModCompatibilityState = true;
+                    }
+                }
 
                 return packet;
             });
