@@ -415,6 +415,10 @@ namespace TCAMultiplayer.Game
                     }
 
                     pi.IsReady = wp.IsReady; pi.IsLoaded = wp.IsLoaded; pi.IsHost = wp.IsHost;
+                    if (pi.IsModsVerified != wp.IsModsVerified || pi.IsModSyncing != wp.IsModSyncing)
+                        Log.Debug(Tag, $"Player {wp.PlayerName} mod state: " +
+                            $"IsModsVerified={wp.IsModsVerified}, IsModSyncing={wp.IsModSyncing}");
+                    pi.IsModsVerified = wp.IsModsVerified; pi.IsModSyncing = wp.IsModSyncing;
                     pi.Team = GameSession.ClampTeam(FromWire(wp.Team), _session.TeamCount);
                 }
             foreach (var id in _session.Players.Keys)
@@ -992,6 +996,7 @@ namespace TCAMultiplayer.Game
                     SelectedAircraft = p.SelectedAircraft ?? "", SelectedAirfield = p.SelectedAirfield ?? "",
                     SelectedLoadout = p.SelectedLoadout ?? "",
                     IsReady = p.IsReady, IsLoaded = p.IsLoaded, IsHost = p.IsHost,
+                    IsModsVerified = p.IsModsVerified, IsModSyncing = p.IsModSyncing,
                     Team = ToWire(p.Team)
                 };
             var state = _session.StateMachine.CurrentState;

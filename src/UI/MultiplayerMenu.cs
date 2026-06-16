@@ -508,6 +508,16 @@ namespace TCAMultiplayer.UI
                         ModConfig.Save();
                     }, labelWidth: 200f));
             }
+
+            bool checkModsOn = ModConfig.HostCheckMods?.Value ?? true;
+            Track(UIFactory.CreateLabeledSelector(
+                "Mod Verification >", new List<string> { "ON", "OFF" }, checkModsOn ? 0 : 1, parent,
+                idx =>
+                {
+                    if (ModConfig.HostCheckMods != null)
+                        ModConfig.HostCheckMods.Value = idx == 0;
+                    ModConfig.Save();
+                }, labelWidth: 200f));
         }
 
         private void DrawDirectConnect()
@@ -667,6 +677,13 @@ namespace TCAMultiplayer.UI
             try { version = lobby.GetData("version"); } catch { version = null; }
             if (string.IsNullOrEmpty(version)) version = "?";
 
+            string hostName;
+            try { hostName = lobby.GetData("host_name"); } catch { hostName = null; }
+            if (string.IsNullOrEmpty(hostName))
+            {
+                try { hostName = lobby.Owner.Name; } catch { }
+            }
+
             int players = lobby.MemberCount;
             int maxPlayers = lobby.MaxMembers;
 
@@ -676,13 +693,15 @@ namespace TCAMultiplayer.UI
             // Format map display — show "Loading..." if map metadata isn't set yet
             string mapDisplay = string.IsNullOrEmpty(map) ? "Loading..." : map;
 
+            string hostDisplay = string.IsNullOrEmpty(hostName) ? "" : $"  —  {hostName}";
+
             var entry = UIFactory.CreateNativePanel(parent, 8, 6);
             entry.GetComponent<LayoutElement>().preferredHeight = 60f;
 
             var row = UIFactory.CreateHorizontalGroup(entry.transform, 8);
 
             var info = UIFactory.CreateNativeText(
-                $"<color={Green}>{name}</color>\n" +
+                $"<color={Green}>{name}{hostDisplay}</color>\n" +
                 $"<color={DimGreen}>{mapDisplay}  |  {players}/{maxPlayers} pilots  |  v{version}</color>",
                 row.transform, 16, TextAlignmentOptions.MidlineLeft);
             UIFactory.SetFlexible(info.gameObject);
@@ -962,7 +981,12 @@ namespace TCAMultiplayer.UI
 
             if (session == null || session.Players.Count == 0)
             {
-                UIFactory.CreateNativeText($"<color={DimGreen}>NO PILOTS CONNECTED.</color>", parent, 17, TextAlignmentOptions.Left);
+                bool connecting = session != null
+                    && _connection != null
+                    && !_connection.IsHost
+                    && !_connection.IsConnected;
+                string text = connecting ? "Connecting to server..." : "NO PILOTS CONNECTED.";
+                UIFactory.CreateNativeText($"<color={DimGreen}>{text}</color>", parent, 17, TextAlignmentOptions.Left);
                 return;
             }
 
@@ -1874,6 +1898,7 @@ namespace TCAMultiplayer.UI
                     || local.Team != MultiplayerTeam.None);
         }
 
+        /// <summary>True when any non-host player has IsModsVerified == false.</summary>
         private static bool HasUnverifiedPeers(GameSession session)
         {
             if (session == null)
@@ -1881,7 +1906,10 @@ namespace TCAMultiplayer.UI
 
             foreach (var player in session.Players.Values)
                 if (!player.IsHost && !player.IsModsVerified)
+                {
+                    Log.Debug(Tag, $"Unverified peer: {player.PlayerName} ({player.PeerId}) IsModsVerified={player.IsModsVerified}, IsModSyncing={player.IsModSyncing}");
                     return true;
+                }
 
             return false;
         }

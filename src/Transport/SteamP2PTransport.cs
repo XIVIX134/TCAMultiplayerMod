@@ -692,10 +692,12 @@ namespace TCAMultiplayer.Transport
 
             string serverName = ModConfig.HostServerName?.Value ?? "TCA Server";
             string hostSteamId = SteamClient.SteamId.Value.ToString();
+            string hostName = SteamClient.Name ?? "Host";
             string version = "1.0";
 
             _currentLobby.Value.SetData("game", "TCAMP");
             _currentLobby.Value.SetData("name", serverName);
+            _currentLobby.Value.SetData("host_name", hostName);
             _currentLobby.Value.SetData("version", version);
             _currentLobby.Value.SetData("host_steamid", hostSteamId);
 

@@ -951,6 +951,17 @@ namespace TCAMultiplayer.Protocol
                 w.Write(packet.TeamCount);
                 w.Write(packet.Revision);
 
+                // Player mod verification state (appended after Revision for backward compat)
+                w.Write(playerCount);
+                if (packet.Players != null)
+                {
+                    foreach (var player in packet.Players)
+                    {
+                        w.Write(player.IsModsVerified);
+                        w.Write(player.IsModSyncing);
+                    }
+                }
+
                 return ms.ToArray();
             }
         }
@@ -1014,6 +1025,21 @@ namespace TCAMultiplayer.Protocol
                     packet.TeamCount = r.ReadInt32();
                 if (r.BaseStream.Position + sizeof(uint) <= r.BaseStream.Length)
                     packet.Revision = r.ReadUInt32();
+
+                // Mod verification state (appended — old builds read Revision and ignore trailing bytes)
+                bool hasModVerification = r.BaseStream.Position < r.BaseStream.Length;
+                if (hasModVerification)
+                {
+                    int vPlayerCount = r.ReadInt32();
+                    for (int i = 0; i < vPlayerCount && i < playerCount; i++)
+                    {
+                        if (r.BaseStream.Position + 2 <= r.BaseStream.Length)
+                        {
+                            packet.Players[i].IsModsVerified = r.ReadBoolean();
+                            packet.Players[i].IsModSyncing = r.ReadBoolean();
+                        }
+                    }
+                }
 
                 return packet;
             });

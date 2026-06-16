@@ -36,6 +36,10 @@ namespace TCAMultiplayer.Protocol
         public bool IsReady;
         public bool IsLoaded;
         public bool IsHost;
+        /// <summary>True after the player's mod manifest has been verified.</summary>
+        public bool IsModsVerified;
+        /// <summary>True while mod files are being synced from the host.</summary>
+        public bool IsModSyncing;
         public MultiplayerTeam Team;
     }
 

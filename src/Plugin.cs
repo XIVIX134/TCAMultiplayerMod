@@ -859,6 +859,7 @@ namespace TCAMultiplayer
             _remoteManager = new RemoteAircraftManager(session, _aircraftSpawner, _originService);
             _stateReader = new LocalAircraftStateReader(_originService);
             _modManifest = new ModManifestCollector(session, _connection, router);
+            _modManifest.ModCheckingEnabled = ModConfig.HostCheckMods?.Value ?? true;
             _modManifest.OnCompatibilityAccepted += HandleModCompatibilityAccepted;
             _modManifest.OnCompatibilityMismatch += HandleModCompatibilityMismatch;
             _modManifest.OnSyncStatus += HandleModSyncStatus;
@@ -1384,9 +1385,10 @@ namespace TCAMultiplayer
                 }
             }
 
-            // Back in flight — re-lock the cursor (same as initial spawn)
+            // Back in flight — re-lock both TinyCursor (game wrapper) and Cursor (Unity hardware)
             TinyCursor.LockState = CursorLockMode.Locked;
             Cursor.visible = true;
+            Cursor.lockState = CursorLockMode.Locked;
         }
 
         /// <summary>
@@ -1649,6 +1651,7 @@ namespace TCAMultiplayer
 
         private void HandlePeerLeft(ulong peerId)
         {
+            _modManifest?.CleanupPeer(peerId);
             _radarSync?.CleanupPeerRadar(peerId);
             _missileSync?.CleanupPeerMissiles(peerId);
             _bombSync?.CleanupPeerBombs(peerId);

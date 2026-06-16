@@ -45,6 +45,7 @@ namespace TCAMultiplayer.Core
         public static ConfigEntry<int> HostGameMode { get; private set; }
         public static ConfigEntry<int> HostTeamCount { get; private set; }
         public static ConfigEntry<string> HostSteamLobbyType { get; private set; }
+        public static ConfigEntry<bool> HostCheckMods { get; private set; }
 
         // ── Logging verbosity ───────────────────────────────────────────
         public static ConfigEntry<bool> VerboseAll { get; private set; }
@@ -117,6 +118,7 @@ namespace TCAMultiplayer.Core
             HostGameMode            = config.Bind("Host", "GameMode", 0, "0=Free-for-all dogfight, 1=Team dogfight");
             HostTeamCount           = config.Bind("Host", "TeamCount", 2, "Number of teams for Team Dogfight. Valid range: 2-4.");
             HostSteamLobbyType      = config.Bind("Host", "SteamLobbyType", "Public", "Steam lobby visibility: Public or FriendsOnly");
+            HostCheckMods            = config.Bind("Host", "CheckMods", true, "Verify clients have matching mods before they can ready up.");
 
             // Logging verbosity
             VerboseAll            = config.Bind("Logging", "VerboseAll", true, "Enable verbose logs across the mod.");
