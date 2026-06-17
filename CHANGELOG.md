@@ -4,19 +4,27 @@ All notable changes to TCAMP are tracked here.
 
 ## Unreleased
 
-- Refactored Steam P2P transport: fixed thread safety in peer tracking, replaced magic byte markers with named constants, improved lobby metadata propagation (map name now set in lobby metadata).
-- Added `UpdateLobbyMap` to `SteamP2PTransport` so the lobby browser always shows the current map.
-- Fixed lobby browser: version check before joining, self-join prevention, better error messages for common failure scenarios (missing host_steamid, full lobby, version mismatch).
-- Added 15-second connection timeout for clients — auto-disconnects if the host doesn't respond.
-- Added `OnConnectionFailed` event to `ConnectionManager` for UI notification of connection failures.
-- Added `CreateTransport` factory in `PluginRunner` for cleaner transport initialization.
-- Wired lobby state changes to update Steam lobby metadata automatically.
-- Added TCAMM-style XML documentation to `SteamP2PTransport`, `ConnectionManager`, and `MultiplayerMenu`.
-- Fixed kicked Steam clients lingering in the session until a timeout — a player removed by the host now disconnects immediately.
-- Hardened the host against spoofed aircraft positions, so a client can no longer send movement updates on another player's behalf.
-- Made the mod load-order check more reliable by removing a fragile dependency on game internals (no change to in-game behavior).
-- Fixed a network connection being leaked when switching between Steam and Direct IP hosting in the multiplayer menu.
 - Add new changes here before running `.\scripts\Release-Version.ps1`.
+
+## v0.3.0 - 2026-06-17
+
+### Added
+
+- **Steam multiplayer** — host and join games over Steam with no port forwarding (NAT traversal runs through Steam's relay network), plus a built-in lobby browser that lists open TCAMP sessions by server name, map, and player count for one-click joining.
+- Choice of Steam or Direct IP when hosting or joining, selectable in the multiplayer menu.
+- Steam host options: lobby visibility (Public or Friends Only) and a toggle to require clients to run matching mods.
+
+### Changed
+
+- Aircraft and loadout pickers now reflect host-enabled availability in the lobby and respawn screen, so players can't select options the host hasn't enabled.
+- Mod sync now covers Steam Workshop mods — the host's enabled Workshop mods are included in the compatibility check and sync, and extra Workshop mods on a client are disabled to match the host.
+- Joins now time out after 15 seconds instead of hanging on an unresponsive host.
+- More reliable aircraft spawning, with airfield/player-slot-based spawn positions and clearer handling of spawn failures.
+
+### Internal
+
+- Mod load-order handling no longer depends on game internals, making it more robust and unit-testable (no change to in-game behavior).
+- Added developer documentation and tests across the new transport, selection, and mod-sync code.
 
 ## v0.2.3 - 2026-06-15
 
