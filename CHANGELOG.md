@@ -12,6 +12,10 @@ All notable changes to TCAMP are tracked here.
 - Added `CreateTransport` factory in `PluginRunner` for cleaner transport initialization.
 - Wired lobby state changes to update Steam lobby metadata automatically.
 - Added TCAMM-style XML documentation to `SteamP2PTransport`, `ConnectionManager`, and `MultiplayerMenu`.
+- Fixed kicked Steam clients lingering in the session until a timeout — a player removed by the host now disconnects immediately.
+- Hardened the host against spoofed aircraft positions, so a client can no longer send movement updates on another player's behalf.
+- Made the mod load-order check more reliable by removing a fragile dependency on game internals (no change to in-game behavior).
+- Fixed a network connection being leaked when switching between Steam and Direct IP hosting in the multiplayer menu.
 - Add new changes here before running `.\scripts\Release-Version.ps1`.
 
 ## v0.2.3 - 2026-06-15

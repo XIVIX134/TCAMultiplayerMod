@@ -632,7 +632,7 @@ namespace TCAMultiplayer.Compatibility
                     .FirstOrDefault(mod => mod != null && string.Equals(mod.Name, modName, StringComparison.Ordinal));
                 if (entry == null)
                 {
-                    loadOrder.Mods.Add(new ModLoadOrder.LoadableMod
+                    loadOrder.Mods.Add(new ModLoadOrderData.ModEntry
                     {
                         Name = modName,
                         IsEnabled = false
@@ -865,9 +865,9 @@ namespace TCAMultiplayer.Compatibility
             return ComputeManifestHash(Encoding.UTF8.GetBytes(sb.ToString()));
         }
 
-        private static bool TryReadModLoadOrder(string path, out ModLoadOrder loadOrder)
+        private static bool TryReadModLoadOrder(string path, out ModLoadOrderData loadOrder)
         {
-            loadOrder = new ModLoadOrder();
+            loadOrder = new ModLoadOrderData();
             try
             {
                 if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
@@ -882,16 +882,16 @@ namespace TCAMultiplayer.Compatibility
             catch (Exception ex)
             {
                 Log.Warning(Tag, $"Could not parse {ModLoadOrderFileName}: {ex.Message}");
-                loadOrder = new ModLoadOrder();
+                loadOrder = new ModLoadOrderData();
                 return false;
             }
         }
 
-        private static bool TryParseModLoadOrder(string json, out ModLoadOrder loadOrder)
+        private static bool TryParseModLoadOrder(string json, out ModLoadOrderData loadOrder)
         {
-            loadOrder = new ModLoadOrder();
+            loadOrder = new ModLoadOrderData();
             if (loadOrder.Mods == null)
-                loadOrder.Mods = new List<ModLoadOrder.LoadableMod>();
+                loadOrder.Mods = new List<ModLoadOrderData.ModEntry>();
 
             if (string.IsNullOrWhiteSpace(json))
                 return true;
@@ -905,7 +905,7 @@ namespace TCAMultiplayer.Compatibility
                 bool isEnabled = true;
                 TryReadJsonBoolProperty(entryJson, "IsEnabled", out isEnabled);
 
-                loadOrder.Mods.Add(new ModLoadOrder.LoadableMod
+                loadOrder.Mods.Add(new ModLoadOrderData.ModEntry
                 {
                     Name = name ?? "",
                     IsEnabled = isEnabled
@@ -915,15 +915,15 @@ namespace TCAMultiplayer.Compatibility
             return true;
         }
 
-        private static string SerializeModLoadOrder(ModLoadOrder loadOrder)
+        private static string SerializeModLoadOrder(ModLoadOrderData loadOrder)
         {
             var sb = new StringBuilder();
             sb.AppendLine("{");
             sb.AppendLine("  \"Mods\": [");
-            var mods = loadOrder?.Mods ?? new List<ModLoadOrder.LoadableMod>();
+            var mods = loadOrder?.Mods ?? new List<ModLoadOrderData.ModEntry>();
             for (int i = 0; i < mods.Count; i++)
             {
-                var mod = mods[i] ?? new ModLoadOrder.LoadableMod();
+                var mod = mods[i] ?? new ModLoadOrderData.ModEntry();
                 sb.AppendLine("    {");
                 sb.Append("      \"Name\": ");
                 AppendJsonString(sb, mod.Name ?? "");
@@ -1177,6 +1177,22 @@ namespace TCAMultiplayer.Compatibility
             public string SourceRoot;
             public string DestinationFolder;
             public string ModName;
+        }
+
+        // Plain DTO mirroring the on-disk ModLoadOrder.json shape. We parse and
+        // serialize that file ourselves (regex + StringBuilder) and never hand
+        // the object to the game, so we deliberately avoid the game's
+        // Assembly-CSharp ModLoadOrder type — that keeps this logic loadable and
+        // testable outside a running game.
+        private sealed class ModLoadOrderData
+        {
+            public List<ModEntry> Mods = new List<ModEntry>();
+
+            public sealed class ModEntry
+            {
+                public string Name;
+                public bool IsEnabled;
+            }
         }
 
         private static string GetModsRoot()

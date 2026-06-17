@@ -50,6 +50,7 @@ namespace TCAMultiplayer.Transport
         // These are distinct from application data to avoid accidental collisions.
         private const byte MARKER_HANDSHAKE = 0x01;
         private const byte MARKER_KEEPALIVE  = 0x02;
+        private const byte MARKER_DISCONNECT = 0x03;
 
         // ── ITransport events ────────────────────────────────────────
         public event Action<ulong, byte[]> OnDataReceived;
@@ -201,7 +202,7 @@ namespace TCAMultiplayer.Transport
                     return;
 
                 SteamNetworking.SendP2PPacket(
-                    steamId, new byte[] { 0x02 }, 1, CH_RELIABLE, P2PSend.Reliable);
+                    steamId, new byte[] { MARKER_DISCONNECT }, 1, CH_RELIABLE, P2PSend.Reliable);
                 SteamNetworking.CloseP2PSessionWithUser(steamId);
                 RemovePeer(peerId);
                 _eventQueue.Enqueue(TransportEvent.PeerDisconnected(peerId));
@@ -375,6 +376,20 @@ namespace TCAMultiplayer.Transport
                 // Update last-received timestamp for timeout detection
                 if (_lastReceivedMs.ContainsKey(peerId))
                     _lastReceivedMs[peerId] = _clock.ElapsedMilliseconds;
+
+                // Explicit disconnect signal (e.g. host kicking a client). Tear
+                // the peer down now instead of waiting for the keepalive timeout.
+                if (p.Data != null && p.Data.Length == 1 && p.Data[0] == MARKER_DISCONNECT)
+                {
+                    Log.Info(Tag, $"Received disconnect marker from {senderSteamId} (peer {peerId})");
+                    if (_peerSteamIds.TryGetValue(peerId, out SteamId dcSteamId))
+                        SteamNetworking.CloseP2PSessionWithUser(dcSteamId);
+                    RemovePeer(peerId);
+                    if (!IsHost && peerId == 1)
+                        IsConnected = false;
+                    _eventQueue.Enqueue(TransportEvent.PeerDisconnected(peerId));
+                    continue;
+                }
 
                 // Skip protocol markers — they're not application data.
                 // MARKER_HANDSHAKE (0x01): initial connection trigger

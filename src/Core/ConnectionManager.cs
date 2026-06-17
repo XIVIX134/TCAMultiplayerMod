@@ -138,6 +138,9 @@ namespace TCAMultiplayer.Core
                 if (_diagnostics != null)
                     _diagnostics.OnStatusChanged -= SetStatusMessage;
                 _transport.Disconnect();
+                // We are abandoning this transport, so release it now. Dispose is
+                // idempotent, so Plugin's shutdown disposing it again is harmless.
+                _transport.Dispose();
             }
 
             // Clear reliability layer and router (similar to Disconnect)

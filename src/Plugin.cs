@@ -1622,6 +1622,15 @@ namespace TCAMultiplayer
                     // Host processes all client state packets and relays them to other clients.
                     if (fromPeerId == _activeSession.LocalPeerId)
                         return; // Don't process our own packets
+
+                    // A client only sends its own aircraft state directly to the host,
+                    // so the claimed owner must match the sender. Reject spoofed owners
+                    // (HostPacketRelay validates the same before forwarding to peers).
+                    if (ownerPeerId != fromPeerId)
+                    {
+                        Log.Warning(Tag, $"Rejected AircraftState from peer {fromPeerId} for peer {ownerPeerId}");
+                        return;
+                    }
                 }
                 else
                 {
