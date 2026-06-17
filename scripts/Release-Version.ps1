@@ -91,6 +91,12 @@ try {
         throw "CHANGELOG.md needs real notes under '## Unreleased' before releasing $tag."
     }
 
+    # Strip the "Add new changes here" placeholder so it never lands in the
+    # release notes or the generated changelog section.
+    $releaseNotes = (($releaseNotes -split "\r?\n") |
+        Where-Object { $_ -notmatch '^\s*-\s*Add new changes here before running' }) -join "`r`n"
+    $releaseNotes = $releaseNotes.Trim()
+
     $releaseDate = Get-Date -Format "yyyy-MM-dd"
     $escapedTag = [regex]::Escape($tag)
     if ($changelogText -match "(?m)^## $escapedTag(\s|-|$)") {
