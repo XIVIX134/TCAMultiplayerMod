@@ -8,6 +8,8 @@ All notable changes to TCAMP are tracked here.
 
 ## v0.3.0 - 2026-06-17
 
+Thanks to @1w7g0 for the Steam Integration PR that provided the Steam multiplayer transport, lobby browser, and related hosting/joining improvements in this release.
+
 ### Added
 
 - **Steam multiplayer** — host and join games over Steam with no port forwarding (NAT traversal runs through Steam's relay network), plus a built-in lobby browser that lists open TCAMP sessions by server name, map, and player count for one-click joining.
