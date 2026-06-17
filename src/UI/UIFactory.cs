@@ -449,6 +449,9 @@ namespace TCAMultiplayer.UI
             layout.spacing = spacing;
             layout.padding = new RectOffset(padding, padding, padding, padding);
 
+            var le = go.AddComponent<LayoutElement>();
+            le.flexibleWidth = 1f;
+
             return go;
         }
 
@@ -1006,7 +1009,13 @@ namespace TCAMultiplayer.UI
             {
                 string popupTitle = label.TrimEnd(':', ' ');
                 btn.onClick.AddListener(() =>
-                    ShowNativeSelectionAsync(popupTitle, options, currentValue, onSelected).Forget());
+                    ShowNativeSelectionAsync(popupTitle, options, currentValue, idx =>
+                    {
+                        onSelected(idx);
+                        // Update button text to reflect new selection
+                        if (idx >= 0 && idx < options.Count)
+                            SetButtonText(btn, options[idx]);
+                    }).Forget());
             }
 
             return btn;

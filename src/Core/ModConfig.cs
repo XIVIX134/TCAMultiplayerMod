@@ -1,7 +1,17 @@
+using System;
 using BepInEx.Configuration;
 
 namespace TCAMultiplayer.Core
 {
+    /// <summary>Which network transport the mod uses. Selected in the multiplayer menu.</summary>
+    public enum TransportType
+    {
+        /// <summary>Direct UDP via IP:port (DirectUdpTransport).</summary>
+        DirectIP,
+        /// <summary>Steam P2P via Steam lobbies (SteamP2PTransport).</summary>
+        SteamLobby
+    }
+
     /// <summary>
     /// All mod-wide configuration entries.
     /// Call <see cref="Bind"/> once from the plugin entry point, passing its ConfigFile.
@@ -10,6 +20,9 @@ namespace TCAMultiplayer.Core
     public static class ModConfig
     {
         private static ConfigFile _config;
+
+        // ── Transport ───────────────────────────────────────────────────
+        public static ConfigEntry<string> TransportMode { get; private set; }
 
         // ── Player ──────────────────────────────────────────────────────
         public static ConfigEntry<string> Username { get; private set; }
@@ -31,6 +44,8 @@ namespace TCAMultiplayer.Core
         public static ConfigEntry<int> HostMaxPlayersTotal { get; private set; }
         public static ConfigEntry<int> HostGameMode { get; private set; }
         public static ConfigEntry<int> HostTeamCount { get; private set; }
+        public static ConfigEntry<string> HostSteamLobbyType { get; private set; }
+        public static ConfigEntry<bool> HostCheckMods { get; private set; }
 
         // ── Logging verbosity ───────────────────────────────────────────
         public static ConfigEntry<bool> VerboseAll { get; private set; }
@@ -76,6 +91,9 @@ namespace TCAMultiplayer.Core
         {
             _config = config;
 
+            // Transport
+            TransportMode = config.Bind("Network", "TransportMode", "DirectIP", "Transport type: DirectIP or SteamLobby");
+
             // Player
             Username        = config.Bind("Player", "Username", "Player", "Your multiplayer username.");
             LastIP          = config.Bind("Network", "LastIP", "127.0.0.1", "Last connected IP address.");
@@ -99,6 +117,8 @@ namespace TCAMultiplayer.Core
             HostMaxPlayersTotal     = config.Bind("Host", "MaxPlayersTotal", 8, "Maximum players including host. Recommended: 8 (host + 7 peers).");
             HostGameMode            = config.Bind("Host", "GameMode", 0, "0=Free-for-all dogfight, 1=Team dogfight");
             HostTeamCount           = config.Bind("Host", "TeamCount", 2, "Number of teams for Team Dogfight. Valid range: 2-4.");
+            HostSteamLobbyType      = config.Bind("Host", "SteamLobbyType", "Public", "Steam lobby visibility: Public or FriendsOnly");
+            HostCheckMods            = config.Bind("Host", "CheckMods", true, "Verify clients have matching mods before they can ready up.");
 
             // Logging verbosity
             VerboseAll            = config.Bind("Logging", "VerboseAll", true, "Enable verbose logs across the mod.");
@@ -149,6 +169,15 @@ namespace TCAMultiplayer.Core
             UpdateApiUrl = config.Bind("Updater", "UpdateApiUrl",
                 "https://api.github.com/repos/XIVIX134/TCAMultiplayerMod/releases/latest",
                 "GitHub latest-release API endpoint used by the in-game updater.");
+        }
+
+        /// <summary>Parse the TransportMode config string into a <see cref="TransportType"/> enum.</summary>
+        public static TransportType GetTransportType()
+        {
+            string raw = TransportMode?.Value ?? "DirectIP";
+            if (string.Equals(raw, "SteamLobby", StringComparison.OrdinalIgnoreCase))
+                return TransportType.SteamLobby;
+            return TransportType.DirectIP;
         }
 
         public static string ConfigDirectory

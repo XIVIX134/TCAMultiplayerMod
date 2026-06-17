@@ -31,6 +31,9 @@ namespace TCAMultiplayer.Compatibility
         private ModFileManifest _hostManifestForPrompt;
         private string _hostManifestHashForPrompt;
 
+        /// <summary>When false, skip mod file comparison and immediately accept all peers.</summary>
+        public bool ModCheckingEnabled { get; set; } = true;
+
         public event Action OnCompatibilityAccepted;
         public event Action<ModMismatchInfo> OnCompatibilityMismatch;
         public event Action<string> OnSyncStatus;
@@ -49,6 +52,8 @@ namespace TCAMultiplayer.Compatibility
             _router.Register(PacketType.ModCompatibilityResult, HandleCompatibilityResultRaw);
             _router.Register(PacketType.ModSyncRequest, HandleSyncRequestRaw);
             _router.Register(PacketType.ModSyncChunk, HandleSyncChunkRaw);
+
+            _session.OnPlayerJoined += OnPlayerJoined;
             Log.Info(Tag, "Initialized");
         }
 
@@ -109,6 +114,23 @@ namespace TCAMultiplayer.Compatibility
             Log.Info(Tag, $"Requested mod sync for host manifest {_hostManifestHashForPrompt.Substring(0, 16)}");
         }
 
+        // ── Auto-verification (mod checking disabled) ──────────────────
+
+        /// <summary>
+        /// When the host has mod checking disabled, mark every new player as
+        /// verified immediately without waiting for their manifest packet.
+        /// Eliminates the timing window where HasUnverifiedPeers could return
+        /// true between the player joining and HandleManifestReceived running.
+        /// </summary>
+        private void OnPlayerJoined(PlayerInfo player)
+        {
+            if (_disposed || !_session.IsHost || ModCheckingEnabled)
+                return;
+
+            player.IsModsVerified = true;
+            Log.Info(Tag, $"Player {player.PeerId} auto-verified (mod checking disabled)");
+        }
+
         private void HandleManifestRaw(ulong fromPeerId, byte[] data)
         {
             if (_disposed) return;
@@ -140,30 +162,45 @@ namespace TCAMultiplayer.Compatibility
             ModFileManifest.ModManifestDiff diff = null;
             string reason = "";
 
-            try
-            {
-                clientManifest = ModFileManifest.Deserialize(packet.ManifestData);
-                hostManifest = ModFileManifest.Collect();
-                diff = clientManifest.CompareTo(hostManifest);
-            }
-            catch (Exception ex)
-            {
-                reason = $"Invalid client mod manifest: {ex.Message}";
-            }
+            bool isCompatible;
 
-            bool isCompatible = versionMatches && diff != null && diff.IsCompatible;
-            if (!versionMatches)
+            if (ModCheckingEnabled)
             {
-                string shownClientVersion = string.IsNullOrWhiteSpace(clientVersion) ? "unknown/old build" : clientVersion;
-                reason = $"TCAMP version mismatch - host {hostVersion}, client {shownClientVersion}";
-            }
-            else if (!isCompatible && string.IsNullOrEmpty(reason))
-            {
-                reason = $"Mod files mismatch ({diff.ToSummary()}). Sync or match the host Mods folder.";
-            }
+                try
+                {
+                    clientManifest = ModFileManifest.Deserialize(packet.ManifestData);
+                    hostManifest = ModFileManifest.Collect();
+                    diff = clientManifest.CompareTo(hostManifest);
+                }
+                catch (Exception ex)
+                {
+                    reason = $"Invalid client mod manifest: {ex.Message}";
+                }
 
-            if (clientManifest != null)
-                _clientManifests[fromPeerId] = clientManifest;
+                isCompatible = versionMatches && diff != null && diff.IsCompatible;
+                if (!versionMatches)
+                {
+                    string shownClientVersion = string.IsNullOrWhiteSpace(clientVersion) ? "unknown/old build" : clientVersion;
+                    reason = $"TCAMP version mismatch - host {hostVersion}, client {shownClientVersion}";
+                }
+                else if (!isCompatible && string.IsNullOrEmpty(reason))
+                {
+                    reason = $"Mod files mismatch ({diff.ToSummary()}). Sync or match the host Mods folder.";
+                }
+
+                if (clientManifest != null)
+                    _clientManifests[fromPeerId] = clientManifest;
+            }
+            else
+            {
+                isCompatible = versionMatches;
+                if (!versionMatches)
+                {
+                    string shownClientVersion = string.IsNullOrWhiteSpace(clientVersion) ? "unknown/old build" : clientVersion;
+                    reason = $"TCAMP version mismatch - host {hostVersion}, client {shownClientVersion}";
+                }
+                Log.Info(Tag, $"Mod checking disabled — peer {fromPeerId} accepted without manifest comparison");
+            }
 
             var player = _session.GetPlayer(fromPeerId);
             if (player != null)
@@ -476,6 +513,13 @@ namespace TCAMultiplayer.Compatibility
             SendManifest();
         }
 
+        /// <summary>Remove per-peer manifest and outgoing transfer state when a peer disconnects.</summary>
+        public void CleanupPeer(ulong peerId)
+        {
+            _clientManifests.Remove(peerId);
+            _outgoingTransfers.Remove(peerId);
+        }
+
         private static SyncReloadResult ReloadGameDataAfterSync()
         {
             try
@@ -499,6 +543,7 @@ namespace TCAMultiplayer.Compatibility
             _router.Unregister(PacketType.ModCompatibilityResult, HandleCompatibilityResultRaw);
             _router.Unregister(PacketType.ModSyncRequest, HandleSyncRequestRaw);
             _router.Unregister(PacketType.ModSyncChunk, HandleSyncChunkRaw);
+            _session.OnPlayerJoined -= OnPlayerJoined;
             _outgoingTransfers.Clear();
             _incomingTransfers.Clear();
             OnCompatibilityAccepted = null;

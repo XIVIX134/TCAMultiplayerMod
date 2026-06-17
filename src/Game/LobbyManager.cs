@@ -441,13 +441,11 @@ namespace TCAMultiplayer.Game
                     pi.Team = GameSession.ClampTeam(FromWire(wp.Team), _session.TeamCount);
                     if (wp.IsHost)
                     {
-                        pi.IsModsVerified = true;
-                        pi.IsModSyncing = false;
+                        SetPlayerModState(pi, wp.PlayerName, true, false);
                     }
                     else if (wp.HasModCompatibilityState)
                     {
-                        pi.IsModsVerified = wp.IsModsVerified;
-                        pi.IsModSyncing = wp.IsModSyncing;
+                        SetPlayerModState(pi, wp.PlayerName, wp.IsModsVerified, wp.IsModSyncing);
                     }
                 }
             foreach (var id in _session.Players.Keys)
@@ -1011,6 +1009,21 @@ namespace TCAMultiplayer.Game
         {
             return !string.IsNullOrEmpty(current)
                 && !string.Equals(current, incoming, StringComparison.Ordinal);
+        }
+
+        private static void SetPlayerModState(PlayerInfo player, string playerName, bool isVerified, bool isSyncing)
+        {
+            if (player == null)
+                return;
+
+            if (player.IsModsVerified != isVerified || player.IsModSyncing != isSyncing)
+            {
+                Log.Debug(Tag, $"Player {playerName ?? player.PlayerName} mod state: " +
+                    $"IsModsVerified={isVerified}, IsModSyncing={isSyncing}");
+            }
+
+            player.IsModsVerified = isVerified;
+            player.IsModSyncing = isSyncing;
         }
 
         private static void PersistAircraft(string name)

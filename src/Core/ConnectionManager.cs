@@ -16,20 +16,35 @@ namespace TCAMultiplayer.Core
     ///   Disconnect()   → transport.Disconnect() + session.Dispose() → Disconnected
     ///
     /// Update() must be called every frame from Plugin's MonoBehaviour.
+    ///
+    /// <para><b>Connection timeout:</b> When a client joins, a timeout timer
+    /// starts. If the host doesn't send a Welcome packet within
+    /// <see cref="ConnectionTimeoutSeconds"/>, the client automatically
+    /// disconnects and fires <see cref="OnConnectionFailed"/> with a reason.</para>
     /// </summary>
     public class ConnectionManager : IDisposable
     {
         private const string Tag = "CONN";
 
-        private readonly ITransport _transport;
-        private readonly ITransportDiagnostics _diagnostics;
+        /// <summary>
+        /// Seconds to wait for a Welcome packet from the host before
+        /// giving up and disconnecting. 0 disables the timeout.
+        /// </summary>
+        private const float ConnectionTimeoutSeconds = 15f;
+
+        private ITransport _transport;
+        private ITransportDiagnostics _diagnostics;
         private readonly TransportConfig _config;
-        private readonly ReliabilityLayer _reliability;
+        private ReliabilityLayer _reliability;
         private readonly PacketRouter _router;
 
         private GameSession _session;
         private bool _disposed;
         private string _statusMessage = "";
+
+        // ── Connection timeout (client-side) ──────────────────────────
+        private float _connectionElapsed;
+        private bool _waitingForWelcome;
 
         // ── Public accessors ─────────────────────────────────────────────
 
@@ -44,6 +59,13 @@ namespace TCAMultiplayer.Core
 
         /// <summary>Fired after a peer leaves the current session.</summary>
         public event Action<ulong> OnPeerLeft;
+
+        /// <summary>
+        /// Fired when a client-side connection attempt fails (e.g., timeout
+        /// waiting for host Welcome). The string argument is a human-readable
+        /// reason.
+        /// </summary>
+        public event Action<string> OnConnectionFailed;
 
         /// <summary>Fired when the transport/session has a user-facing network status.</summary>
         public event Action<string> OnStatusMessage;
@@ -66,6 +88,9 @@ namespace TCAMultiplayer.Core
 
         /// <summary>True if the local peer is hosting.</summary>
         public bool IsHost => _transport?.IsHost ?? false;
+
+        /// <summary>Current transport instance.</summary>
+        public ITransport Transport => _transport;
 
         /// <summary>Most recent user-facing networking status.</summary>
         public string StatusMessage => _statusMessage;
@@ -92,6 +117,50 @@ namespace TCAMultiplayer.Core
             _reliability.OnDataReady += HandleDataReady;
         }
 
+        /// <summary>
+        /// Switch to a different transport. Disconnects current transport,
+        /// unwires events, creates new reliability layer, and wires new transport.
+        /// </summary>
+        public void SetTransport(ITransport newTransport)
+        {
+            if (newTransport == null)
+                throw new ArgumentNullException(nameof(newTransport));
+
+            if (_transport == newTransport)
+                return;
+
+            // Disconnect and cleanup current transport
+            if (_transport != null)
+            {
+                _transport.OnPeerConnected -= HandlePeerConnected;
+                _transport.OnPeerDisconnected -= HandlePeerDisconnected;
+                _transport.OnDataReceived -= HandleDataReceived;
+                if (_diagnostics != null)
+                    _diagnostics.OnStatusChanged -= SetStatusMessage;
+                _transport.Disconnect();
+            }
+
+            // Clear reliability layer and router (similar to Disconnect)
+            _reliability?.Clear();
+            _router.Clear();
+
+            _transport = newTransport;
+            _diagnostics = _transport as ITransportDiagnostics;
+            _reliability = new ReliabilityLayer(_transport, _config);
+
+            // Wire new transport events
+            _transport.OnPeerConnected += HandlePeerConnected;
+            _transport.OnPeerDisconnected += HandlePeerDisconnected;
+            _transport.OnDataReceived += HandleDataReceived;
+            if (_diagnostics != null)
+                _diagnostics.OnStatusChanged += SetStatusMessage;
+
+            // Wire reliability → router
+            _reliability.OnDataReady += HandleDataReady;
+
+            Log.Info(Tag, $"Switched to transport: {_transport.GetType().Name}");
+        }
+
         // ── Lifecycle ────────────────────────────────────────────────────
 
         /// <summary>
@@ -113,14 +182,14 @@ namespace TCAMultiplayer.Core
             _transport.StartHost(port);
 
             _session = new GameSession(isHost: true);
-            _session.LocalPeerId = _transport.LocalPeerId;
+            _session.LocalPeerId = 1; // Host is always peer 1 regardless of transport
             _session.HostName = hostName ?? "Host";
             _session.StateMachine.TryTransition(GameState.HostingLobby);
 
             // Register the host as the first player
-            _session.AddPlayer(_transport.LocalPeerId, hostName ?? "Host");
+            _session.AddPlayer(_session.LocalPeerId, hostName ?? "Host");
 
-            Log.Info(Tag, $"Hosting session \"{hostName}\" on port {port} (peerId={_transport.LocalPeerId})");
+            Log.Info(Tag, $"Hosting session \"{hostName}\" on port {port} (peerId={_session.LocalPeerId})");
             OnSessionCreated?.Invoke(_session);
         }
 
@@ -128,6 +197,8 @@ namespace TCAMultiplayer.Core
         /// Join an existing session at the given address and port.
         /// Creates a GameSession, connects the transport, and transitions to ClientLobby.
         /// The local player is added once the connection handshake completes (via OnPeerConnected).
+        /// A connection timeout starts; if the host doesn't respond within
+        /// <see cref="ConnectionTimeoutSeconds"/>, the attempt is aborted.
         /// </summary>
         public void JoinSession(string address, int port)
         {
@@ -147,7 +218,11 @@ namespace TCAMultiplayer.Core
             _session.LocalPeerId = _transport.LocalPeerId;
             _session.StateMachine.TryTransition(GameState.ClientLobby);
 
-            Log.Info(Tag, $"Joining session at {address}:{port} (peerId={_transport.LocalPeerId})");
+            // Start connection timeout timer
+            _connectionElapsed = 0f;
+            _waitingForWelcome = ConnectionTimeoutSeconds > 0f;
+
+            Log.Info(Tag, $"Joining session at {address}:{port} (peerId={_session.LocalPeerId})");
             OnSessionCreated?.Invoke(_session);
         }
 
@@ -209,7 +284,8 @@ namespace TCAMultiplayer.Core
 
         /// <summary>
         /// Must be called every frame from Plugin's MonoBehaviour.
-        /// Drains the transport receive queue and retransmits pending reliable packets.
+        /// Drains the transport receive queue, retransmits pending reliable packets,
+        /// and checks for client connection timeout.
         /// </summary>
         public void Update(float deltaTime)
         {
@@ -220,6 +296,30 @@ namespace TCAMultiplayer.Core
 
             // Retransmit pending reliable packets
             _reliability.Update(deltaTime);
+
+            // Client connection timeout: disconnect if Welcome not received in time.
+            // Only applies during initial connection (ClientLobby state).
+            if (_waitingForWelcome && _session != null && !_session.IsHost)
+            {
+                // Disable timeout once past initial lobby connection
+                if (_session.StateMachine.CurrentState != GameState.ClientLobby)
+                {
+                    _waitingForWelcome = false;
+                }
+                else
+                {
+                    _connectionElapsed += deltaTime;
+                    if (_connectionElapsed > ConnectionTimeoutSeconds)
+                    {
+                        _waitingForWelcome = false;
+                        string reason = $"Connection timed out after {ConnectionTimeoutSeconds:F0}s — " +
+                            "host did not respond. Check that the host is running and reachable.";
+                        Log.Warning(Tag, reason);
+                        OnConnectionFailed?.Invoke(reason);
+                        Disconnect();
+                    }
+                }
+            }
         }
 
         // ── Send helpers (delegate to reliability layer) ────────────────
@@ -303,6 +403,7 @@ namespace TCAMultiplayer.Core
             OnSessionCreated = null;
             OnSessionEnded = null;
             OnPeerLeft = null;
+            OnConnectionFailed = null;
             OnStatusMessage = null;
         }
 
@@ -319,8 +420,17 @@ namespace TCAMultiplayer.Core
                 _session.LocalPeerId = _transport.LocalPeerId;
                 var username = ModConfig.Username?.Value ?? "Player";
                 _session.AddPlayer(_session.LocalPeerId, username);
+                _waitingForWelcome = false; // Connection succeeded — cancel timeout
                 Log.Info(Tag, $"Client assigned peer ID {_session.LocalPeerId}");
                 SetStatusMessage("Connected");
+            }
+
+            // For Steam transport, LocalPeerId is set upfront (SteamID), so the above
+            // condition never triggers. Cancel timeout when host (peer 1) connects.
+            if (!_session.IsHost && peerId == 1)
+            {
+                _waitingForWelcome = false;
+                Log.Debug(Tag, "Host connected — cancelling connection timeout");
             }
 
             // Add the remote peer (host sees client, client sees host)

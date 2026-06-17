@@ -10,24 +10,46 @@ namespace TCAMultiplayer.Transport
 {
     /// <summary>
     /// Steam P2P transport using Facepunch.Steamworks legacy SteamNetworking API.
-    /// <para>
-    /// Host creates a Steam lobby for discovery; clients join via SteamId.
-    /// NAT traversal and relay fallback are handled automatically by Steam.
-    /// No background receive thread is needed — <see cref="Update"/> polls for
-    /// incoming packets each frame via <see cref="SteamNetworking.IsP2PPacketAvailable"/>.
-    /// </para>
-    /// <para>
-    /// PeerId mapping: SteamId.Value (ulong) is used directly as the peerId.
-    /// The host's peerId is always 1; clients use their own SteamId.Value.
-    /// </para>
+    ///
+    /// <para><b>Architecture:</b> The host creates a Steam lobby for discovery;
+    /// clients join via the host's SteamId extracted from lobby metadata.
+    /// NAT traversal and relay fallback are handled automatically by Steam's
+    /// relay network — no port forwarding is required.</para>
+    ///
+    /// <para><b>Threading model:</b> All public methods are safe to call from
+    /// the main Unity thread. <see cref="Send"/> and <see cref="Broadcast"/>
+    /// are also safe from background threads because they delegate to
+    /// <c>SteamNetworking.SendP2PPacket</c>, which is thread-safe.
+    /// Incoming packets are polled in <see cref="Update"/> on the main thread
+    /// via <see cref="SteamNetworking.IsP2PPacketAvailable"/>.</para>
+    ///
+    /// <para><b>PeerId mapping:</b> The host's peerId is always <c>1</c>.
+    /// Clients use their own <c>SteamId.Value</c> as their peerId.
+    /// The mapping is maintained in <see cref="_peerSteamIds"/> (peerId → SteamId)
+    /// and <see cref="_steamIdToPeerId"/> (SteamId.Value → peerId).</para>
+    ///
+    /// <para><b>Lobby lifecycle:</b> The host creates a lobby in
+    /// <see cref="StartHost"/> and sets metadata (<c>game</c>, <c>name</c>,
+    /// <c>version</c>, <c>host_steamid</c>, <c>map</c>) before making it
+    /// visible. Clients query the lobby list via
+    /// <see cref="SteamMatchmaking.LobbyList"/> and extract the host SteamId
+    /// from the <c>host_steamid</c> metadata key to connect.</para>
     /// </summary>
     public sealed class SteamP2PTransport : ITransport
     {
         private const string Tag = "STEAM";
 
         // ── P2P channels ─────────────────────────────────────────────
+        // Channel 0: unreliable (state updates, keepalive)
+        // Channel 1: reliable (lobby packets, handshake, chat)
         private const int CH_UNRELIABLE = 0;
         private const int CH_RELIABLE   = 1;
+
+        // ── Protocol markers ─────────────────────────────────────────
+        // Single-byte markers used to identify special packets in PollIncomingPackets.
+        // These are distinct from application data to avoid accidental collisions.
+        private const byte MARKER_HANDSHAKE = 0x01;
+        private const byte MARKER_KEEPALIVE  = 0x02;
 
         // ── ITransport events ────────────────────────────────────────
         public event Action<ulong, byte[]> OnDataReceived;
@@ -47,13 +69,13 @@ namespace TCAMultiplayer.Transport
         private volatile bool _isRunning;
         private bool _disposed;
 
-        // ── Peer tracking ────────────────────────────────────────────
-        // SteamId.Value → peerId mapping (for host, peerId != SteamId.Value; host = 1)
-        // For clients, host peerId is always 1.
-        private readonly ConcurrentDictionary<ulong, SteamId> _peerSteamIds
-            = new ConcurrentDictionary<ulong, SteamId>();
-        private readonly Dictionary<ulong, ulong> _steamIdToPeerId
-            = new Dictionary<ulong, ulong>();
+        // ── Peer tracking (main-thread only) ─────────────────────────
+        // These dictionaries are only accessed from the main Unity thread
+        // (Update, AcceptNewPeer, RemovePeer, Send, Broadcast). No locking
+        // is needed because all mutations happen in Update() or event
+        // handlers that run on the main thread.
+        private readonly Dictionary<ulong, SteamId> _peerSteamIds = new Dictionary<ulong, SteamId>();
+        private readonly Dictionary<ulong, ulong> _steamIdToPeerId = new Dictionary<ulong, ulong>();
         private readonly HashSet<ulong> _connectedPeerIds = new HashSet<ulong>();
         private readonly Dictionary<ulong, long> _lastReceivedMs = new Dictionary<ulong, long>();
         private ulong _nextPeerId = 2; // Host is always 1; clients start at 2
@@ -64,6 +86,7 @@ namespace TCAMultiplayer.Transport
 
         // ── Lobby ────────────────────────────────────────────────────
         private Lobby? _currentLobby;
+        private string _currentMapName;
 
         // ── Host SteamId (client-side: the host we're connecting to) ─
         private SteamId _hostSteamId;
@@ -106,7 +129,9 @@ namespace TCAMultiplayer.Transport
             _isRunning = true;
             _lastKeepaliveMs = _clock.ElapsedMilliseconds;
 
-            // Enable Steam relay fallback for NAT traversal
+            // Enable Steam relay fallback for NAT traversal.
+            // This allows connections through Steam's relay network when
+            // direct P2P fails (symmetric NAT, firewalls, etc.).
             SteamNetworking.AllowP2PPacketRelay(true);
 
             SubscribeSteamEvents();
@@ -126,7 +151,7 @@ namespace TCAMultiplayer.Transport
                 return;
             }
 
-            // Address is the host's SteamId as a string
+            // Address is the host's SteamId as a string (from lobby metadata)
             if (!ulong.TryParse(address, out ulong hostId))
             {
                 throw new ArgumentException(
@@ -145,10 +170,12 @@ namespace TCAMultiplayer.Transport
 
             SubscribeSteamEvents();
 
-            // Initiate P2P connection by sending an empty reliable packet to the host.
-            // Steam will fire OnP2PSessionRequest on the host side.
-            SteamNetworking.SendP2PPacket(
-                _hostSteamId, new byte[] { 0x01 }, 1, CH_RELIABLE, P2PSend.Reliable);
+            // Initiate P2P connection by sending a handshake packet to the host.
+            // Steam will fire OnP2PSessionRequest on the host side, which calls
+            // AcceptP2PSessionWithUser to establish the bidirectional channel.
+            bool sent = SteamNetworking.SendP2PPacket(
+                _hostSteamId, new byte[] { MARKER_HANDSHAKE }, 1, CH_RELIABLE, P2PSend.Reliable);
+            Log.Info(Tag, $"Sent handshake to {hostId}: {sent}");
 
             Log.Info(Tag, $"Connecting to Steam host {hostId}");
         }
@@ -206,6 +233,7 @@ namespace TCAMultiplayer.Transport
             }
             else
             {
+                // Client can only send to the host (peerId 1)
                 if (peerId != 1)
                 {
                     Log.Debug(Tag, $"Client can only send to host (peer 1), got {peerId}");
@@ -295,7 +323,9 @@ namespace TCAMultiplayer.Transport
 
         private void PollIncomingPackets(int channel)
         {
-            // Read all available packets on this channel
+            // Read all available packets on this channel.
+            // SteamNetworking.IsP2PPacketAvailable returns the count of
+            // queued packets; we drain them all to avoid queue buildup.
             while (SteamNetworking.IsP2PPacketAvailable(channel))
             {
                 var packet = SteamNetworking.ReadP2PPacket(channel);
@@ -311,8 +341,10 @@ namespace TCAMultiplayer.Transport
                     if (!_steamIdToPeerId.TryGetValue(senderSteamId, out peerId))
                     {
                         // Unknown sender — could be initial connection packet.
-                        // The OnP2PSessionRequest handler should have accepted them first.
-                        // If we get data from an unknown peer, accept them now.
+                        // The OnP2PSessionRequest handler should have accepted
+                        // them first. If we get data from an unknown peer,
+                        // accept them now as a fallback.
+                        Log.Debug(Tag, $"Host received data from unknown peer {senderSteamId}, accepting...");
                         AcceptNewPeer(p.SteamId);
                         if (!_steamIdToPeerId.TryGetValue(senderSteamId, out peerId))
                             continue; // Still unknown — skip
@@ -328,6 +360,7 @@ namespace TCAMultiplayer.Transport
                         // Complete connection if we haven't yet
                         if (!IsConnected)
                         {
+                            Log.Info(Tag, "Client received data from host — marking connected");
                             IsConnected = true;
                             AddPeer(1, _hostSteamId);
                             _eventQueue.Enqueue(TransportEvent.PeerConnected(1));
@@ -339,15 +372,21 @@ namespace TCAMultiplayer.Transport
                     }
                 }
 
-                // Update last-received timestamp
+                // Update last-received timestamp for timeout detection
                 if (_lastReceivedMs.ContainsKey(peerId))
                     _lastReceivedMs[peerId] = _clock.ElapsedMilliseconds;
 
-                // Skip the initial connection byte (0x01) — it's just a handshake trigger
-                if (p.Data != null && p.Data.Length == 1 && p.Data[0] == 0x01)
+                // Skip protocol markers — they're not application data.
+                // MARKER_HANDSHAKE (0x01): initial connection trigger
+                // MARKER_KEEPALIVE (0x02): keepalive ping
+                if (p.Data != null && p.Data.Length == 1
+                    && (p.Data[0] == MARKER_HANDSHAKE || p.Data[0] == MARKER_KEEPALIVE))
+                {
+                    Log.Debug(Tag, $"Received marker 0x{p.Data[0]:X2} from {senderSteamId} (peer {peerId})");
                     continue;
+                }
 
-                // Deliver payload
+                // Deliver payload to the reliability layer / packet router
                 if (p.Data != null && p.Data.Length > 0)
                 {
                     _eventQueue.Enqueue(TransportEvent.DataReceived(peerId, p.Data));
@@ -365,7 +404,7 @@ namespace TCAMultiplayer.Transport
             _onP2PConnectionFailed = OnSteamP2PConnectionFailed;
             _onLobbyMemberJoined = OnSteamLobbyMemberJoined;
             _onLobbyMemberLeave = OnSteamLobbyMemberLeave;
-            _onLobbyMemberDisconnected = OnSteamLobbyMemberLeave; // Same handler
+            _onLobbyMemberDisconnected = OnSteamLobbyMemberLeave;
 
             SteamNetworking.OnP2PSessionRequest = _onP2PSessionRequest;
             SteamNetworking.OnP2PConnectionFailed = _onP2PConnectionFailed;
@@ -376,7 +415,6 @@ namespace TCAMultiplayer.Transport
 
         private void UnsubscribeSteamEvents()
         {
-            // OnP2PSessionRequest is a simple delegate (not event), null it out
             if (SteamNetworking.OnP2PSessionRequest == _onP2PSessionRequest)
                 SteamNetworking.OnP2PSessionRequest = null;
             if (SteamNetworking.OnP2PConnectionFailed == _onP2PConnectionFailed)
@@ -387,6 +425,11 @@ namespace TCAMultiplayer.Transport
             SteamMatchmaking.OnLobbyMemberDisconnected -= _onLobbyMemberDisconnected;
         }
 
+        /// <summary>
+        /// Called by Steam when a remote peer wants to establish a P2P session.
+        /// The host accepts all peers (up to MaxConnections); clients only
+        /// accept sessions from the known host.
+        /// </summary>
         private void OnSteamP2PSessionRequest(SteamId remoteSteamId)
         {
             if (!_isRunning) return;
@@ -396,13 +439,19 @@ namespace TCAMultiplayer.Transport
                 // Enforce max connections
                 if (_config.MaxConnections > 0 && _connectedPeerIds.Count >= _config.MaxConnections)
                 {
-                    Log.Warning(Tag, $"Rejecting P2P session from {remoteSteamId}: max connections ({_config.MaxConnections}) reached");
+                    Log.Warning(Tag, $"Rejecting P2P session from {remoteSteamId}: " +
+                        $"max connections ({_config.MaxConnections}) reached");
                     SteamNetworking.CloseP2PSessionWithUser(remoteSteamId);
                     return;
                 }
 
-                SteamNetworking.AcceptP2PSessionWithUser(remoteSteamId);
-                Log.Debug(Tag, $"Accepted P2P session request from {remoteSteamId}");
+                bool accepted = SteamNetworking.AcceptP2PSessionWithUser(remoteSteamId);
+                Log.Info(Tag, $"Host AcceptP2PSessionWithUser({remoteSteamId}) = {accepted}");
+                if (!accepted)
+                {
+                    Log.Error(Tag, $"Failed to accept P2P session from {remoteSteamId}");
+                    return;
+                }
 
                 // Register peer if not already known
                 if (!_steamIdToPeerId.ContainsKey(remoteSteamId.Value))
@@ -415,8 +464,13 @@ namespace TCAMultiplayer.Transport
                 // Client: only accept sessions from our host
                 if (remoteSteamId.Value == _hostSteamId.Value)
                 {
-                    SteamNetworking.AcceptP2PSessionWithUser(remoteSteamId);
-                    Log.Debug(Tag, $"Accepted P2P session from host {remoteSteamId}");
+                    bool accepted = SteamNetworking.AcceptP2PSessionWithUser(remoteSteamId);
+                    Log.Info(Tag, $"Client AcceptP2PSessionWithUser({remoteSteamId}) = {accepted}");
+                    if (!accepted)
+                    {
+                        Log.Error(Tag, $"Failed to accept P2P session from host {remoteSteamId}");
+                        return;
+                    }
                 }
                 else
                 {
@@ -481,9 +535,9 @@ namespace TCAMultiplayer.Transport
             Log.Info(Tag, $"Peer {peerId} connected (SteamId: {remoteSteamId})");
             _eventQueue.Enqueue(TransportEvent.PeerConnected(peerId));
 
-            // Send connection ACK: host replies with a packet so client knows it's connected
+            // Send connection ACK so the client knows it's connected
             SteamNetworking.SendP2PPacket(
-                remoteSteamId, new byte[] { 0x01 }, 1, CH_RELIABLE, P2PSend.Reliable);
+                remoteSteamId, new byte[] { MARKER_HANDSHAKE }, 1, CH_RELIABLE, P2PSend.Reliable);
         }
 
         private void AddPeer(ulong peerId, SteamId steamId)
@@ -496,10 +550,11 @@ namespace TCAMultiplayer.Transport
 
         private void RemovePeer(ulong peerId)
         {
-            if (_peerSteamIds.TryRemove(peerId, out SteamId steamId))
+            if (_peerSteamIds.TryGetValue(peerId, out SteamId steamId))
             {
                 _steamIdToPeerId.Remove(steamId.Value);
             }
+            _peerSteamIds.Remove(peerId);
             _connectedPeerIds.Remove(peerId);
             _lastReceivedMs.Remove(peerId);
         }
@@ -514,8 +569,34 @@ namespace TCAMultiplayer.Transport
 
             long nowMs = _clock.ElapsedMilliseconds;
             long timeoutMs = (long)(_config.TimeoutSeconds * 1000f);
+            long keepaliveIntervalMs = (long)(_config.KeepaliveInterval * 1000f);
 
-            // Check for timed-out peers
+            // 1. Send keepalive pings if interval elapsed
+            if (nowMs - _lastKeepaliveMs > keepaliveIntervalMs)
+            {
+                _lastKeepaliveMs = nowMs;
+                byte[] keepalive = new byte[] { MARKER_KEEPALIVE };
+                foreach (var peerId in _connectedPeerIds)
+                {
+                    if (IsHost)
+                    {
+                        if (_peerSteamIds.TryGetValue(peerId, out SteamId steamId))
+                        {
+                            SteamNetworking.SendP2PPacket(
+                                steamId, keepalive, keepalive.Length,
+                                CH_UNRELIABLE, P2PSend.UnreliableNoDelay);
+                        }
+                    }
+                    else if (peerId == 1)
+                    {
+                        SteamNetworking.SendP2PPacket(
+                            _hostSteamId, keepalive, keepalive.Length,
+                            CH_UNRELIABLE, P2PSend.UnreliableNoDelay);
+                    }
+                }
+            }
+
+            // 2. Check for timed-out peers
             List<ulong> timedOut = null;
             foreach (var kvp in _lastReceivedMs)
             {
@@ -532,7 +613,6 @@ namespace TCAMultiplayer.Transport
                 {
                     Log.Warning(Tag, $"Peer {peerId} timed out ({_config.TimeoutSeconds}s no data)");
 
-                    // Close the P2P session
                     if (_peerSteamIds.TryGetValue(peerId, out SteamId steamId))
                     {
                         SteamNetworking.CloseP2PSessionWithUser(steamId);
@@ -552,33 +632,117 @@ namespace TCAMultiplayer.Transport
         // Lobby management
         // ═══════════════════════════════════════════════════════════════
 
+        /// <summary>
+        /// Create a Steam lobby for game discovery. The lobby is created
+        /// asynchronously; metadata is set before making it visible so
+        /// it's fully searchable the moment it appears in the listing.
+        /// </summary>
         private async void CreateLobbyAsync()
         {
             try
             {
+                // Check if transport was disposed/switched while awaiting
+                if (!_isRunning)
+                {
+                    Log.Debug(Tag, "CreateLobbyAsync cancelled — transport no longer running");
+                    return;
+                }
+
                 int maxMembers = _config.MaxConnections > 0 ? _config.MaxConnections + 1 : 8;
+                Log.Info(Tag, $"Requesting Steam lobby creation with maxMembers={maxMembers}...");
                 var lobby = await SteamMatchmaking.CreateLobbyAsync(maxMembers);
+
+                // Check again after await
+                if (!_isRunning)
+                {
+                    Log.Debug(Tag, "CreateLobbyAsync cancelled after await — transport no longer running");
+                    if (lobby.HasValue)
+                    {
+                        try { lobby.Value.Leave(); } catch { }
+                    }
+                    return;
+                }
 
                 if (!lobby.HasValue)
                 {
-                    Log.Error(Tag, "Failed to create Steam lobby");
+                    Log.Error(Tag, "SteamMatchmaking.CreateLobbyAsync returned null — lobby creation failed");
                     return;
                 }
 
                 _currentLobby = lobby.Value;
-                _currentLobby.Value.SetPublic();
-                _currentLobby.Value.SetJoinable(true);
+                Log.Info(Tag, $"Lobby created: id={_currentLobby.Value.Id}, " +
+                    $"owner={_currentLobby.Value.Owner.Name} (SteamId={_currentLobby.Value.Owner.Id})");
 
-                // Store metadata for discovery
-                _currentLobby.Value.SetData("game", "TCAMP");
-                _currentLobby.Value.SetData("version", "1.0");
-                _currentLobby.Value.SetData("host_steamid", SteamClient.SteamId.Value.ToString());
-
-                Log.Info(Tag, $"Steam lobby created: {_currentLobby.Value.Id}");
+                SetLobbyMetadata();
             }
             catch (Exception ex)
             {
-                Log.Error(Tag, $"Failed to create Steam lobby: {ex.Message}");
+                Log.Error(Tag, $"Failed to create Steam lobby: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Set all lobby metadata keys. Called after lobby creation and
+        /// whenever settings change so the lobby browser always shows
+        /// current information.
+        /// </summary>
+        private void SetLobbyMetadata()
+        {
+            if (!_currentLobby.HasValue) return;
+
+            string serverName = ModConfig.HostServerName?.Value ?? "TCA Server";
+            string hostSteamId = SteamClient.SteamId.Value.ToString();
+            string hostName = SteamClient.Name ?? "Host";
+            string version = "1.0";
+
+            _currentLobby.Value.SetData("game", "TCAMP");
+            _currentLobby.Value.SetData("name", serverName);
+            _currentLobby.Value.SetData("host_name", hostName);
+            _currentLobby.Value.SetData("version", version);
+            _currentLobby.Value.SetData("host_steamid", hostSteamId);
+
+            // Set map if known (the lobby browser displays this)
+            if (!string.IsNullOrEmpty(_currentMapName))
+                _currentLobby.Value.SetData("map", _currentMapName);
+
+            // Apply lobby visibility from config
+            string lobbyType = ModConfig.HostSteamLobbyType?.Value?.Trim() ?? "Public";
+            if (string.Equals(lobbyType, "FriendsOnly", StringComparison.OrdinalIgnoreCase))
+            {
+                _currentLobby.Value.SetFriendsOnly();
+                Log.Info(Tag, $"Lobby {_currentLobby.Value.Id} set to FriendsOnly");
+            }
+            else
+            {
+                _currentLobby.Value.SetPublic();
+                Log.Info(Tag, $"Lobby {_currentLobby.Value.Id} set to Public");
+            }
+
+            _currentLobby.Value.SetJoinable(true);
+
+            Log.Info(Tag, $"Lobby metadata set: game=TCAMP, name={serverName}, " +
+                $"map={_currentMapName ?? "<not set>"}, host_steamid={hostSteamId}, " +
+                $"type={lobbyType}, joinable=true, " +
+                $"members={_currentLobby.Value.MemberCount}/{_currentLobby.Value.MaxMembers}");
+        }
+
+        /// <summary>
+        /// Update the lobby's <c>map</c> metadata when the host changes maps.
+        /// This ensures the lobby browser always shows the current map.
+        /// </summary>
+        public void UpdateLobbyMap(string mapName)
+        {
+            _currentMapName = mapName;
+            if (!_currentLobby.HasValue) return;
+
+            try
+            {
+                _currentLobby.Value.SetData("map", mapName ?? "");
+                Log.Debug(Tag, $"Lobby map metadata updated: {mapName}");
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(Tag, $"Failed to update lobby map metadata: {ex.Message}");
             }
         }
 
@@ -597,14 +761,14 @@ namespace TCAMultiplayer.Transport
             foreach (var kvp in _peerSteamIds)
             {
                 try { SteamNetworking.CloseP2PSessionWithUser(kvp.Value); }
-                catch { /* best-effort */ }
+                catch (Exception ex) { Log.Debug(Tag, $"CloseP2PSessionWithUser error: {ex.Message}"); }
             }
 
             // Leave lobby
             if (_currentLobby.HasValue)
             {
                 try { _currentLobby.Value.Leave(); }
-                catch { /* best-effort */ }
+                catch (Exception ex) { Log.Debug(Tag, $"Lobby leave error: {ex.Message}"); }
                 _currentLobby = null;
             }
 
@@ -613,6 +777,7 @@ namespace TCAMultiplayer.Transport
             _steamIdToPeerId.Clear();
             _connectedPeerIds.Clear();
             _lastReceivedMs.Clear();
+            _nextPeerId = 2;
             LocalPeerId = 0;
 
             // Drain any remaining queued events

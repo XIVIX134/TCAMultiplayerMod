@@ -139,11 +139,22 @@ namespace TCAMultiplayer
                 ModVersion = PluginMetadata.Version
             };
             ApplyBandwidthPreset(config);
-            _transport = new DirectUdpTransport(config);
+            _transport = CreateTransport(config);
 
             _connection = new ConnectionManager(_transport, config);
             _connection.OnSessionCreated += OnSessionCreated;
             _connection.OnSessionEnded += OnSessionEnded;
+            _connection.OnConnectionFailed += OnConnectionFailed;
+
+            if (ModConfig.GetTransportType() == Core.TransportType.SteamLobby && Steamworks.SteamClient.IsValid)
+            {
+                string steamName = Steamworks.SteamClient.Name;
+                if (!string.IsNullOrWhiteSpace(steamName))
+                {
+                    ModConfig.Username.Value = steamName;
+                    Log.Info("STEAM", $"Using Steam username: {steamName}");
+                }
+            }
             _originService = new FloatingOriginService();
             _aircraftSpawner = new AircraftSpawner(_originService);
             _eventBridge = new GameEventBridge();
@@ -182,6 +193,29 @@ namespace TCAMultiplayer
                     $"Enabled: role={_liveTest.Role}, autostart={_liveTest.AutoStart}, ready={_liveTest.Ready}, " +
                     $"startGame={_liveTest.StartGame}, address={_liveTest.Address}, port={_liveTest.Port}");
             }
+        }
+
+        // ── Transport factory ────────────────────────────────────────────
+
+        /// <summary>
+        /// Create the appropriate transport based on the current config.
+        /// Called once at startup and can be called again to recreate
+        /// the transport when the user switches transport types.
+        /// </summary>
+        private static ITransport CreateTransport(TransportConfig config)
+        {
+            if (ModConfig.GetTransportType() == Core.TransportType.SteamLobby)
+                return new SteamP2PTransport(config);
+            return new DirectUdpTransport(config);
+        }
+
+        /// <summary>
+        /// Called when a client-side connection attempt fails (timeout, etc.).
+        /// Logs the failure and shows it in the menu if visible.
+        /// </summary>
+        private void OnConnectionFailed(string reason)
+        {
+            Log.Warning(Tag, $"Connection failed: {reason}");
         }
 
         // ── Update (called every frame) ─────────────────────────────────
@@ -757,7 +791,7 @@ namespace TCAMultiplayer
 
         private void SendLocalAircraftState(float deltaTime)
         {
-            if (_activeSession == null || _stateReader == null || _transport == null)
+            if (_activeSession == null || _stateReader == null)
                 return;
 
             var localAircraft = _spawnManager?.LocalAircraft;
@@ -783,7 +817,7 @@ namespace TCAMultiplayer
 
             var payload = PacketSerializer.SerializeAircraftState(statePacket);
             var frame = PacketSerializer.Serialize(PacketType.AircraftState, payload);
-            _transport.Broadcast(frame, reliable: false);
+            _connection?.Transport?.Broadcast(frame, reliable: false);
         }
 
         private bool _lastSentGearDown = true;
@@ -828,12 +862,14 @@ namespace TCAMultiplayer
             _lobby = new LobbyManager(session, _connection, router);
             _lobby.OnAllPlayersLoaded += OnAllPlayersLoaded;
             _lobby.OnGameStarting += OnGameStarting;
+            _lobby.OnLobbyStateChanged += OnLobbyStateChanged;
 
             _eventBridge.Subscribe();
             _aircraftSpawner.IsFriendlyPeer = peerId => session.ArePlayersOnSameTeam(session.LocalPeerId, peerId);
             _remoteManager = new RemoteAircraftManager(session, _aircraftSpawner, _originService);
             _stateReader = new LocalAircraftStateReader(_originService);
             _modManifest = new ModManifestCollector(session, _connection, router);
+            _modManifest.ModCheckingEnabled = ModConfig.HostCheckMods?.Value ?? true;
             _modManifest.OnCompatibilityAccepted += HandleModCompatibilityAccepted;
             _modManifest.OnCompatibilityMismatch += HandleModCompatibilityMismatch;
             _modManifest.OnSyncStatus += HandleModSyncStatus;
@@ -959,6 +995,22 @@ namespace TCAMultiplayer
             if (mainMenu == null) return;
 
             mainMenu.ShowMainMenu(visible);
+        }
+
+        /// <summary>
+        /// When the lobby state changes, update the Steam lobby's map metadata
+        /// so the lobby browser always shows the current map.
+        /// </summary>
+        private void OnLobbyStateChanged()
+        {
+            if (_activeSession == null || _connection?.Transport == null) return;
+            if (!_activeSession.IsHost) return;
+
+            // Only the SteamP2PTransport has UpdateLobbyMap; check via type
+            if (_connection.Transport is SteamP2PTransport steamTransport)
+            {
+                steamTransport.UpdateLobbyMap(_activeSession.MapName);
+            }
         }
 
         private async void OnGameStarting(string mapName)
@@ -1253,6 +1305,19 @@ namespace TCAMultiplayer
             _remoteManager?.RemoveAllPeers();
             _originService?.Reset();
 
+            // Reset the game's static FloatingOrigin.TotalOffset so the next match
+            // doesn't inherit accumulated offset from the previous one
+            try
+            {
+                HarmonyLib.Traverse.Create(typeof(Falcon.World.FloatingOrigin))
+                    .Property("TotalOffset")
+                    .SetValue(Vector3.zero);
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(Tag, $"Failed to reset FloatingOrigin.TotalOffset: {ex.Message}");
+            }
+
             try
             {
                 var flightGame = Falcon.Game2.FlightGame.Instance;
@@ -1344,9 +1409,10 @@ namespace TCAMultiplayer
                 }
             }
 
-            // Back in flight — re-lock the cursor (same as initial spawn)
+            // Back in flight — re-lock both TinyCursor (game wrapper) and Cursor (Unity hardware)
             TinyCursor.LockState = CursorLockMode.Locked;
             Cursor.visible = true;
+            Cursor.lockState = CursorLockMode.Locked;
         }
 
         /// <summary>
@@ -1542,29 +1608,39 @@ namespace TCAMultiplayer
 
         private void HandleAircraftStateRaw(ulong fromPeerId, byte[] data)
         {
-            // Only track remote aircraft during gameplay. After a return to
-            // lobby, peers still mid-flight keep sending state for a moment —
-            // without this gate those packets resurrect clones into the lobby.
-            var state = _activeSession?.StateMachine.CurrentState;
-            if (state != GameState.Spawning
-                && state != GameState.InGame
-                && state != GameState.Respawning)
-                return;
-
             var (_, payload) = PacketSerializer.Deserialize(data);
             if (payload == null) return;
             var packet = PacketSerializer.DeserializeAircraftState(payload);
             ulong ownerPeerId = packet.PlayerId != 0 ? packet.PlayerId : fromPeerId;
-            if (_activeSession != null
-                && _activeSession.IsHost
-                && fromPeerId != _activeSession.LocalPeerId
-                && ownerPeerId != fromPeerId)
+
+            // Host: always accept state packets from clients to relay to other clients.
+            // Client: only accept during gameplay states to prevent lobby clones.
+            if (_activeSession != null)
             {
-                Log.Warning(Tag, $"Rejected AircraftState from peer {fromPeerId} for peer {ownerPeerId}");
-                return;
+                if (_activeSession.IsHost)
+                {
+                    // Host processes all client state packets and relays them to other clients.
+                    if (fromPeerId == _activeSession.LocalPeerId)
+                        return; // Don't process our own packets
+                }
+                else
+                {
+                    // Client: only track during gameplay
+                    var state = _activeSession.StateMachine.CurrentState;
+                    if (state != GameState.Spawning
+                        && state != GameState.InGame
+                        && state != GameState.Respawning)
+                    {
+                        Log.Debug(Tag, $"Ignored AircraftState: state={state}, fromPeer={fromPeerId}");
+                        return;
+                    }
+                }
             }
+
             if (ownerPeerId == _activeSession?.LocalPeerId) return;
+            Log.Debug(Tag, $"Received AircraftState from peer {ownerPeerId} (via {fromPeerId}), seq={packet.SequenceNumber}, type={packet.AircraftType}");
             _remoteManager?.HandleStatePacket(ownerPeerId, packet);
+
         }
 
         private void HandleAircraftChangedRaw(ulong fromPeerId, byte[] data)
@@ -1591,6 +1667,7 @@ namespace TCAMultiplayer
 
         private void HandlePeerLeft(ulong peerId)
         {
+            _modManifest?.CleanupPeer(peerId);
             _radarSync?.CleanupPeerRadar(peerId);
             _missileSync?.CleanupPeerMissiles(peerId);
             _bombSync?.CleanupPeerBombs(peerId);
@@ -1723,12 +1800,24 @@ namespace TCAMultiplayer
             {
                 _lobby.OnAllPlayersLoaded -= OnAllPlayersLoaded;
                 _lobby.OnGameStarting -= OnGameStarting;
+                _lobby.OnLobbyStateChanged -= OnLobbyStateChanged;
                 _lobby.Dispose();
                 _lobby = null;
             }
             _remoteManager?.Dispose(); _remoteManager = null;
             _stateReader = null;
             _originService?.Reset();
+
+            try
+            {
+                HarmonyLib.Traverse.Create(typeof(Falcon.World.FloatingOrigin))
+                    .Property("TotalOffset")
+                    .SetValue(Vector3.zero);
+            }
+            catch (System.Exception ex)
+            {
+                Log.Warning(Tag, $"Failed to reset FloatingOrigin.TotalOffset: {ex.Message}");
+            }
 
             // Clear UI references to disposed systems and prevent stale lobby UI after host loss.
             _menu?.HandleSessionEnded();
@@ -1815,8 +1904,13 @@ namespace TCAMultiplayer
             {
                 _connection.OnSessionCreated -= OnSessionCreated;
                 _connection.OnSessionEnded -= OnSessionEnded;
+                _connection.OnConnectionFailed -= OnConnectionFailed;
             }
+            // Dispose the active transport (may differ from the original if SetTransport was called)
+            var activeTransport = _connection?.Transport;
             _connection?.Dispose();
+            if (activeTransport != null && activeTransport != _transport)
+                activeTransport.Dispose();
             _transport?.Dispose();
 
             Log.Info(Tag, "All systems shut down");

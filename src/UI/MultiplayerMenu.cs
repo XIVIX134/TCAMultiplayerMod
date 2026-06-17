@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading.Tasks;
+using Steamworks;
 using TMPro;
 using UnityEngine;
 using UnityEngine.EventSystems;
@@ -8,6 +10,8 @@ using UnityEngine.UI;
 using TCAMultiplayer.Compatibility;
 using TCAMultiplayer.Core;
 using TCAMultiplayer.Game;
+using TCAMultiplayer.Transport;
+using ConnectionManager = TCAMultiplayer.Core.ConnectionManager;
 
 namespace TCAMultiplayer.UI
 {
@@ -33,7 +37,7 @@ namespace TCAMultiplayer.UI
         private static readonly Color ModSyncSecondaryPressed = new Color(0f, 0.10f, 0.04f, 0.8f);
         private static readonly Color ModSyncDisabledFill = new Color(0f, 0.05f, 0.02f, 0.45f);
 
-        private enum Screen { MainMenu, HostSetup, DirectConnect, Lobby }
+        private enum Screen { MainMenu, HostSetup, DirectConnect, SteamLobbyBrowser, Lobby }
         private Screen _currentScreen = Screen.MainMenu;
 
         private ConnectionManager _connection;
@@ -65,6 +69,10 @@ namespace TCAMultiplayer.UI
         private string _connectPort;
         private string _hostName;
         private string _hostPort;
+        private int _transportIdx;
+
+        private Steamworks.Data.Lobby[] _lobbyResults;
+        private bool _refreshingLobbies;
 
         public void Init(ConnectionManager connection)
         {
@@ -180,6 +188,8 @@ namespace TCAMultiplayer.UI
             {
                 if (_currentScreen == Screen.MainMenu || _currentScreen == Screen.Lobby)
                     CloseMenu();
+                else if (_currentScreen == Screen.SteamLobbyBrowser)
+                    SetScreen(Screen.MainMenu);
                 else
                     SetScreen(Screen.MainMenu);
             }
@@ -262,6 +272,7 @@ namespace TCAMultiplayer.UI
             _connectPort = ModConfig.LastPort?.Value ?? "7777";
             _hostName = ModConfig.HostServerName?.Value ?? "TCA Server";
             _hostPort = ModConfig.HostPort?.Value ?? "7777";
+            _transportIdx = ModConfig.GetTransportType() == Core.TransportType.SteamLobby ? 1 : 0;
         }
 
         private void SetupUI()
@@ -295,7 +306,7 @@ namespace TCAMultiplayer.UI
             overlayRect.offsetMin = Vector2.zero;
             overlayRect.offsetMax = Vector2.zero;
             var overlayImage = overlay.GetComponent<Image>();
-            overlayImage.color = new Color(0f, 0f, 0f, 0.72f);
+            overlayImage.color = new Color(0f, 0f, 0f, 0.85f);
             overlayImage.raycastTarget = false;
 
             _contentRoot = new GameObject("Content", typeof(RectTransform));
@@ -335,6 +346,7 @@ namespace TCAMultiplayer.UI
                 case Screen.MainMenu: DrawMainMenu(); break;
                 case Screen.HostSetup: DrawHostSetup(); break;
                 case Screen.DirectConnect: DrawDirectConnect(); break;
+                case Screen.SteamLobbyBrowser: DrawSteamLobbyBrowser(); break;
                 case Screen.Lobby: DrawLobby(); break;
             }
 
@@ -364,8 +376,8 @@ namespace TCAMultiplayer.UI
 
         private void DrawMainMenu()
         {
-            var panel = CreateMenuPanel(620f, 470f);
-            AddHeader(panel.transform, "MULTIPLAYER", "Host a direct session or connect to another pilot.");
+            var panel = CreateMenuPanel(860f, 580f);
+            AddHeader(panel.transform, "MULTIPLAYER", "Host a session or connect to another pilot.");
             DrawStatusMessage(panel.transform);
 
             UIFactory.CreateLabelInputRow("Pilot >", _username, panel.transform, val =>
@@ -376,48 +388,102 @@ namespace TCAMultiplayer.UI
 
             UIFactory.CreateSpacer(panel.transform, 8);
 
-            Track(UIFactory.CreateNativeButton("HOST GAME", panel.transform, 52))
-                ?.onClick.AddListener(() => SetScreen(Screen.HostSetup));
+            // ── Steam ────────────────────────────────────────────────────
+            UIFactory.CreateNativeText($"<color={DimGreen}>── STEAM LOBBY ──</color>", panel.transform, 16, TextAlignmentOptions.Center);
 
-            Track(UIFactory.CreateNativeButton("DIRECT CONNECT", panel.transform, 52))
-                ?.onClick.AddListener(() => SetScreen(Screen.DirectConnect));
+            var steamRow = UIFactory.CreateHorizontalGroup(panel.transform, 10);
+            steamRow.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = true;
+
+            var hostSteam = Track(UIFactory.CreateNativeButton("HOST STEAM", steamRow.transform, 48));
+            if (hostSteam != null)
+                hostSteam.onClick.AddListener(() =>
+                {
+                    _transportIdx = 1;
+                    SetScreen(Screen.HostSetup);
+                });
+
+            var browseLobbies = Track(UIFactory.CreateNativeButton("BROWSE LOBBIES", steamRow.transform, 48));
+            if (browseLobbies != null)
+                browseLobbies.onClick.AddListener(() =>
+                {
+                    _transportIdx = 1;
+                    SetScreen(Screen.SteamLobbyBrowser);
+                });
+
+            UIFactory.CreateSpacer(panel.transform, 8);
+
+            // ── Direct ───────────────────────────────────────────────────
+            UIFactory.CreateNativeText($"<color={DimGreen}>── DIRECT IP ──</color>", panel.transform, 16, TextAlignmentOptions.Center);
+
+            var directRow = UIFactory.CreateHorizontalGroup(panel.transform, 10);
+            directRow.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = true;
+
+            var hostDirect = Track(UIFactory.CreateNativeButton("HOST DIRECT", directRow.transform, 48));
+            if (hostDirect != null)
+                hostDirect.onClick.AddListener(() =>
+                {
+                    _transportIdx = 0;
+                    SetScreen(Screen.HostSetup);
+                });
+
+            var directConnect = Track(UIFactory.CreateNativeButton("DIRECT CONNECT", directRow.transform, 48));
+            if (directConnect != null)
+                directConnect.onClick.AddListener(() =>
+                {
+                    _transportIdx = 0;
+                    SetScreen(Screen.DirectConnect);
+                });
+
+            // Force all four host/browse buttons to the same explicit width,
+            // derived from panel width (860) minus padding (28*2=56) minus spacing (10) / 2
+            float btnWidth = 397f;
+            foreach (var btn in new[] { hostSteam, browseLobbies, hostDirect, directConnect })
+            {
+                if (btn != null)
+                    UIFactory.SetLayoutWidth(btn.gameObject, btnWidth, btnWidth);
+            }
 
             UIFactory.CreateSpacer(panel.transform, 14, 1f);
 
-            Track(UIFactory.CreateNativeButton("MAIN MENU", panel.transform, 46))
+            Track(UIFactory.CreateNativeButton("MAIN MENU", panel.transform, 48))
                 ?.onClick.AddListener(CloseMenu);
         }
 
         private void DrawHostSetup()
         {
-            var panel = CreateMenuPanel(700f, 560f);
+            bool isSteam = _transportIdx == 1;
+            float height = isSteam ? 520f : 500f;
+            var panel = CreateMenuPanel(960f, height);
             AddHeader(panel.transform, "HOST GAME", "Create a lobby and wait for peers to join.");
             DrawStatusMessage(panel.transform);
 
-            UIFactory.CreateLabelInputRow("Server >", _hostName, panel.transform, val =>
+            UIFactory.CreateLabelInputRow("Server Name >", _hostName, panel.transform, val =>
             {
                 _hostName = val;
                 if (ModConfig.HostServerName != null) ModConfig.HostServerName.Value = val;
-            });
+            }, 200f);
 
-            UIFactory.CreateLabelInputRow("Port >", _hostPort, panel.transform, val =>
+            if (!isSteam)
             {
-                _hostPort = val;
-                if (ModConfig.HostPort != null) ModConfig.HostPort.Value = val;
-            });
+                UIFactory.CreateLabelInputRow("Port >", _hostPort, panel.transform, val =>
+                {
+                    _hostPort = val;
+                    if (ModConfig.HostPort != null) ModConfig.HostPort.Value = val;
+                }, 200f);
+            }
 
-            DrawHostSetupOptions(panel.transform);
+            DrawHostSetupOptions(panel.transform, isSteam);
 
             UIFactory.CreateSpacer(panel.transform, 18, 1f);
 
-            Track(UIFactory.CreateNativeButton("START SERVER", panel.transform, 54))
+            Track(UIFactory.CreateNativeButton("START SERVER", panel.transform, 48))
                 ?.onClick.AddListener(StartHost);
 
-            Track(UIFactory.CreateNativeButton("BACK", panel.transform, 46))
+            Track(UIFactory.CreateNativeButton("BACK", panel.transform, 48))
                 ?.onClick.AddListener(() => SetScreen(Screen.MainMenu));
         }
 
-        private void DrawHostSetupOptions(Transform parent)
+        private void DrawHostSetupOptions(Transform parent, bool isSteam)
         {
             Track(UIFactory.CreateLabeledSelector(
                 "Player Limit >", BuildPlayerLimitOptions(), MaxPlayersIndex(ModConfig.HostMaxPlayersTotal?.Value ?? 8), parent,
@@ -426,12 +492,37 @@ namespace TCAMultiplayer.UI
                     if (ModConfig.HostMaxPlayersTotal != null)
                         ModConfig.HostMaxPlayersTotal.Value = PlayerLimitFromIndex(idx);
                     RefreshUI();
-                }));
+                }, labelWidth: 200f));
+
+            if (isSteam)
+            {
+                string curLobbyType = ModConfig.HostSteamLobbyType?.Value ?? "Public";
+                int lobbyTypeIdx = string.Equals(curLobbyType, "FriendsOnly", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
+                Track(UIFactory.CreateLabeledSelector(
+                    "Visibility >", new List<string> { "Public", "Friends Only" }, lobbyTypeIdx, parent,
+                    idx =>
+                    {
+                        string val = idx == 1 ? "FriendsOnly" : "Public";
+                        if (ModConfig.HostSteamLobbyType != null)
+                            ModConfig.HostSteamLobbyType.Value = val;
+                        ModConfig.Save();
+                    }, labelWidth: 200f));
+            }
+
+            bool checkModsOn = ModConfig.HostCheckMods?.Value ?? true;
+            Track(UIFactory.CreateLabeledSelector(
+                "Mod Verification >", new List<string> { "ON", "OFF" }, checkModsOn ? 0 : 1, parent,
+                idx =>
+                {
+                    if (ModConfig.HostCheckMods != null)
+                        ModConfig.HostCheckMods.Value = idx == 0;
+                    ModConfig.Save();
+                }, labelWidth: 200f));
         }
 
         private void DrawDirectConnect()
         {
-            var panel = CreateMenuPanel(700f, 470f);
+            var panel = CreateMenuPanel(960f, 430f);
             AddHeader(panel.transform, "DIRECT CONNECT", "Join a lobby by address.");
             DrawStatusMessage(panel.transform);
 
@@ -449,11 +540,345 @@ namespace TCAMultiplayer.UI
 
             UIFactory.CreateSpacer(panel.transform, 18, 1f);
 
-            Track(UIFactory.CreateNativeButton("CONNECT", panel.transform, 54))
+            Track(UIFactory.CreateNativeButton("CONNECT", panel.transform, 48))
                 ?.onClick.AddListener(StartJoin);
 
-            Track(UIFactory.CreateNativeButton("BACK", panel.transform, 46))
+            Track(UIFactory.CreateNativeButton("BACK", panel.transform, 48))
                 ?.onClick.AddListener(() => SetScreen(Screen.MainMenu));
+        }
+
+        /// <summary>
+        /// Browse available Steam lobbies filtered for TCAMP games.
+        /// Auto-refreshes on first entry; shows server name, map, player count, and a JOIN button.
+        /// </summary>
+        private void DrawSteamLobbyBrowser()
+        {
+            Log.Info(Tag, "Drawing Steam lobby browser screen");
+
+            if (_lobbyResults == null && !_refreshingLobbies)
+            {
+                Log.Info(Tag, "No cached results — triggering lobby refresh");
+                _ = RefreshLobbyList();
+            }
+
+            // Build the panel directly with explicit layout instead of CreateScreen,
+            // because the lobby list needs a scrollable region between fixed top/bottom rows.
+            var panel = CreateMenuPanel(1200f, 640f);
+            AddHeader(panel.transform, "STEAM LOBBIES", "Browse available multiplayer sessions.");
+
+            // ── Top row: REFRESH button (fixed 48px at top) ──────────
+            var topRow = UIFactory.CreateHorizontalGroup(panel.transform, 10);
+            var topRowLe = topRow.GetComponent<LayoutElement>();
+            topRowLe.minHeight = 48f;
+            topRowLe.preferredHeight = 48f;
+            topRowLe.flexibleHeight = 0f;
+            topRow.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = true;
+
+            var refresh = AddRowButton(topRow.transform, "REFRESH");
+            if (refresh != null)
+            {
+                refresh.interactable = !_refreshingLobbies;
+                refresh.onClick.AddListener(async () =>
+                {
+                    await RefreshLobbyList();
+                    // Defer to next frame — avoids NRE from destroying UI tree
+                    // while async callback is still on the stack.
+                    if (_visible && _currentScreen == Screen.SteamLobbyBrowser)
+                        Invoke(nameof(RefreshUI), 0f);
+                });
+            }
+
+            // ── Bottom row: BACK button (fixed 48px at bottom) ───────
+            var bottomRow = UIFactory.CreateHorizontalGroup(panel.transform, 10);
+            var bottomRowLe = bottomRow.GetComponent<LayoutElement>();
+            bottomRowLe.minHeight = 48f;
+            bottomRowLe.preferredHeight = 48f;
+            bottomRowLe.flexibleHeight = 0f;
+            bottomRow.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = true;
+
+            AddRowButton(bottomRow.transform, "BACK")
+                ?.onClick.AddListener(() => SetScreen(Screen.MainMenu));
+
+            // ── Middle area: lobby list (fills all remaining space) ───
+            if (_refreshingLobbies)
+            {
+                var msg = UIFactory.CreateNativeText(
+                    $"<color={DimGreen}>Searching for lobbies...</color>",
+                    panel.transform, 18, TextAlignmentOptions.Center);
+                msg.GetComponent<LayoutElement>().flexibleHeight = 1f;
+            }
+            else if (_lobbyResults == null || _lobbyResults.Length == 0)
+            {
+                var msg = UIFactory.CreateNativeText(
+                    $"<color={DimGreen}>No lobbies found. Host a game first, then refresh.</color>",
+                    panel.transform, 18, TextAlignmentOptions.Center);
+                msg.GetComponent<LayoutElement>().flexibleHeight = 1f;
+            }
+            else
+            {
+                // Scrollable lobby list — direct child of the panel VLG
+                var scroll = new GameObject("LobbyScroll", typeof(RectTransform), typeof(ScrollRect), typeof(Mask));
+                scroll.transform.SetParent(panel.transform, false);
+                var scrollLe = scroll.AddComponent<LayoutElement>();
+                scrollLe.flexibleHeight = 1f;
+                scrollLe.minHeight = 0f;
+                scrollLe.preferredHeight = 0f;
+                var scrollRt = scroll.GetComponent<RectTransform>();
+                scrollRt.anchorMin = Vector2.zero;
+                scrollRt.anchorMax = Vector2.one;
+                scrollRt.offsetMin = Vector2.zero;
+                scrollRt.offsetMax = Vector2.zero;
+
+                var scrollContent = new GameObject("Content", typeof(RectTransform), typeof(VerticalLayoutGroup));
+                scrollContent.transform.SetParent(scroll.transform, false);
+                var scrollContentRect = scrollContent.GetComponent<RectTransform>();
+                scrollContentRect.anchorMin = new Vector2(0, 1);
+                scrollContentRect.anchorMax = new Vector2(1, 1);
+                scrollContentRect.pivot = new Vector2(0.5f, 1);
+                scrollContentRect.sizeDelta = new Vector2(0, _lobbyResults.Length * 70f);
+
+                var vlg = scrollContent.GetComponent<VerticalLayoutGroup>();
+                vlg.childForceExpandWidth = true;
+                vlg.childForceExpandHeight = false;
+                vlg.childControlWidth = true;
+                vlg.childControlHeight = true;
+                vlg.spacing = 6f;
+                vlg.padding = new RectOffset(6, 6, 6, 6);
+
+                scroll.GetComponent<ScrollRect>().content = scrollContentRect;
+                scroll.GetComponent<ScrollRect>().movementType = ScrollRect.MovementType.Clamped;
+
+                foreach (var lobby in _lobbyResults)
+                {
+                    DrawLobbyEntry(scrollContent.transform, lobby);
+                }
+            }
+
+            // Don't auto-select any button in the lobby browser
+            _lastSelected = null;
+        }
+
+        /// <summary>Draw a single lobby row with name, map, player count, version, and a JOIN button.</summary>
+        private void DrawLobbyEntry(Transform parent, Steamworks.Data.Lobby lobby)
+        {
+            // Safely extract lobby metadata — lobby.Owner may throw if the
+            // owner left or Steam hasn't fully propagated the data yet.
+            string name;
+            try { name = lobby.GetData("name"); } catch { name = null; }
+            if (string.IsNullOrEmpty(name))
+            {
+                try { name = lobby.Owner.Name; } catch { }
+            }
+            if (string.IsNullOrEmpty(name)) name = "Unknown";
+
+            string map;
+            try { map = lobby.GetData("map"); } catch { map = null; }
+            string version;
+            try { version = lobby.GetData("version"); } catch { version = null; }
+            if (string.IsNullOrEmpty(version)) version = "?";
+
+            string hostName;
+            try { hostName = lobby.GetData("host_name"); } catch { hostName = null; }
+            if (string.IsNullOrEmpty(hostName))
+            {
+                try { hostName = lobby.Owner.Name; } catch { }
+            }
+
+            int players = lobby.MemberCount;
+            int maxPlayers = lobby.MaxMembers;
+
+            string hostSteamId;
+            try { hostSteamId = lobby.GetData("host_steamid"); } catch { hostSteamId = null; }
+
+            // Format map display — show "Loading..." if map metadata isn't set yet
+            string mapDisplay = string.IsNullOrEmpty(map) ? "Loading..." : map;
+
+            string hostDisplay = string.IsNullOrEmpty(hostName) ? "" : $"  —  {hostName}";
+
+            var entry = UIFactory.CreateNativePanel(parent, 8, 6);
+            entry.GetComponent<LayoutElement>().preferredHeight = 60f;
+
+            var row = UIFactory.CreateHorizontalGroup(entry.transform, 8);
+
+            var info = UIFactory.CreateNativeText(
+                $"<color={Green}>{name}{hostDisplay}</color>\n" +
+                $"<color={DimGreen}>{mapDisplay}  |  {players}/{maxPlayers} pilots  |  v{version}</color>",
+                row.transform, 16, TextAlignmentOptions.MidlineLeft);
+            UIFactory.SetFlexible(info.gameObject);
+
+            var joinBtn = Track(UIFactory.CreateNativeButton("JOIN", row.transform, 48));
+            if (joinBtn != null)
+            {
+                // Disable JOIN if: lobby is full, no host_steamid, or it's our own lobby
+                bool isOwnLobby = false;
+                if (!string.IsNullOrEmpty(hostSteamId) && SteamClient.IsValid)
+                {
+                    try { isOwnLobby = hostSteamId == SteamClient.SteamId.Value.ToString(); }
+                    catch { /* SteamId access failed — treat as not own lobby */ }
+                }
+
+                joinBtn.interactable = players < maxPlayers
+                    && !string.IsNullOrEmpty(hostSteamId)
+                    && !isOwnLobby;
+                joinBtn.onClick.AddListener(() =>
+                {
+                    JoinSteamLobby(hostSteamId, lobby);
+                });
+            }
+        }
+
+        /// <summary>
+        /// Query Steam for TCAMP lobbies via the lobby-list API.
+        /// Filters for lobbies with <c>game=TCAMP</c> metadata and at
+        /// least one free slot. Results are cached in <see cref="_lobbyResults"/>
+        /// for display by <see cref="DrawSteamLobbyBrowser"/>.
+        /// </summary>
+        private async Task RefreshLobbyList()
+        {
+            if (_refreshingLobbies)
+            {
+                Log.Debug(Tag, "RefreshLobbyList skipped — already refreshing");
+                return;
+            }
+
+            Log.Info(Tag, "=== Steam Lobby Browser Refresh ===");
+
+            if (!SteamClient.IsValid)
+            {
+                Log.Error(Tag, "Steam is not initialized (SteamClient.IsValid=false). " +
+                    "Cannot browse lobbies. Launch the game through Steam.");
+                _lobbyResults = Array.Empty<Steamworks.Data.Lobby>();
+                _refreshingLobbies = false;
+                RefreshUI();
+                return;
+            }
+
+            Log.Info(Tag, $"SteamClient: IsValid=true, SteamId={SteamClient.SteamId}, " +
+                $"Name={SteamClient.Name}, AppId={SteamClient.AppId}");
+
+            _refreshingLobbies = true;
+            _lobbyResults = null;
+
+            try
+            {
+                var query = SteamMatchmaking.LobbyList
+                    .WithKeyValue("game", "TCAMP")
+                    .WithSlotsAvailable(1)
+                    .FilterDistanceWorldwide()
+                    .WithMaxResults(50);
+
+                Log.Debug(Tag, "Calling RequestAsync() on lobby query...");
+                var stopwatch = new System.Diagnostics.Stopwatch();
+                stopwatch.Start();
+                var lobbies = await query.RequestAsync();
+                stopwatch.Stop();
+
+                _lobbyResults = lobbies ?? Array.Empty<Steamworks.Data.Lobby>();
+                Log.Info(Tag, $"Query returned in {stopwatch.ElapsedMilliseconds}ms — " +
+                    $"found {_lobbyResults.Length} lobbies");
+
+                if (_lobbyResults.Length == 0)
+                {
+                    Log.Info(Tag, "No TCAMP lobbies found. Possible causes:");
+                    Log.Info(Tag, "  - No host is running with 'game'='TCAMP' metadata set");
+                    Log.Info(Tag, "  - Host's lobby is FriendsOnly and you are not on their friends list");
+                    Log.Info(Tag, "  - Host created the lobby but metadata hasn't propagated yet (wait ~5s and refresh)");
+                    Log.Info(Tag, "  - Steam datacenter propagation delay (try refreshing in 10-30s)");
+                    Log.Info(Tag, "  - Both client and host are the same Steam account (can't join own lobby via browser)");
+                }
+                else
+                {
+                    foreach (var lobby in _lobbyResults)
+                    {
+                        string name = lobby.GetData("name") ?? "Unknown";
+                        string map = lobby.GetData("map") ?? "not-set";
+                        string version = lobby.GetData("version") ?? "?";
+                        string hostId = lobby.GetData("host_steamid") ?? "not-set";
+                        Log.Info(Tag, $"  Lobby: id={lobby.Id}, name='{name}', map='{map}', " +
+                            $"version='{version}', host_steamid='{hostId}', " +
+                            $"members={lobby.MemberCount}/{lobby.MaxMembers}, " +
+                            $"owner={lobby.Owner.Name} (id={lobby.Owner.Id})");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error(Tag, $"Failed to list lobbies: {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
+                _lobbyResults = Array.Empty<Steamworks.Data.Lobby>();
+            }
+            finally
+            {
+                _refreshingLobbies = false;
+            }
+        }
+
+        /// <summary>
+        /// Join a Steam lobby by extracting the host's SteamId from its metadata.
+        /// Validates the lobby's game version before joining and provides
+        /// specific error messages for common failure scenarios.
+        /// </summary>
+        private void JoinSteamLobby(string hostSteamId, Steamworks.Data.Lobby lobby)
+        {
+            try
+            {
+                // Validate the host SteamId is present and parseable
+                if (string.IsNullOrEmpty(hostSteamId))
+                {
+                    Log.Error(Tag, "Cannot join lobby: host_steamid metadata is missing. " +
+                        "The host may not have initialized the lobby correctly.");
+                    return;
+                }
+
+                if (!ulong.TryParse(hostSteamId, out ulong steamId))
+                {
+                    Log.Error(Tag, $"Cannot join lobby: host_steamid '{hostSteamId}' is not a valid SteamId.");
+                    return;
+                }
+
+                // Check version compatibility
+                string remoteVersion = lobby.GetData("version") ?? "";
+                string localVersion = "1.0"; // Must match the version set in SteamP2PTransport.SetLobbyMetadata
+                if (!string.IsNullOrEmpty(remoteVersion) && remoteVersion != localVersion)
+                {
+                    Log.Warning(Tag, $"Lobby version mismatch: host has '{remoteVersion}', " +
+                        $"local is '{localVersion}'. Join may fail if the protocol differs.");
+                }
+
+                // Check if the lobby is full
+                if (lobby.MemberCount >= lobby.MaxMembers)
+                {
+                    Log.Warning(Tag, $"Lobby is full: {lobby.MemberCount}/{lobby.MaxMembers}. " +
+                        "The join button should have been disabled.");
+                    return;
+                }
+
+                // Check if we're trying to join our own lobby
+                if (steamId == SteamClient.SteamId.Value)
+                {
+                    Log.Warning(Tag, "Cannot join your own lobby via the browser. " +
+                        "You are already the host.");
+                    return;
+                }
+
+                // Ensure we're using SteamP2PTransport for Steam lobbies
+                if (!(_connection.Config is null) && _transportIdx == 1)
+                {
+                    var steamTransport = new SteamP2PTransport(_connection.Config);
+                    _connection.SetTransport(steamTransport);
+                }
+
+                _connection.JoinSession(steamId.ToString(), 0);
+                var local = _connection.Session?.GetLocalPlayer();
+                if (local != null) local.PlayerName = _username;
+                SetScreen(Screen.Lobby);
+                Log.Info(Tag, $"Joining Steam lobby {lobby.Id} (host: {hostSteamId}, " +
+                    $"map={lobby.GetData("map") ?? "unknown"}, " +
+                    $"version={remoteVersion})");
+            }
+            catch (Exception ex)
+            {
+                Log.Error(Tag, $"Failed to join Steam lobby: {ex.GetType().Name}: {ex.Message}");
+            }
         }
 
         private void DrawLobby()
@@ -462,7 +887,7 @@ namespace TCAMultiplayer.UI
             bool isHost = _connection?.IsHost ?? false;
             EnsureLobbyDefaults(session);
 
-            var shell = CreateMenuPanel(1120f, 800f);
+            var shell = CreateMenuPanel(1200f, 860f);
             AddHeader(shell.transform, "MULTIPLAYER LOBBY", BuildLobbySubtitle(session, isHost));
             DrawStatusMessage(shell.transform);
 
@@ -494,7 +919,7 @@ namespace TCAMultiplayer.UI
             bool gameInProgress = _lobby?.HostGameInProgress ?? false;
             bool localReady = session?.GetLocalPlayer()?.IsReady ?? false;
             bool canReady = CanReady(session) && !gameInProgress;
-            var ready = Track(UIFactory.CreateNativeButton(localReady ? "NOT READY" : "READY", buttons.transform, 50));
+            var ready = Track(UIFactory.CreateNativeButton(localReady ? "NOT READY" : "READY", buttons.transform, 48));
             if (ready != null)
             {
                 ready.interactable = canReady;
@@ -507,7 +932,7 @@ namespace TCAMultiplayer.UI
 
             if (isHost)
             {
-                var start = Track(UIFactory.CreateNativeButton("START GAME", buttons.transform, 50));
+                var start = Track(UIFactory.CreateNativeButton("START GAME", buttons.transform, 48));
                 if (start != null)
                 {
                     start.interactable = AllRequiredPlayersReady(session);
@@ -515,7 +940,7 @@ namespace TCAMultiplayer.UI
                 }
             }
 
-            Track(UIFactory.CreateNativeButton("LEAVE", buttons.transform, 50))
+            Track(UIFactory.CreateNativeButton("LEAVE", buttons.transform, 48))
                 ?.onClick.AddListener(() =>
                 {
                     _connection?.Disconnect();
@@ -556,7 +981,12 @@ namespace TCAMultiplayer.UI
 
             if (session == null || session.Players.Count == 0)
             {
-                UIFactory.CreateNativeText($"<color={DimGreen}>NO PILOTS CONNECTED.</color>", parent, 17, TextAlignmentOptions.Left);
+                bool connecting = session != null
+                    && _connection != null
+                    && !_connection.IsHost
+                    && !_connection.IsConnected;
+                string text = connecting ? "Connecting to server..." : "NO PILOTS CONNECTED.";
+                UIFactory.CreateNativeText($"<color={DimGreen}>{text}</color>", parent, 17, TextAlignmentOptions.Left);
                 return;
             }
 
@@ -807,10 +1237,49 @@ namespace TCAMultiplayer.UI
 
         private void StartHost()
         {
-            if (_connection == null) return;
+            if (_connection == null)
+            {
+                Log.Error(Tag, "StartHost called but ConnectionManager is null");
+                return;
+            }
 
-            int.TryParse(_hostPort, out int port);
-            if (port <= 0) port = 7777;
+            int port = 7777;
+            if (_transportIdx == 0)
+            {
+                int.TryParse(_hostPort, out port);
+                if (port <= 0) port = 7777;
+            }
+
+            // Log the state before hosting
+            string mode = _transportIdx == 1 ? "SteamLobby" : "DirectIP";
+            string lobbyType = "";
+            if (_transportIdx == 1)
+            {
+                lobbyType = ModConfig.HostSteamLobbyType?.Value?.Trim() ?? "Public";
+                Log.Info(Tag, $"=== Starting Steam host ===");
+                Log.Info(Tag, $"Transport: SteamLobby, serverName={_hostName}, lobbyType={lobbyType}");
+                Log.Info(Tag, $"Config: MaxPlayers={ModConfig.HostMaxPlayersTotal?.Value ?? 8}, GameMode={ModConfig.HostGameMode?.Value ?? 0}");
+                Log.Info(Tag, $"SteamClient: IsValid={SteamClient.IsValid}, SteamId={SteamClient.SteamId}");
+
+                // Ensure we're using SteamP2PTransport for Steam lobbies
+                if (!(_connection.Config is null))
+                {
+                    var steamTransport = new SteamP2PTransport(_connection.Config);
+                    _connection.SetTransport(steamTransport);
+                }
+            }
+            else
+            {
+                Log.Info(Tag, $"=== Starting DirectIP host ===");
+                Log.Info(Tag, $"Transport: DirectIP, serverName={_hostName}, port={port}");
+
+                // Ensure we're using DirectUdpTransport for DirectIP
+                if (!(_connection.Config is null))
+                {
+                    var directTransport = new DirectUdpTransport(_connection.Config);
+                    _connection.SetTransport(directTransport);
+                }
+            }
 
             try
             {
@@ -820,11 +1289,11 @@ namespace TCAMultiplayer.UI
                 var local = _connection.Session?.GetLocalPlayer();
                 if (local != null) local.PlayerName = _username;
                 SetScreen(Screen.Lobby);
-                Log.Info(Tag, $"Hosting on port {port}");
+                Log.Info(Tag, $"Host session created: mode={mode}, name={_hostName}, port={port}");
             }
             catch (Exception ex)
             {
-                Log.Error(Tag, $"Host failed: {ex}");
+                Log.Error(Tag, $"Host failed: {ex.GetType().Name}: {ex.Message}");
             }
         }
 
@@ -834,6 +1303,13 @@ namespace TCAMultiplayer.UI
 
             int.TryParse(_connectPort, out int port);
             if (port <= 0) port = 7777;
+
+            // Ensure we're using DirectUdpTransport for direct connections
+            if (_transportIdx == 0 && !(_connection.Config is null))
+            {
+                var directTransport = new DirectUdpTransport(_connection.Config);
+                _connection.SetTransport(directTransport);
+            }
 
             try
             {
@@ -872,6 +1348,45 @@ namespace TCAMultiplayer.UI
             rect.anchoredPosition = Vector2.zero;
             rect.sizeDelta = new Vector2(width, height);
             return panel;
+        }
+
+        // ── Unified Layout Helpers ────────────────────────────────────────
+
+        /// <summary>
+        /// Creates a standard screen panel with header, content area, and optional bottom button row.
+        /// Content area fills remaining space. Returns (panel, contentRoot, bottomRow).
+        /// </summary>
+        private (GameObject panel, GameObject contentRoot, GameObject bottomRow) CreateScreen(
+            float width, float height, string title, string subtitle = "")
+        {
+            var panel = CreateMenuPanel(width, height);
+            AddHeader(panel.transform, title, subtitle);
+
+            // Content area - fills remaining space
+            var contentRoot = UIFactory.CreateVerticalGroup(panel.transform, 10);
+            var contentLe = contentRoot.GetComponent<LayoutElement>();
+            contentLe.flexibleHeight = 1f;
+            contentLe.minHeight = 0f;
+            contentLe.preferredHeight = 0f;
+
+            // Bottom button row (fixed height) - optional
+            var bottomRow = UIFactory.CreateHorizontalGroup(panel.transform, 10);
+            bottomRow.GetComponent<HorizontalLayoutGroup>().childForceExpandWidth = true;
+            var bottomRowLe = bottomRow.GetComponent<LayoutElement>();
+            bottomRowLe.minHeight = 48f;
+            bottomRowLe.preferredHeight = 48f;
+            bottomRowLe.flexibleHeight = 0f;
+
+            return (panel, contentRoot, bottomRow);
+        }
+
+        /// <summary>Adds a fixed-height button to a horizontal row.</summary>
+        private Button AddRowButton(Transform row, string label, float width = 397f)
+        {
+            var btn = Track(UIFactory.CreateNativeButton(label, row, 48));
+            if (btn != null)
+                UIFactory.SetLayoutWidth(btn.gameObject, width, width);
+            return btn;
         }
 
         private void AddHeader(Transform parent, string title, string subtitle)
@@ -1397,6 +1912,7 @@ namespace TCAMultiplayer.UI
                     || local.Team != MultiplayerTeam.None);
         }
 
+        /// <summary>True when any non-host player has IsModsVerified == false.</summary>
         private static bool HasUnverifiedPeers(GameSession session)
         {
             if (session == null)
@@ -1404,7 +1920,10 @@ namespace TCAMultiplayer.UI
 
             foreach (var player in session.Players.Values)
                 if (!player.IsHost && !player.IsModsVerified)
+                {
+                    Log.Debug(Tag, $"Unverified peer: {player.PlayerName} ({player.PeerId}) IsModsVerified={player.IsModsVerified}, IsModSyncing={player.IsModSyncing}");
                     return true;
+                }
 
             return false;
         }

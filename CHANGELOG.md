@@ -4,6 +4,14 @@ All notable changes to TCAMP are tracked here.
 
 ## Unreleased
 
+- Refactored Steam P2P transport: fixed thread safety in peer tracking, replaced magic byte markers with named constants, improved lobby metadata propagation (map name now set in lobby metadata).
+- Added `UpdateLobbyMap` to `SteamP2PTransport` so the lobby browser always shows the current map.
+- Fixed lobby browser: version check before joining, self-join prevention, better error messages for common failure scenarios (missing host_steamid, full lobby, version mismatch).
+- Added 15-second connection timeout for clients — auto-disconnects if the host doesn't respond.
+- Added `OnConnectionFailed` event to `ConnectionManager` for UI notification of connection failures.
+- Added `CreateTransport` factory in `PluginRunner` for cleaner transport initialization.
+- Wired lobby state changes to update Steam lobby metadata automatically.
+- Added TCAMM-style XML documentation to `SteamP2PTransport`, `ConnectionManager`, and `MultiplayerMenu`.
 - Add new changes here before running `.\scripts\Release-Version.ps1`.
 
 ## v0.2.3 - 2026-06-15
