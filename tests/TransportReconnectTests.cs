@@ -56,6 +56,12 @@ namespace TCAMultiplayer.Tests
             return config;
         }
 
+        private static string EndpointAddressText(string endpoint)
+        {
+            int separator = endpoint?.LastIndexOf(':') ?? -1;
+            return separator > 0 ? endpoint.Substring(0, separator) : endpoint;
+        }
+
         /// <summary>Pump update loops for a fixed duration. Pass pumpB=false to simulate peer B going silent.</summary>
         private static void Pump(DirectUdpTransport a, DirectUdpTransport b, double seconds, bool pumpB = true)
         {
@@ -514,7 +520,32 @@ namespace TCAMultiplayer.Tests
         }
 
         [Test]
-        public void LocalBindAddress_AllowsBindingToSelectedAdapterIp()
+        public void Host_IgnoresLocalBindAddress_AndListensOnAllAdapters()
+        {
+            int port = _nextPort++;
+            var host = new DirectUdpTransport(new TransportConfig
+            {
+                LocalBindAddress = "127.0.0.1",
+                EndpointRefreshInterval = 0f,
+            });
+
+            try
+            {
+                host.StartHost(port);
+
+                var quality = host.GetNetworkQuality();
+                Assert.AreEqual("0.0.0.0", EndpointAddressText(quality.LocalEndpoint),
+                    "host should listen on all IPv4 adapters for LAN, VPN, and port-forwarded public joins");
+                Assert.AreEqual("listening on all IPv4 adapters", quality.RouteDescription);
+            }
+            finally
+            {
+                host.Dispose();
+            }
+        }
+
+        [Test]
+        public void ClientLocalBindAddress_AllowsBindingToSelectedAdapterIp()
         {
             int port = _nextPort++;
             var host = new DirectUdpTransport(new TransportConfig

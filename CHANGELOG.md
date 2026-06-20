@@ -6,6 +6,12 @@ All notable changes to TCAMP are tracked here.
 
 - Add new changes here before running `.\scripts\Release-Version.ps1`.
 
+## v0.3.1 - 2026-06-20
+
+- Improved Direct IP routing so hosts listen on all IPv4 adapters while clients dynamically choose the correct local route for LAN, VPN/tunnel, or public IP joins.
+- Fixed host relay validation for radar lock-lost packets so client unlock events can reach other peers.
+- Tightened lobby packet handler cleanup so disposing the lobby only removes its own router handlers.
+
 ## v0.3.0 - 2026-06-17
 
 Thanks to @1w7g0 for the Steam Integration PR that provided the Steam multiplayer transport, lobby browser, and related hosting/joining improvements in this release.

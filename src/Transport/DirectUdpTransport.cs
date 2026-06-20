@@ -998,7 +998,8 @@ namespace TCAMultiplayer.Transport
 
         private UdpClient CreateUdpClient(int port, IPAddress remoteAddress = null)
         {
-            var bindAddressText = _config.LocalBindAddress;
+            bool isListeningSocket = port > 0 && remoteAddress == null;
+            var bindAddressText = isListeningSocket ? "" : _config.LocalBindAddress;
             IPAddress bindAddress = IPAddress.Any;
             _routeDescription = port > 0 ? "listening on all IPv4 adapters" : "OS default route";
             string ignoredManualBind = null;
@@ -1189,6 +1190,17 @@ namespace TCAMultiplayer.Transport
             if (candidates.Count == 0)
                 return false;
 
+            if (TryGetOsSelectedLocalAddress(remoteAddress, out var osSelectedAddress))
+            {
+                var osSelectedCandidate = FindLocalAddressCandidate(candidates, osSelectedAddress);
+                if (osSelectedCandidate != null)
+                {
+                    address = osSelectedCandidate.Address;
+                    description = $"OS route on {osSelectedCandidate.AdapterName}";
+                    return true;
+                }
+            }
+
             byte[] remoteBytes = remoteAddress.GetAddressBytes();
             bool remoteSpecialVpn = IsSpecialVpnAddress(remoteBytes);
             bool remoteRfc1918 = IsRfc1918Address(remoteBytes);
@@ -1239,6 +1251,50 @@ namespace TCAMultiplayer.Transport
             address = best.Address;
             description = $"matched route on {best.AdapterName}";
             return true;
+        }
+
+        private static bool TryGetOsSelectedLocalAddress(IPAddress remoteAddress, out IPAddress localAddress)
+        {
+            localAddress = null;
+
+            if (remoteAddress == null || remoteAddress.AddressFamily != AddressFamily.InterNetwork)
+                return false;
+
+            try
+            {
+                using (var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+                {
+                    socket.Connect(new IPEndPoint(remoteAddress, 9));
+                    if (socket.LocalEndPoint is IPEndPoint localEndpoint
+                        && localEndpoint.Address.AddressFamily == AddressFamily.InterNetwork
+                        && !IPAddress.Any.Equals(localEndpoint.Address))
+                    {
+                        localAddress = localEndpoint.Address;
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return false;
+        }
+
+        private static LocalAddressCandidate FindLocalAddressCandidate(
+            List<LocalAddressCandidate> candidates,
+            IPAddress address)
+        {
+            if (candidates == null || address == null)
+                return null;
+
+            foreach (var candidate in candidates)
+            {
+                if (candidate.Address.Equals(address))
+                    return candidate;
+            }
+
+            return null;
         }
 
         private static List<LocalAddressCandidate> GetLocalAddressCandidates()

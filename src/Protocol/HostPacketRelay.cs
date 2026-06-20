@@ -93,6 +93,7 @@ namespace TCAMultiplayer.Protocol
                 case PacketType.MissileLaunch:
                     return PacketSerializer.DeserializeMissileLaunch(payload).ShooterId == fromPeerId;
                 case PacketType.RadarLock:
+                case PacketType.RadarLockLost:
                     return PacketSerializer.DeserializeRadarLock(payload).LockerId == fromPeerId;
                 case PacketType.BombDrop:
                     return PacketSerializer.DeserializeBombDrop(payload).ShooterId == fromPeerId;

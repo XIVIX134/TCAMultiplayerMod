@@ -1179,14 +1179,21 @@ namespace TCAMultiplayer.Game
             if (_disposed) return;
             _disposed = true;
             _session.OnPlayerLeft -= HandleSessionPlayerLeft;
-            var unregTypes = new[] {
-                PacketType.LobbyState, PacketType.LobbyPlayerJoined, PacketType.LobbyPlayerLeft,
-                PacketType.LobbyPlayerReady, PacketType.LobbyAirfieldSelect, PacketType.LobbySpawnSettings,
-                PacketType.LobbyStartGame, PacketType.LobbyLoadingComplete, PacketType.LobbySpawnPlayers,
-                PacketType.LobbyRespawnRequest, PacketType.LobbyWelcome, PacketType.LobbyReturnToLobby,
-                PacketType.LobbyTeamSelect, PacketType.AircraftSelect, PacketType.LoadoutSelect
-            };
-            foreach (var t in unregTypes) _router.Unregister(t);
+            _router.Unregister(PacketType.LobbyState, HandleLobbyStateRaw);
+            _router.Unregister(PacketType.LobbyPlayerJoined, HandlePlayerJoinedRaw);
+            _router.Unregister(PacketType.LobbyPlayerLeft, HandlePlayerLeftRaw);
+            _router.Unregister(PacketType.LobbyPlayerReady, HandlePlayerReadyRaw);
+            _router.Unregister(PacketType.LobbyAirfieldSelect, HandleAirfieldSelectRaw);
+            _router.Unregister(PacketType.LobbySpawnSettings, HandleSpawnSettingsRaw);
+            _router.Unregister(PacketType.LobbyStartGame, HandleStartGameRaw);
+            _router.Unregister(PacketType.LobbyLoadingComplete, HandleLoadingCompleteRaw);
+            _router.Unregister(PacketType.LobbySpawnPlayers, HandleSpawnPlayersRaw);
+            _router.Unregister(PacketType.LobbyRespawnRequest, HandleRespawnRequestRaw);
+            _router.Unregister(PacketType.LobbyWelcome, HandleWelcomeRaw);
+            _router.Unregister(PacketType.LobbyReturnToLobby, HandleReturnToLobbyRaw);
+            _router.Unregister(PacketType.LobbyTeamSelect, HandleTeamSelectRaw);
+            _router.Unregister(PacketType.AircraftSelect, HandleAircraftSelectRaw);
+            _router.Unregister(PacketType.LoadoutSelect, HandleLoadoutSelectRaw);
             OnLobbyStateChanged = null;
             OnGameStarting = null;
             OnAllPlayersLoaded = null;

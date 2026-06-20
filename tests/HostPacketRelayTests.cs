@@ -112,6 +112,53 @@ namespace TCAMultiplayer.Tests
         }
 
         [Test]
+        public void HostRelay_RelaysClientRadarLockLost_WhenLockerMatchesSender()
+        {
+            var network = new FakeNetworkHarness();
+            var hostTransport = network.CreateHost(1);
+            var firstClientTransport = network.CreateClient(2);
+            var secondClientTransport = network.CreateClient(3);
+
+            using (var hostConnection = new ConnectionManager(hostTransport, new TransportConfig { MaxConnections = 7 }))
+            using (var firstClientConnection = new ConnectionManager(firstClientTransport))
+            using (var secondClientConnection = new ConnectionManager(secondClientTransport))
+            {
+                hostConnection.HostSession("Host", 7777);
+                firstClientConnection.JoinSession("127.0.0.1", 7777);
+                secondClientConnection.JoinSession("127.0.0.1", 7777);
+                Pump(network, hostConnection, firstClientConnection, secondClientConnection);
+
+                using (new HostPacketRelay(hostConnection.Session, hostConnection, hostConnection.Router))
+                {
+                    RadarLockPacket relayed = default;
+                    secondClientConnection.Router.Register(PacketType.RadarLockLost, (_, raw) =>
+                    {
+                        var (_, payload) = PacketSerializer.Deserialize(raw);
+                        relayed = PacketSerializer.DeserializeRadarLock(payload);
+                    });
+
+                    var packet = new RadarLockPacket
+                    {
+                        LockerId = 2,
+                        TargetId = 3,
+                        IsLocked = false,
+                        LockType = 0
+                    };
+                    var frame = PacketSerializer.Serialize(
+                        PacketType.RadarLockLost,
+                        PacketSerializer.SerializeRadarLock(packet));
+
+                    firstClientConnection.BroadcastUnreliable(frame);
+                    Pump(network, hostConnection, firstClientConnection, secondClientConnection);
+
+                    Assert.AreEqual(2UL, relayed.LockerId);
+                    Assert.AreEqual(3UL, relayed.TargetId);
+                    Assert.IsFalse(relayed.IsLocked);
+                }
+            }
+        }
+
+        [Test]
         public void HostRelay_FansOutAircraftState_FromOneClientToSixOtherPeers()
         {
             var network = new FakeNetworkHarness();

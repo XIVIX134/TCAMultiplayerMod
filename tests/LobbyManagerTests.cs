@@ -139,6 +139,34 @@ namespace TCAMultiplayer.Tests
         }
 
         [Test]
+        public void Dispose_RemovesOnlyLobbyHandlers()
+        {
+            using (var session = new GameSession(isHost: false))
+            using (var transport = new FakeTransport())
+            using (var connection = new ConnectionManager(transport))
+            {
+                session.LocalPeerId = 2;
+                var router = new PacketRouter();
+                int sharedHandlerCalls = 0;
+                router.Register(PacketType.LobbyState, (_, __) => sharedHandlerCalls++);
+
+                using (new LobbyManager(session, connection, router))
+                {
+                    Assert.AreEqual(2, router.GetHandlerCount(PacketType.LobbyState));
+                }
+
+                Assert.AreEqual(1, router.GetHandlerCount(PacketType.LobbyState));
+
+                var frame = PacketSerializer.Serialize(
+                    PacketType.LobbyState,
+                    PacketSerializer.SerializeLobbyState(new LobbyStatePacket()));
+                router.Route(1, frame);
+
+                Assert.AreEqual(1, sharedHandlerCalls);
+            }
+        }
+
+        [Test]
         public void HostLobbyTeamSelect_RejectsPeerSpoofingAnotherPlayer()
         {
             using (var session = new GameSession(isHost: true))
