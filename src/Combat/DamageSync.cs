@@ -1,11 +1,10 @@
 using System;
-using System.Reflection;
+using System.Collections.Generic;
 using UnityEngine;
 using Falcon;
 using Falcon.Damage;
 using Falcon.Targeting;
 using Falcon.UniversalAircraft;
-using Falcon.Weapons;
 using TCAMultiplayer.Core;
 using TCAMultiplayer.Game;
 using TCAMultiplayer.Protocol;
@@ -30,7 +29,6 @@ namespace TCAMultiplayer.Combat
         private readonly RemoteAircraftManager _remoteManager;
         private readonly FloatingOriginService _originService;
         private readonly Func<UniAircraft> _localAircraftProvider;
-        private readonly FieldInfo _damageableMostRecentDamageField;
         private readonly ApplicationEventSequencer _damageSequencer = new ApplicationEventSequencer();
         private readonly ApplicationEventDedupCache _damageDedup = new ApplicationEventDedupCache();
         private float _lastForwardDiagnosticTime;
@@ -52,9 +50,6 @@ namespace TCAMultiplayer.Combat
             _remoteManager = remoteManager ?? throw new ArgumentNullException(nameof(remoteManager));
             _originService = originService ?? throw new ArgumentNullException(nameof(originService));
             _localAircraftProvider = localAircraftProvider;
-            _damageableMostRecentDamageField = typeof(Damageable).GetField(
-                "<MostRecentDamage>k__BackingField",
-                BindingFlags.Instance | BindingFlags.NonPublic);
 
             _router.Register(PacketType.DamageDealt, OnDamageDealtReceived);
             _router.Register(PacketType.PartDestroyed, OnPartDestroyedReceived);
@@ -89,31 +84,13 @@ namespace TCAMultiplayer.Combat
                 Log.Warning(Tag, $"Rejected DamageDealt from peer {fromPeerId} for attacker {packet.AttackerId}");
                 return;
             }
-            if (packet.VictimId == 0 || packet.VictimId != _session.LocalPeerId)
+            if (packet.VictimId == 0)
                 return;
             if (packet.AttackerId == _session.LocalPeerId)
                 return;
-            if (packet.AttackerLifeId != 0)
-            {
-                var id = new ApplicationEventId(
-                    packet.AttackerId,
-                    packet.AttackerLifeId,
-                    ApplicationEventKind.Damage,
-                    packet.DamageSequence,
-                    packet.DamageType);
-                if (!_damageDedup.TryAccept(id))
-                {
-                    Log.Debug(Tag, $"Ignoring duplicate/stale damage event {id} weapon={packet.WeaponName}");
-                    return;
-                }
-            }
-
-            var localPlayer = _session.GetLocalPlayer();
-            if (localPlayer != null && !localPlayer.IsAlive)
-            {
-                Log.Debug(Tag, $"Ignoring damage while local player is dead weapon={packet.WeaponName}");
+            if (!TryAcceptDamageEvent(packet))
                 return;
-            }
+
             if (_session.ArePlayersOnSameTeam(packet.AttackerId, packet.VictimId))
             {
                 Log.Debug(Tag, $"Ignoring friendly damage attacker={packet.AttackerId} victim={packet.VictimId}");
@@ -125,7 +102,44 @@ namespace TCAMultiplayer.Combat
                 return;
             }
 
-            var localDamageable = FindLocalDamageable();
+            if (packet.VictimId == _session.LocalPeerId)
+            {
+                ApplyDamageToLocalVictim(packet);
+                return;
+            }
+
+            ApplyDamageToRemoteVictimClone(packet);
+        }
+
+        private bool TryAcceptDamageEvent(DamagePacket packet)
+        {
+            if (packet.AttackerLifeId == 0)
+                return true;
+
+            var id = new ApplicationEventId(
+                packet.AttackerId,
+                packet.AttackerLifeId,
+                ApplicationEventKind.Damage,
+                packet.DamageSequence,
+                packet.DamageType);
+            if (_damageDedup.TryAccept(id))
+                return true;
+
+            Log.Debug(Tag, $"Ignoring duplicate/stale damage event {id} weapon={packet.WeaponName}");
+            return false;
+        }
+
+        private void ApplyDamageToLocalVictim(DamagePacket packet)
+        {
+            var localPlayer = _session.GetLocalPlayer();
+            if (localPlayer != null && !localPlayer.IsAlive)
+            {
+                Log.Debug(Tag, $"Ignoring damage while local player is dead weapon={packet.WeaponName}");
+                return;
+            }
+
+            var localAircraft = FindLocalAircraft();
+            var localDamageable = FindPrimaryDamageable(localAircraft);
             if (localDamageable == null)
             {
                 if (localPlayer != null && !localPlayer.IsAlive)
@@ -139,34 +153,89 @@ namespace TCAMultiplayer.Combat
                 Log.Debug(Tag, "Ignoring damage for already-destroyed local aircraft");
                 return;
             }
+
             Target attackerTarget = ResolveAttackerTarget(packet.AttackerId);
+            ApplyDamageToAircraft(localAircraft, localDamageable, packet, attackerTarget, isLocalVictim: true);
+        }
+
+        private void ApplyDamageToRemoteVictimClone(DamagePacket packet)
+        {
+            var victim = _session.GetPlayer(packet.VictimId);
+            if (victim != null
+                && (victim.IsAwaitingRespawn || (victim.LifeId != 0 && !victim.IsAlive)))
+            {
+                Log.Debug(Tag, $"Ignoring clone damage for dead/respawning peer {packet.VictimId} weapon={packet.WeaponName}");
+                return;
+            }
+
+            var aircraft = _remoteManager.GetAircraft(packet.VictimId);
+            if (aircraft == null)
+            {
+                Log.Debug(Tag, $"Ignoring damage for unspawned remote victim {packet.VictimId} weapon={packet.WeaponName}");
+                return;
+            }
+
+            var damageable = FindPrimaryDamageable(aircraft);
+            if (damageable == null || damageable.IsDestroyed)
+                return;
+
+            Target attackerTarget = ResolveAttackerTarget(packet.AttackerId);
+            ApplyDamageToAircraft(aircraft, damageable, packet, attackerTarget, isLocalVictim: false);
+        }
+
+        private void ApplyDamageToAircraft(
+            UniAircraft aircraft,
+            Damageable primaryDamageable,
+            DamagePacket packet,
+            Target attackerTarget,
+            bool isLocalVictim)
+        {
             Vector3 localHitPos = _originService.AbsoluteToLocal(
                 packet.HitPosX, packet.HitPosY, packet.HitPosZ);
 
-            // If the shooter hit a specific damageable part on our clone, apply
-            // the damage to OUR matching part so the native per-part model runs
-            // (part HP, shear-off, engine/control damage, mirror to hull).
-            var targetDamageable = ResolveLocalHitPart(packet.HitPartName) ?? localDamageable;
-
-            // Public 9-param DamageSource constructor — no reflection
+            var targetDamageable = ResolveHitPart(aircraft, packet.HitPartName) ?? primaryDamageable;
+            var hitCollider = ResolveHitCollider(aircraft, targetDamageable, packet.HitColliderPath);
             var damageSource = new DamageSource(
                 packet.Damage,
                 packet.Penetration,
-                0,                  // critHitChance
-                0,                  // maxCritHits
+                packet.CriticalHitChance,
+                packet.MaxCriticalHits,
                 attackerTarget,
-                null,               // hitCollider — no local reference
+                hitCollider,
                 localHitPos,
-                true,               // isCausedByWeapon
+                true,
                 packet.WeaponName ?? "Unknown"
             );
 
-            OnRemoteDamageApplied?.Invoke(packet.AttackerId, packet.WeaponName);
+            if (isLocalVictim)
+                OnRemoteDamageApplied?.Invoke(packet.AttackerId, packet.WeaponName);
+
+            ApplyNetworkDamage(targetDamageable, damageSource, packet.DamageType, allowDestroy: isLocalVictim);
+
+            Log.Info(Tag, $"{(isLocalVictim ? "Applied" : "Mirrored clone")} {packet.Damage} dmg " +
+                          $"from {packet.AttackerId} to {packet.VictimId} " +
+                          $"(type={packet.DamageType}, part={FormatPart(packet.HitPartName)}, " +
+                          $"collider={packet.HitColliderPath ?? ""}) hullHP={primaryDamageable.HitPoints}");
+        }
+
+        private static void ApplyNetworkDamage(
+            Damageable targetDamageable,
+            DamageSource damageSource,
+            byte damageType,
+            bool allowDestroy)
+        {
+            if (!allowDestroy)
+            {
+                int cappedDamage = Math.Min(damageSource.Damage, Math.Max(0, targetDamageable.HitPoints - 1));
+                if (cappedDamage <= 0)
+                    return;
+                damageSource.Damage = cappedDamage;
+            }
 
             DamagePatch.NetworkDamageDepth++;
             try
             {
-                if (packet.DamageType == 2)
+                if (damageType == 2)
                     targetDamageable.ApplyDamageFromExplosion(damageSource);
                 else
                     targetDamageable.ApplyDamageFromImpact(damageSource);
@@ -175,10 +244,6 @@ namespace TCAMultiplayer.Combat
             {
                 DamagePatch.NetworkDamageDepth--;
             }
-
-            Log.Info(Tag, $"Applied {packet.Damage} dmg from {packet.AttackerId} " +
-                          $"(type={packet.DamageType}, part={packet.HitPartName ?? "hull"}) " +
-                          $"hullHP={localDamageable.HitPoints}");
         }
 
         // ── Helpers ──────────────────────────────────────────────────
@@ -186,28 +251,35 @@ namespace TCAMultiplayer.Combat
         /// <summary>Find local player's Damageable (non-remote UniAircraft).</summary>
         private Damageable FindLocalDamageable()
         {
+            return FindPrimaryDamageable(FindLocalAircraft());
+        }
+
+        private UniAircraft FindLocalAircraft()
+        {
             var providedAircraft = _localAircraftProvider?.Invoke();
             if (providedAircraft != null && !IsRemoteClone(providedAircraft))
-            {
-                var providedDamageable = providedAircraft.GetComponentInChildren<Damageable>();
-                if (providedDamageable != null) return providedDamageable;
-            }
+                return providedAircraft;
 
             var player = UniAircraft.Player;
             if (player != null && !IsRemoteClone(player))
-            {
-                var playerDamageable = player.GetComponentInChildren<Damageable>();
-                if (playerDamageable != null) return playerDamageable;
-            }
+                return player;
 
             var allAircraft = UnityEngine.Object.FindObjectsByType<UniAircraft>(FindObjectsSortMode.None);
             foreach (var aircraft in allAircraft)
             {
                 var damageable = aircraft.gameObject.GetComponentInChildren<Damageable>();
                 if (damageable != null && !_remoteManager.IsRemoteCloneDamageable(damageable))
-                    return damageable;
+                    return aircraft;
             }
             return null;
+        }
+
+        private static Damageable FindPrimaryDamageable(UniAircraft aircraft)
+        {
+            if (aircraft == null) return null;
+            return aircraft.Damage != null
+                ? aircraft.Damage
+                : aircraft.GetComponentInChildren<Damageable>();
         }
 
         /// <summary>Resolve attacker peer ID → their aircraft's Target component.</summary>
@@ -225,10 +297,12 @@ namespace TCAMultiplayer.Combat
         /// </summary>
         private Damageable ResolveLocalHitPart(string hitPartName)
         {
-            if (string.IsNullOrEmpty(hitPartName)) return null;
+            return ResolveHitPart(FindLocalAircraft(), hitPartName);
+        }
 
-            var aircraft = _localAircraftProvider?.Invoke() ?? UniAircraft.Player;
-            if (aircraft == null || IsRemoteClone(aircraft)) return null;
+        private static Damageable ResolveHitPart(UniAircraft aircraft, string hitPartName)
+        {
+            if (aircraft == null || string.IsNullOrEmpty(hitPartName)) return null;
 
             foreach (var wing in aircraft.GetComponentsInChildren<Falcon.Vehicles.WingDamage>())
             {
@@ -396,7 +470,6 @@ namespace TCAMultiplayer.Combat
             // Get hit position in absolute coordinates
             Vector3 hitPos = source.HitPosition;
             _originService.LocalToAbsolute(hitPos, out double absX, out double absY, out double absZ);
-            ApplyVisualDamageToRemoteClone(cloneDamageable, source);
             LogForwardDiagnostic(victimPeerId, source, isExplosion);
             var localLifeId = GetLocalLifeId();
             var eventId = _damageSequencer.Next(
@@ -410,6 +483,7 @@ namespace TCAMultiplayer.Combat
             string hitPartName = cloneDamageable.GetComponent<Falcon.Vehicles.WingDamage>() != null
                 ? cloneDamageable.name
                 : "";
+            string hitColliderPath = GetTransformPath(ownerAircraft?.transform, source.HitCollider?.transform);
 
             var packet = new DamagePacket
             {
@@ -419,34 +493,109 @@ namespace TCAMultiplayer.Combat
                 DamageSequence = eventId.Sequence,
                 Damage = source.Damage,
                 Penetration = source.Penetration,
+                CriticalHitChance = source.CriticalHitChance,
+                MaxCriticalHits = source.MaxCriticalHits,
                 DamageType = isExplosion ? (byte)2 : (byte)0,
                 HitPosX = absX,
                 HitPosY = absY,
                 HitPosZ = absZ,
                 WeaponName = source.Weapon ?? "Unknown",
-                HitPartName = hitPartName
+                HitPartName = hitPartName,
+                HitColliderPath = hitColliderPath
             };
 
+            ApplyNetworkDamage(cloneDamageable, source, packet.DamageType, allowDestroy: false);
             SendDamage(victimPeerId, packet);
             Log.Info(Tag, $"Forwarded {source.Damage} damage to peer {victimPeerId} " +
                           $"type={(isExplosion ? "explosion" : "impact")} weapon={source.Weapon} event={eventId}");
         }
 
-        private void ApplyVisualDamageToRemoteClone(Damageable cloneDamageable, DamageSource source)
+        private static Collider ResolveHitCollider(
+            UniAircraft aircraft,
+            Damageable targetDamageable,
+            string hitColliderPath)
         {
-            if (cloneDamageable == null || source.Damage <= 0) return;
+            if (aircraft != null && !string.IsNullOrEmpty(hitColliderPath))
+            {
+                var transform = FindTransformByPath(aircraft.transform, hitColliderPath);
+                var collider = transform != null ? transform.GetComponent<Collider>() : null;
+                if (collider != null)
+                    return collider;
+            }
 
-            try
+            if (targetDamageable == null)
+                return null;
+
+            var wing = targetDamageable.GetComponent<Falcon.Vehicles.WingDamage>();
+            if (wing != null && wing.Hitbox != null)
+                return wing.Hitbox;
+
+            return targetDamageable.GetComponent<Collider>()
+                ?? targetDamageable.GetComponentInChildren<Collider>();
+        }
+
+        private static string GetTransformPath(Transform root, Transform target)
+        {
+            if (root == null || target == null || !target.IsChildOf(root))
+                return "";
+
+            var names = new List<string>();
+            var current = target;
+            while (current != null && current != root)
             {
-                cloneDamageable.HitPoints = Math.Max(1, cloneDamageable.HitPoints - source.Damage);
-                if (source.IsCausedByWeapon && _damageableMostRecentDamageField != null)
-                    _damageableMostRecentDamageField.SetValue(cloneDamageable, source);
-                cloneDamageable.OnDamaged?.Invoke(source);
+                names.Add(current.name);
+                current = current.parent;
             }
-            catch (Exception ex)
+            names.Reverse();
+            return string.Join("/", names.ToArray());
+        }
+
+        private static Transform FindTransformByPath(Transform root, string path)
+        {
+            if (root == null || string.IsNullOrEmpty(path))
+                return null;
+
+            var current = root;
+            var parts = path.Split('/');
+            for (int i = 0; i < parts.Length; i++)
             {
-                Log.Warning(Tag, $"Remote clone visual damage failed: {ex.Message}");
+                if (string.IsNullOrEmpty(parts[i]))
+                    continue;
+
+                Transform next = null;
+                for (int childIndex = 0; childIndex < current.childCount; childIndex++)
+                {
+                    var child = current.GetChild(childIndex);
+                    if (child.name == parts[i])
+                    {
+                        next = child;
+                        break;
+                    }
+                }
+                if (next == null)
+                    return FindDeepChildByName(root, parts[parts.Length - 1]);
+                current = next;
             }
+
+            return current;
+        }
+
+        private static Transform FindDeepChildByName(Transform root, string name)
+        {
+            if (root == null || string.IsNullOrEmpty(name))
+                return null;
+
+            foreach (var transform in root.GetComponentsInChildren<Transform>(true))
+            {
+                if (transform != null && transform.name == name)
+                    return transform;
+            }
+            return null;
+        }
+
+        private static string FormatPart(string partName)
+        {
+            return string.IsNullOrEmpty(partName) ? "hull" : partName;
         }
 
         // ── Dispose ──────────────────────────────────────────────────

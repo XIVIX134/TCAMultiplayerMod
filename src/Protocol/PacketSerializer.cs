@@ -243,6 +243,9 @@ namespace TCAMultiplayer.Protocol
                 w.Write(packet.AttackerLifeId);
                 w.Write(packet.DamageSequence);
                 w.Write(packet.HitPartName ?? "");
+                w.Write(packet.CriticalHitChance);
+                w.Write(packet.MaxCriticalHits);
+                w.Write(packet.HitColliderPath ?? "");
                 return ms.ToArray();
             }
         }
@@ -275,6 +278,18 @@ namespace TCAMultiplayer.Protocol
                 // Backward compat: hit part name added after event identity.
                 if (r.BaseStream.Position < r.BaseStream.Length)
                     packet.HitPartName = r.ReadString();
+
+                // Backward compat: full DamageSource critical-hit fields were
+                // appended after the hit-part name.
+                if (r.BaseStream.Position + sizeof(int) * 2 <= r.BaseStream.Length)
+                {
+                    packet.CriticalHitChance = r.ReadInt32();
+                    packet.MaxCriticalHits = r.ReadInt32();
+                }
+
+                // Backward compat: hit collider path was appended last.
+                if (r.BaseStream.Position < r.BaseStream.Length)
+                    packet.HitColliderPath = r.ReadString();
 
                 return packet;
             });

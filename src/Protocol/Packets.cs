@@ -469,6 +469,8 @@ namespace TCAMultiplayer.Protocol
         public uint DamageSequence;
         public int Damage;
         public int Penetration;
+        public int CriticalHitChance;
+        public int MaxCriticalHits;
         public byte DamageType;     // 0 = bullet, 1 = missile, 2 = explosion
         public double HitPosX;
         public double HitPosY;
@@ -476,6 +478,8 @@ namespace TCAMultiplayer.Protocol
         public string WeaponName;
         public string HitPartName;  // damageable part hit on the shooter's clone
                                     // (backward-compat trailing field; may be empty)
+        public string HitColliderPath; // collider transform path under the victim aircraft
+                                       // (backward-compat trailing field; may be empty)
     }
 
     /// <summary>

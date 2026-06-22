@@ -34,6 +34,9 @@ namespace TCAMultiplayer.Patches
         {
             if (IsRemoteClone?.Invoke(__instance) == true)
             {
+                if (NetworkDamageDepth > 0)
+                    return true;
+
                 if (AllowRemoteCloneNativeDamage?.Invoke(__instance, damageSource) == true)
                     return true;
 
@@ -54,6 +57,9 @@ namespace TCAMultiplayer.Patches
         {
             if (IsRemoteClone?.Invoke(__instance) == true)
             {
+                if (NetworkDamageDepth > 0)
+                    return true;
+
                 if (AllowRemoteCloneNativeDamage?.Invoke(__instance, damageSource) == true)
                     return true;
 

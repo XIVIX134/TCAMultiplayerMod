@@ -456,12 +456,15 @@ namespace TCAMultiplayer.Tests
                 DamageSequence = 77,
                 Damage = 500,
                 Penetration = 100,
+                CriticalHitChance = 30,
+                MaxCriticalHits = 2,
                 DamageType = 1, // missile
                 HitPosX = 1234.5678,
                 HitPosY = 2345.6789,
                 HitPosZ = 3456.7890,
                 WeaponName = "M61A1",
-                HitPartName = "WingLeft"
+                HitPartName = "WingLeft",
+                HitColliderPath = "Damage/WingLeft/Hitbox"
             };
 
             byte[] data = PacketSerializer.SerializeDamage(original);
@@ -473,12 +476,15 @@ namespace TCAMultiplayer.Tests
             Assert.AreEqual(original.DamageSequence, result.DamageSequence);
             Assert.AreEqual(original.Damage, result.Damage);
             Assert.AreEqual(original.Penetration, result.Penetration);
+            Assert.AreEqual(original.CriticalHitChance, result.CriticalHitChance);
+            Assert.AreEqual(original.MaxCriticalHits, result.MaxCriticalHits);
             Assert.AreEqual(original.DamageType, result.DamageType);
             Assert.AreEqual(original.HitPosX, result.HitPosX, 0.0001);
             Assert.AreEqual(original.HitPosY, result.HitPosY, 0.0001);
             Assert.AreEqual(original.HitPosZ, result.HitPosZ, 0.0001);
             Assert.AreEqual(original.WeaponName, result.WeaponName);
             Assert.AreEqual(original.HitPartName, result.HitPartName);
+            Assert.AreEqual(original.HitColliderPath, result.HitColliderPath);
         }
 
         [Test]
@@ -496,7 +502,8 @@ namespace TCAMultiplayer.Tests
             byte[] full = PacketSerializer.SerializeDamage(original);
 
             // Strip the trailing part-name string (1 length byte + 8 chars)
-            byte[] legacy = new byte[full.Length - 9];
+            // and the later critical-hit fields plus empty collider path.
+            byte[] legacy = new byte[full.Length - 18];
             System.Array.Copy(full, legacy, legacy.Length);
 
             var result = PacketSerializer.DeserializeDamage(legacy);
@@ -504,6 +511,68 @@ namespace TCAMultiplayer.Tests
             Assert.AreEqual(3U, result.AttackerLifeId);
             Assert.AreEqual(77U, result.DamageSequence);
             Assert.IsTrue(string.IsNullOrEmpty(result.HitPartName));
+            Assert.AreEqual(0, result.CriticalHitChance);
+            Assert.AreEqual(0, result.MaxCriticalHits);
+        }
+
+        [Test]
+        public void Damage_LegacyPayloadWithoutCriticalFields_Deserializes()
+        {
+            var original = new DamagePacket
+            {
+                VictimId = 10,
+                AttackerId = 20,
+                AttackerLifeId = 3,
+                DamageSequence = 77,
+                Damage = 500,
+                Penetration = 100,
+                CriticalHitChance = 30,
+                MaxCriticalHits = 2,
+                WeaponName = "M61A1",
+                HitPartName = "WingLeft"
+            };
+            byte[] full = PacketSerializer.SerializeDamage(original);
+
+            // Strip the appended critical-hit fields and later empty collider path.
+            byte[] legacy = new byte[full.Length - 9];
+            System.Array.Copy(full, legacy, legacy.Length);
+
+            var result = PacketSerializer.DeserializeDamage(legacy);
+            Assert.AreEqual(10UL, result.VictimId);
+            Assert.AreEqual("WingLeft", result.HitPartName);
+            Assert.AreEqual(0, result.CriticalHitChance);
+            Assert.AreEqual(0, result.MaxCriticalHits);
+        }
+
+        [Test]
+        public void Damage_LegacyPayloadWithoutColliderPath_Deserializes()
+        {
+            var original = new DamagePacket
+            {
+                VictimId = 10,
+                AttackerId = 20,
+                AttackerLifeId = 3,
+                DamageSequence = 77,
+                Damage = 500,
+                Penetration = 100,
+                CriticalHitChance = 30,
+                MaxCriticalHits = 2,
+                WeaponName = "M61A1",
+                HitPartName = "WingLeft",
+                HitColliderPath = "Damage/WingLeft/Hitbox"
+            };
+            byte[] full = PacketSerializer.SerializeDamage(original);
+
+            // Short ASCII string: one 7-bit length byte plus the path bytes.
+            byte[] legacy = new byte[full.Length - (1 + original.HitColliderPath.Length)];
+            System.Array.Copy(full, legacy, legacy.Length);
+
+            var result = PacketSerializer.DeserializeDamage(legacy);
+            Assert.AreEqual(10UL, result.VictimId);
+            Assert.AreEqual("WingLeft", result.HitPartName);
+            Assert.AreEqual(30, result.CriticalHitChance);
+            Assert.AreEqual(2, result.MaxCriticalHits);
+            Assert.IsTrue(string.IsNullOrEmpty(result.HitColliderPath));
         }
 
         [Test]
@@ -547,11 +616,14 @@ namespace TCAMultiplayer.Tests
                 AttackerId = ulong.MaxValue,
                 Damage = int.MaxValue,
                 Penetration = int.MaxValue,
+                CriticalHitChance = int.MaxValue,
+                MaxCriticalHits = int.MaxValue,
                 DamageType = byte.MaxValue,
                 HitPosX = double.MaxValue,
                 HitPosY = double.MaxValue,
                 HitPosZ = double.MaxValue,
-                WeaponName = "TestWeapon"
+                WeaponName = "TestWeapon",
+                HitColliderPath = "Root/Hitbox"
             };
 
             byte[] data = PacketSerializer.SerializeDamage(original);
@@ -561,8 +633,11 @@ namespace TCAMultiplayer.Tests
             Assert.AreEqual(ulong.MaxValue, result.AttackerId);
             Assert.AreEqual(int.MaxValue, result.Damage);
             Assert.AreEqual(int.MaxValue, result.Penetration);
+            Assert.AreEqual(int.MaxValue, result.CriticalHitChance);
+            Assert.AreEqual(int.MaxValue, result.MaxCriticalHits);
             Assert.AreEqual(byte.MaxValue, result.DamageType);
             Assert.AreEqual(double.MaxValue, result.HitPosX);
+            Assert.AreEqual("Root/Hitbox", result.HitColliderPath);
         }
 
         [Test]
