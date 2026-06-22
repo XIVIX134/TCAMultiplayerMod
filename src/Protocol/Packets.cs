@@ -458,6 +458,32 @@ namespace TCAMultiplayer.Protocol
     // ═══════════════════════════════════════════════════════════════
 
     /// <summary>
+    /// How receivers should feed a reconstructed DamageSource into native
+    /// Damageable APIs. Kept separate from the weapon category because guns,
+    /// missiles, rockets, and direct bomb hits can all arrive as impacts.
+    /// </summary>
+    public static class DamageApplicationType
+    {
+        public const byte Impact = 0;
+        public const byte Explosion = 2;
+    }
+
+    /// <summary>
+    /// Best-known weapon source category for diagnostics and future
+    /// scoring/UI paths. Authoritative numeric damage still comes from the
+    /// DamageSource fields carried by DamagePacket.
+    /// </summary>
+    public static class DamageWeaponCategory
+    {
+        public const byte Unknown = 0;
+        public const byte Gun = 1;
+        public const byte Missile = 2;
+        public const byte Bomb = 3;
+        public const byte Rocket = 4;
+        public const byte OtherMunition = 5;
+    }
+
+    /// <summary>
     /// Damage event packet — sent when attacker hits victim.
     /// Uses absolute (double-precision) coordinates for floating-origin sync.
     /// </summary>
@@ -471,7 +497,8 @@ namespace TCAMultiplayer.Protocol
         public int Penetration;
         public int CriticalHitChance;
         public int MaxCriticalHits;
-        public byte DamageType;     // 0 = bullet, 1 = missile, 2 = explosion
+        public byte DamageType;     // DamageApplicationType: 0 = impact, 2 = explosion
+        public byte WeaponCategory; // DamageWeaponCategory: gun/missile/bomb/rocket/etc.
         public double HitPosX;
         public double HitPosY;
         public double HitPosZ;

@@ -246,6 +246,7 @@ namespace TCAMultiplayer.Protocol
                 w.Write(packet.CriticalHitChance);
                 w.Write(packet.MaxCriticalHits);
                 w.Write(packet.HitColliderPath ?? "");
+                w.Write(packet.WeaponCategory);
                 return ms.ToArray();
             }
         }
@@ -287,9 +288,14 @@ namespace TCAMultiplayer.Protocol
                     packet.MaxCriticalHits = r.ReadInt32();
                 }
 
-                // Backward compat: hit collider path was appended last.
+                // Backward compat: hit collider path was appended after
+                // critical-hit fields.
                 if (r.BaseStream.Position < r.BaseStream.Length)
                     packet.HitColliderPath = r.ReadString();
+
+                // Backward compat: explicit weapon category was appended last.
+                if (r.BaseStream.Position < r.BaseStream.Length)
+                    packet.WeaponCategory = r.ReadByte();
 
                 return packet;
             });

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using Falcon;
 using Falcon.Damage;
+using Falcon.Stores;
 using Falcon.Targeting;
 using Falcon.UniversalAircraft;
 using TCAMultiplayer.Core;
@@ -68,7 +69,8 @@ namespace TCAMultiplayer.Combat
             var payload = PacketSerializer.SerializeDamage(packet);
             var data = PacketSerializer.Serialize(PacketType.DamageDealt, payload);
             _connection.BroadcastReliable(data);
-            Log.Debug(Tag, $"Sent damage: {packet.Damage} to victim {victimPeerId} weapon={packet.WeaponName}");
+            Log.Debug(Tag, $"Sent damage: {packet.Damage} to victim {victimPeerId} " +
+                           $"category={FormatWeaponCategory(packet.WeaponCategory)} weapon={packet.WeaponName}");
         }
 
         // ── Inbound: receive damage from remote shooter ──────────────
@@ -214,7 +216,8 @@ namespace TCAMultiplayer.Combat
 
             Log.Info(Tag, $"{(isLocalVictim ? "Applied" : "Mirrored clone")} {packet.Damage} dmg " +
                           $"from {packet.AttackerId} to {packet.VictimId} " +
-                          $"(type={packet.DamageType}, part={FormatPart(packet.HitPartName)}, " +
+                          $"(type={packet.DamageType}, category={FormatWeaponCategory(packet.WeaponCategory)}, " +
+                          $"part={FormatPart(packet.HitPartName)}, " +
                           $"collider={packet.HitColliderPath ?? ""}) hullHP={primaryDamageable.HitPoints}");
         }
 
@@ -235,7 +238,7 @@ namespace TCAMultiplayer.Combat
             DamagePatch.NetworkDamageDepth++;
             try
             {
-                if (damageType == 2)
+                if (damageType == DamageApplicationType.Explosion)
                     targetDamageable.ApplyDamageFromExplosion(damageSource);
                 else
                     targetDamageable.ApplyDamageFromImpact(damageSource);
@@ -472,11 +475,15 @@ namespace TCAMultiplayer.Combat
             _originService.LocalToAbsolute(hitPos, out double absX, out double absY, out double absZ);
             LogForwardDiagnostic(victimPeerId, source, isExplosion);
             var localLifeId = GetLocalLifeId();
+            byte damageType = isExplosion
+                ? DamageApplicationType.Explosion
+                : DamageApplicationType.Impact;
+            byte weaponCategory = ResolveWeaponCategory(source, isExplosion);
             var eventId = _damageSequencer.Next(
                 _session.LocalPeerId,
                 localLifeId,
                 ApplicationEventKind.Damage,
-                isExplosion ? (byte)2 : (byte)0);
+                damageType);
 
             // Identify the damageable part that was hit on the clone (part
             // Damageables carry a WingDamage and are named after the JSON part)
@@ -495,7 +502,8 @@ namespace TCAMultiplayer.Combat
                 Penetration = source.Penetration,
                 CriticalHitChance = source.CriticalHitChance,
                 MaxCriticalHits = source.MaxCriticalHits,
-                DamageType = isExplosion ? (byte)2 : (byte)0,
+                DamageType = damageType,
+                WeaponCategory = weaponCategory,
                 HitPosX = absX,
                 HitPosY = absY,
                 HitPosZ = absZ,
@@ -507,7 +515,8 @@ namespace TCAMultiplayer.Combat
             ApplyNetworkDamage(cloneDamageable, source, packet.DamageType, allowDestroy: false);
             SendDamage(victimPeerId, packet);
             Log.Info(Tag, $"Forwarded {source.Damage} damage to peer {victimPeerId} " +
-                          $"type={(isExplosion ? "explosion" : "impact")} weapon={source.Weapon} event={eventId}");
+                          $"type={(isExplosion ? "explosion" : "impact")} " +
+                          $"category={FormatWeaponCategory(weaponCategory)} weapon={source.Weapon} event={eventId}");
         }
 
         private static Collider ResolveHitCollider(
@@ -596,6 +605,164 @@ namespace TCAMultiplayer.Combat
         private static string FormatPart(string partName)
         {
             return string.IsNullOrEmpty(partName) ? "hull" : partName;
+        }
+
+        private static byte ResolveWeaponCategory(DamageSource source, bool isExplosion)
+        {
+            string weaponName = NormalizeWeaponName(source.Weapon);
+            byte activeMunitionCategory = ResolveActiveMunitionCategory(weaponName);
+            if (activeMunitionCategory != DamageWeaponCategory.Unknown)
+                return activeMunitionCategory;
+
+            if (LooksLikeGun(weaponName))
+                return DamageWeaponCategory.Gun;
+            if (LooksLikeMissile(weaponName))
+                return DamageWeaponCategory.Missile;
+            if (LooksLikeRocket(weaponName))
+                return DamageWeaponCategory.Rocket;
+            if (LooksLikeBomb(weaponName))
+                return DamageWeaponCategory.Bomb;
+
+            return isExplosion && source.IsCausedByWeapon
+                ? DamageWeaponCategory.OtherMunition
+                : DamageWeaponCategory.Unknown;
+        }
+
+        private static byte ResolveActiveMunitionCategory(string weaponName)
+        {
+            if (string.IsNullOrEmpty(weaponName))
+                return DamageWeaponCategory.Unknown;
+
+            var missiles = Munition.LaunchedMissiles;
+            if (missiles != null)
+            {
+                for (int i = 0; i < missiles.Count; i++)
+                {
+                    var munition = missiles[i];
+                    if (MunitionNameMatches(munition, weaponName))
+                        return DamageWeaponCategory.Missile;
+                }
+            }
+
+            var munitions = Munition.LaunchedMunitions;
+            if (munitions != null)
+            {
+                for (int i = 0; i < munitions.Count; i++)
+                {
+                    var munition = munitions[i];
+                    if (!MunitionNameMatches(munition, weaponName))
+                        continue;
+                    if (munition.HasSeeker)
+                        return DamageWeaponCategory.Missile;
+                    if (HasMotorStages(munition))
+                        return DamageWeaponCategory.Rocket;
+                    return DamageWeaponCategory.Bomb;
+                }
+            }
+
+            return DamageWeaponCategory.Unknown;
+        }
+
+        private static bool MunitionNameMatches(Munition munition, string weaponName)
+        {
+            if (munition == null || string.IsNullOrEmpty(weaponName))
+                return false;
+
+            string munitionName = NormalizeWeaponName(munition.name);
+            if (string.Equals(munitionName, weaponName, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            string displayName = NormalizeWeaponName(munition.Data?.DisplayName);
+            return string.Equals(displayName, weaponName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool HasMotorStages(Munition munition)
+        {
+            try
+            {
+                return munition?.Data?.MotorStages != null && munition.Data.MotorStages.Count > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static string NormalizeWeaponName(string weaponName)
+        {
+            if (string.IsNullOrWhiteSpace(weaponName))
+                return "";
+
+            string normalized = weaponName.Trim();
+            int cloneIndex = normalized.IndexOf("(Clone)", StringComparison.Ordinal);
+            if (cloneIndex >= 0)
+                normalized = normalized.Substring(0, cloneIndex).TrimEnd();
+            return normalized;
+        }
+
+        private static bool LooksLikeGun(string weaponName)
+        {
+            if (string.IsNullOrEmpty(weaponName))
+                return false;
+            return ContainsAny(weaponName, "gun", "cannon", "vulcan", "gatling", "m61", "gau-", "gau_", "mg-");
+        }
+
+        private static bool LooksLikeMissile(string weaponName)
+        {
+            if (string.IsNullOrEmpty(weaponName))
+                return false;
+            return StartsWithAny(weaponName, "aim", "agm", "sam")
+                || ContainsAny(weaponName, "missile", "sidewinder", "sparrow", "amraam", "maverick", "hellfire");
+        }
+
+        private static bool LooksLikeRocket(string weaponName)
+        {
+            if (string.IsNullOrEmpty(weaponName))
+                return false;
+            return ContainsAny(weaponName, "rocket", "hydra", "zuni", "ffar", "s-5", "s-8", "s8");
+        }
+
+        private static bool LooksLikeBomb(string weaponName)
+        {
+            if (string.IsNullOrEmpty(weaponName))
+                return false;
+            return StartsWithAny(weaponName, "mk-", "gbu", "cbu", "bdu", "fab", "kab", "b61")
+                || ContainsAny(weaponName, "bomb", "jdam", "paveway");
+        }
+
+        private static bool StartsWithAny(string value, params string[] prefixes)
+        {
+            for (int i = 0; i < prefixes.Length; i++)
+                if (value.StartsWith(prefixes[i], StringComparison.OrdinalIgnoreCase))
+                    return true;
+            return false;
+        }
+
+        private static bool ContainsAny(string value, params string[] patterns)
+        {
+            for (int i = 0; i < patterns.Length; i++)
+                if (value.IndexOf(patterns[i], StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            return false;
+        }
+
+        private static string FormatWeaponCategory(byte weaponCategory)
+        {
+            switch (weaponCategory)
+            {
+                case DamageWeaponCategory.Gun:
+                    return "gun";
+                case DamageWeaponCategory.Missile:
+                    return "missile";
+                case DamageWeaponCategory.Bomb:
+                    return "bomb";
+                case DamageWeaponCategory.Rocket:
+                    return "rocket";
+                case DamageWeaponCategory.OtherMunition:
+                    return "munition";
+                default:
+                    return "unknown";
+            }
         }
 
         // ── Dispose ──────────────────────────────────────────────────
