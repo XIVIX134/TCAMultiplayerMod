@@ -83,6 +83,7 @@ namespace TCAMultiplayer
         private HostPacketRelay _hostRelay;
         private LocalAircraftStateReader _stateReader;
         private ModManifestCollector _modManifest;
+        private MultiplayerRichPresence _presence;
         private bool _pendingManifestSend;
         private string _loadedMapSceneName;
         private LoadingScreen _loadingScreen;
@@ -145,6 +146,7 @@ namespace TCAMultiplayer
             _connection.OnSessionCreated += OnSessionCreated;
             _connection.OnSessionEnded += OnSessionEnded;
             _connection.OnConnectionFailed += OnConnectionFailed;
+            _presence = new MultiplayerRichPresence();
 
             if (ModConfig.GetTransportType() == Core.TransportType.SteamLobby && Steamworks.SteamClient.IsValid)
             {
@@ -857,6 +859,7 @@ namespace TCAMultiplayer
                     1);
                 _connection.Config.MaxConnections = Math.Max(0, session.MaxPlayersTotal - 1);
             }
+            _presence?.ShowForSession(session);
             _hostRelay = new HostPacketRelay(session, _connection, router);
             // Game flow managers
             _lobby = new LobbyManager(session, _connection, router);
@@ -891,6 +894,7 @@ namespace TCAMultiplayer
             _scoreTracker = new ScoreTracker(session, router, connection: _connection);
             _scoreTracker.OnKillConfirmed += HandleKillConfirmed;
             _scoreTracker.OnDeathConfirmed += HandleDeathConfirmed;
+            _scoreTracker.OnScoresChanged += HandleScoresChanged;
 
             // Combat sync systems
             _radarSync = new RadarSyncSystem(session, _connection, router, _remoteManager,
@@ -1004,6 +1008,7 @@ namespace TCAMultiplayer
         private void OnLobbyStateChanged()
         {
             if (_activeSession == null || _connection?.Transport == null) return;
+            _presence?.ShowForSession(_activeSession);
             if (!_activeSession.IsHost) return;
 
             // Only the SteamP2PTransport has UpdateLobbyMap; check via type
@@ -1016,6 +1021,7 @@ namespace TCAMultiplayer
         private async void OnGameStarting(string mapName)
         {
             Log.Info(Tag, $"Game starting on map: {mapName}");
+            _presence?.ShowForSession(_activeSession);
 
             try
             {
@@ -1241,6 +1247,7 @@ namespace TCAMultiplayer
             _loadingScreen = null;
 
             _activeSession?.StateMachine.TryTransition(GameState.InGame);
+            _presence?.ShowInGame(_activeSession, aircraft?.Data?.Name);
 
             // Lock the cursor for flight (native StartFlight callers do this —
             // see QuickMissionGame.RunQuickMission — but we bypass that path).
@@ -1276,6 +1283,8 @@ namespace TCAMultiplayer
         /// </summary>
         private void HandleSessionStateChanged(GameState oldState, GameState newState)
         {
+            _presence?.ShowForSession(_activeSession);
+
             bool leftGameplay = oldState == GameState.Loading
                 || oldState == GameState.Spawning
                 || oldState == GameState.InGame
@@ -1364,6 +1373,7 @@ namespace TCAMultiplayer
             TinyCursor.LockState = CursorLockMode.None;
             Cursor.visible = true;
             _menu?.ShowLobby();
+            _presence?.ShowForSession(_activeSession);
         }
 
         private void HandlePeerRespawned(ulong peerId, string aircraftType)
@@ -1413,6 +1423,7 @@ namespace TCAMultiplayer
             TinyCursor.LockState = CursorLockMode.Locked;
             Cursor.visible = true;
             Cursor.lockState = CursorLockMode.Locked;
+            _presence?.ShowInGame(_activeSession, aircraft?.Data?.Name ?? aircraftType);
         }
 
         /// <summary>
@@ -1671,6 +1682,7 @@ namespace TCAMultiplayer
                 player.SelectedAircraft = packet.AircraftType;
                 player.IsAlive = packet.IsAlive;
                 Log.Info(Tag, $"Peer {packet.PlayerId} aircraft changed to {packet.AircraftType}");
+                _presence?.ShowForSession(_activeSession);
             }
         }
 
@@ -1683,6 +1695,12 @@ namespace TCAMultiplayer
             _gunSync?.RemovePeer(peerId);
             _remoteManager?.RemovePeer(peerId);
             Log.Info(Tag, $"Cleaned up disconnected peer {peerId}");
+            _presence?.ShowForSession(_activeSession);
+        }
+
+        private void HandleScoresChanged()
+        {
+            _presence?.ShowForSession(_activeSession);
         }
 
         private void HandleModCompatibilityAccepted()
@@ -1795,6 +1813,7 @@ namespace TCAMultiplayer
             {
                 _scoreTracker.OnKillConfirmed -= HandleKillConfirmed;
                 _scoreTracker.OnDeathConfirmed -= HandleDeathConfirmed;
+                _scoreTracker.OnScoresChanged -= HandleScoresChanged;
             }
             _scoreTracker?.Dispose(); _scoreTracker = null;
             // Unsubscribe respawn handler before disposing managers
@@ -1850,6 +1869,7 @@ namespace TCAMultiplayer
             FireControlPatch.ConfigureRemoteGun = null;
 
             _activeSession = null;
+            _presence?.RestoreMainMenu();
             Log.Info(Tag, "Session torn down");
 
             // Restore native main menu when returning from game
