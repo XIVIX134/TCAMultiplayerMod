@@ -25,6 +25,7 @@ namespace TCAMultiplayer.Core
     public class ConnectionManager : IDisposable
     {
         private const string Tag = "CONN";
+        private const int DefaultDirectPort = 7777;
 
         /// <summary>
         /// Seconds to wait for a Welcome packet from the host before
@@ -45,6 +46,8 @@ namespace TCAMultiplayer.Core
         // ── Connection timeout (client-side) ──────────────────────────
         private float _connectionElapsed;
         private bool _waitingForWelcome;
+        private string _pendingJoinAddress = "";
+        private int _pendingJoinPort;
 
         // ── Public accessors ─────────────────────────────────────────────
 
@@ -181,7 +184,7 @@ namespace TCAMultiplayer.Core
             }
 
             _reliability.Clear();
-            SetStatusMessage($"Hosting on port {port}");
+            SetStatusMessage(FormatHostStatus(port));
             _transport.StartHost(port);
 
             _session = new GameSession(isHost: true);
@@ -214,7 +217,9 @@ namespace TCAMultiplayer.Core
             }
 
             _reliability.Clear();
-            SetStatusMessage($"Connecting to {address}:{port}");
+            _pendingJoinAddress = address ?? "";
+            _pendingJoinPort = port;
+            SetStatusMessage(FormatJoinStatus(_pendingJoinAddress, _pendingJoinPort));
             _transport.Connect(address, port);
 
             _session = new GameSession(isHost: false);
@@ -315,11 +320,11 @@ namespace TCAMultiplayer.Core
                     if (_connectionElapsed > ConnectionTimeoutSeconds)
                     {
                         _waitingForWelcome = false;
-                        string reason = $"Connection timed out after {ConnectionTimeoutSeconds:F0}s — " +
-                            "host did not respond. Check that the host is running and reachable.";
+                        string reason = BuildConnectionTimeoutReason();
                         Log.Warning(Tag, reason);
-                        OnConnectionFailed?.Invoke(reason);
                         Disconnect();
+                        SetStatusMessage(reason);
+                        OnConnectionFailed?.Invoke(reason);
                     }
                 }
             }
@@ -385,6 +390,40 @@ namespace TCAMultiplayer.Core
 
             _statusMessage = message;
             OnStatusMessage?.Invoke(message);
+        }
+
+        private static string FormatHostStatus(int port)
+        {
+            if (port <= 0)
+                return "Hosting Steam lobby";
+            return port == DefaultDirectPort
+                ? $"Hosting on default network port {port}"
+                : $"Hosting on custom port {port}";
+        }
+
+        private static string FormatJoinStatus(string address, int port)
+        {
+            if (port <= 0)
+                return "Connecting to Steam host";
+
+            string portMode = port == DefaultDirectPort ? "default network port" : "custom port";
+            return $"Connecting to {address} using {portMode} {port}";
+        }
+
+        private string BuildConnectionTimeoutReason()
+        {
+            if (_pendingJoinPort > 0)
+            {
+                string address = string.IsNullOrWhiteSpace(_pendingJoinAddress)
+                    ? "host"
+                    : _pendingJoinAddress;
+                string portMode = _pendingJoinPort == DefaultDirectPort ? "default port" : "custom port";
+                return $"Could not reach {address} using {portMode} {_pendingJoinPort}. " +
+                    "If the host changed the port, open Advanced Port and enter it.";
+            }
+
+            return $"Connection timed out after {ConnectionTimeoutSeconds:F0}s - host did not respond. " +
+                "Try refreshing the lobby or ask the host to restart it.";
         }
 
         // ── Dispose ─────────────────────────────────────────────────────

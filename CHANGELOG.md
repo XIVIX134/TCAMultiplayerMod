@@ -12,6 +12,7 @@ All notable changes to TCAMP are tracked here.
 - Improved damage sync so critical-hit settings, hit collider paths, and weapon categories are preserved when remote damage is serialized and applied.
 - Fixed remote damage mirroring so non-local victim clones can show replicated hits without being destroyed by another player's damage packet.
 - Improved multiplayer menu sizing for host setup and confirmation dialogs so longer labels and warning text fit more reliably.
+- Improved Direct IP hosting and joining so the default port is automatic, custom ports live behind an advanced control, pasted `address:port` values are handled, and timeout messages explain the default/custom port path.
 
 ## v0.3.1 - 2026-06-20
 

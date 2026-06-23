@@ -25,6 +25,8 @@ namespace TCAMultiplayer.UI
         private const string Tag = "MP-MENU";
         private const string Green = "#00FF40";
         private const string DimGreen = "#007A28";
+        private const int DefaultDirectPort = 7777;
+        private const string DefaultDirectPortText = "7777";
         private const string ModSyncWarning =
             "Before syncing, TCAMP will back up your current Mods folder to TCAMP_ModBackups in the game root.\n\n" +
             "Syncing from the host will overwrite changed mod files and remove extra sync-safe files in your Mods folder.\n\n" +
@@ -69,6 +71,8 @@ namespace TCAMultiplayer.UI
         private string _connectPort;
         private string _hostName;
         private string _hostPort;
+        private bool _showJoinPortAdvanced;
+        private bool _showHostPortAdvanced;
         private int _transportIdx;
 
         private Steamworks.Data.Lobby[] _lobbyResults;
@@ -269,9 +273,11 @@ namespace TCAMultiplayer.UI
         {
             _username = ModConfig.Username?.Value ?? "Player";
             _connectIP = ModConfig.LastIP?.Value ?? "127.0.0.1";
-            _connectPort = ModConfig.LastPort?.Value ?? "7777";
+            _connectPort = ModConfig.LastPort?.Value ?? DefaultDirectPortText;
             _hostName = ModConfig.HostServerName?.Value ?? "TCA Server";
-            _hostPort = ModConfig.HostPort?.Value ?? "7777";
+            _hostPort = ModConfig.HostPort?.Value ?? DefaultDirectPortText;
+            _showJoinPortAdvanced = IsCustomPort(_connectPort);
+            _showHostPortAdvanced = IsCustomPort(_hostPort);
             _transportIdx = ModConfig.GetTransportType() == Core.TransportType.SteamLobby ? 1 : 0;
         }
 
@@ -465,11 +471,7 @@ namespace TCAMultiplayer.UI
 
             if (!isSteam)
             {
-                UIFactory.CreateLabelInputRow("Port >", _hostPort, panel.transform, val =>
-                {
-                    _hostPort = val;
-                    if (ModConfig.HostPort != null) ModConfig.HostPort.Value = val;
-                }, 200f);
+                DrawDirectPortControls(panel.transform, host: true);
             }
 
             DrawHostSetupOptions(panel.transform, isSteam);
@@ -520,10 +522,86 @@ namespace TCAMultiplayer.UI
                 }, labelWidth: 200f));
         }
 
+        private void DrawDirectPortControls(Transform parent, bool host)
+        {
+            bool advanced = host ? _showHostPortAdvanced : _showJoinPortAdvanced;
+            string portText = host ? _hostPort : _connectPort;
+
+            if (advanced)
+            {
+                UIFactory.CreateLabelInputRow("Custom Port >", portText, parent, val =>
+                {
+                    if (host)
+                    {
+                        _hostPort = val;
+                        if (ModConfig.HostPort != null) ModConfig.HostPort.Value = val;
+                    }
+                    else
+                    {
+                        _connectPort = val;
+                        if (ModConfig.LastPort != null) ModConfig.LastPort.Value = val;
+                    }
+                }, 200f);
+
+                var row = UIFactory.CreateHorizontalRow(parent, 40, 10);
+                var note = UIFactory.CreateNativeText(
+                    $"<color={DimGreen}>Most sessions use port {DefaultDirectPort}.</color>",
+                    row.transform, 16, TextAlignmentOptions.MidlineLeft);
+                UIFactory.SetFlexible(note.gameObject);
+
+                var reset = UIFactory.CreateNativeButton("USE DEFAULT", row.transform, 40);
+                if (reset != null)
+                {
+                    UIFactory.SetLayoutWidth(reset.gameObject, 220f, 220f);
+                    reset.onClick.AddListener(() =>
+                    {
+                        if (host)
+                        {
+                            _hostPort = DefaultDirectPortText;
+                            _showHostPortAdvanced = false;
+                            if (ModConfig.HostPort != null) ModConfig.HostPort.Value = DefaultDirectPortText;
+                        }
+                        else
+                        {
+                            _connectPort = DefaultDirectPortText;
+                            _showJoinPortAdvanced = false;
+                            if (ModConfig.LastPort != null) ModConfig.LastPort.Value = DefaultDirectPortText;
+                        }
+
+                        ModConfig.Save();
+                        RefreshUI();
+                    });
+                }
+
+                return;
+            }
+
+            var defaultRow = UIFactory.CreateHorizontalRow(parent, 40, 10);
+            var info = UIFactory.CreateNativeText(
+                $"<color={DimGreen}>Default network port: {DefaultDirectPort}</color>",
+                defaultRow.transform, 16, TextAlignmentOptions.MidlineLeft);
+            UIFactory.SetFlexible(info.gameObject);
+
+            var custom = UIFactory.CreateNativeButton("ADVANCED PORT", defaultRow.transform, 40);
+            if (custom != null)
+            {
+                UIFactory.SetLayoutWidth(custom.gameObject, 220f, 220f);
+                custom.onClick.AddListener(() =>
+                {
+                    if (host)
+                        _showHostPortAdvanced = true;
+                    else
+                        _showJoinPortAdvanced = true;
+                    RefreshUI();
+                });
+            }
+        }
+
         private void DrawDirectConnect()
         {
-            var panel = CreateMenuPanel(960f, 430f);
-            AddHeader(panel.transform, "DIRECT CONNECT", "Join a lobby by address.");
+            float height = _showJoinPortAdvanced ? 470f : 430f;
+            var panel = CreateMenuPanel(960f, height);
+            AddHeader(panel.transform, "DIRECT CONNECT", "Join a lobby by address. The default network port is used automatically.");
             DrawStatusMessage(panel.transform);
 
             UIFactory.CreateLabelInputRow("Address >", _connectIP, panel.transform, val =>
@@ -532,11 +610,7 @@ namespace TCAMultiplayer.UI
                 if (ModConfig.LastIP != null) ModConfig.LastIP.Value = val;
             });
 
-            UIFactory.CreateLabelInputRow("Port >", _connectPort, panel.transform, val =>
-            {
-                _connectPort = val;
-                if (ModConfig.LastPort != null) ModConfig.LastPort.Value = val;
-            });
+            DrawDirectPortControls(panel.transform, host: false);
 
             UIFactory.CreateSpacer(panel.transform, 18, 1f);
 
@@ -1243,11 +1317,14 @@ namespace TCAMultiplayer.UI
                 return;
             }
 
-            int port = 7777;
+            int port = DefaultDirectPort;
             if (_transportIdx == 0)
             {
-                int.TryParse(_hostPort, out port);
-                if (port <= 0) port = 7777;
+                port = ParsePortOrDefault(_hostPort);
+            }
+            else
+            {
+                port = 0;
             }
 
             // Log the state before hosting
@@ -1301,8 +1378,26 @@ namespace TCAMultiplayer.UI
         {
             if (_connection == null) return;
 
-            int.TryParse(_connectPort, out int port);
-            if (port <= 0) port = 7777;
+            string address = (_connectIP ?? "").Trim();
+            int port = ParsePortOrDefault(_connectPort);
+
+            if (TrySplitAddressPort(address, out string splitAddress, out int splitPort))
+            {
+                address = splitAddress;
+                port = splitPort;
+                _connectIP = address;
+                _connectPort = port.ToString();
+                _showJoinPortAdvanced = IsCustomPort(_connectPort);
+                if (ModConfig.LastIP != null) ModConfig.LastIP.Value = _connectIP;
+                if (ModConfig.LastPort != null) ModConfig.LastPort.Value = _connectPort;
+            }
+
+            if (string.IsNullOrWhiteSpace(address))
+            {
+                _statusMessage = $"Enter the host address. TCAMP uses port {DefaultDirectPort} automatically.";
+                RefreshUI();
+                return;
+            }
 
             // Ensure we're using DirectUdpTransport for direct connections
             if (_transportIdx == 0 && !(_connection.Config is null))
@@ -1314,11 +1409,11 @@ namespace TCAMultiplayer.UI
             try
             {
                 ApplyNetworkConfigToTransport();
-                _connection.JoinSession(_connectIP, port);
+                _connection.JoinSession(address, port);
                 var local = _connection.Session?.GetLocalPlayer();
                 if (local != null) local.PlayerName = _username;
                 SetScreen(Screen.Lobby);
-                Log.Info(Tag, $"Joining {_connectIP}:{port}");
+                Log.Info(Tag, $"Joining {address}:{port}");
             }
             catch (Exception ex)
             {
@@ -1736,6 +1831,44 @@ namespace TCAMultiplayer.UI
             if (values == null || values.Count == 0) return 0;
             int index = values.IndexOf(current);
             return index >= 0 ? index : 0;
+        }
+
+        private static bool IsCustomPort(string portText)
+        {
+            return TryParsePort(portText, out int port) && port != DefaultDirectPort;
+        }
+
+        private static int ParsePortOrDefault(string portText)
+        {
+            return TryParsePort(portText, out int port) ? port : DefaultDirectPort;
+        }
+
+        private static bool TryParsePort(string portText, out int port)
+        {
+            return int.TryParse((portText ?? "").Trim(), out port)
+                && port > 0
+                && port <= 65535;
+        }
+
+        private static bool TrySplitAddressPort(string input, out string address, out int port)
+        {
+            address = (input ?? "").Trim();
+            port = DefaultDirectPort;
+
+            int colon = address.LastIndexOf(':');
+            if (colon <= 0 || colon != address.IndexOf(':') || colon == address.Length - 1)
+                return false;
+
+            string portText = address.Substring(colon + 1).Trim();
+            if (!TryParsePort(portText, out port))
+                return false;
+
+            string addressText = address.Substring(0, colon).Trim();
+            if (string.IsNullOrWhiteSpace(addressText))
+                return false;
+
+            address = addressText;
+            return true;
         }
 
         private static List<string> BuildPlayerLimitOptions()
