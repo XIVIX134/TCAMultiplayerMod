@@ -6,6 +6,13 @@ All notable changes to TCAMP are tracked here.
 
 - Add new changes here before running `.\scripts\Release-Version.ps1`.
 
+## v0.3.2 - 2026-06-23
+
+- Added multiplayer Discord Rich Presence updates for lobbies, loading, gameplay, downed, and respawn states, including map/aircraft display names and a stable match timer.
+- Improved damage sync so critical-hit settings, hit collider paths, and weapon categories are preserved when remote damage is serialized and applied.
+- Fixed remote damage mirroring so non-local victim clones can show replicated hits without being destroyed by another player's damage packet.
+- Improved multiplayer menu sizing for host setup and confirmation dialogs so longer labels and warning text fit more reliably.
+
 ## v0.3.1 - 2026-06-20
 
 - Improved Direct IP routing so hosts listen on all IPv4 adapters while clients dynamically choose the correct local route for LAN, VPN/tunnel, or public IP joins.
