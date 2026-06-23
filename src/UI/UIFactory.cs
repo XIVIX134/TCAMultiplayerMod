@@ -747,7 +747,7 @@ namespace TCAMultiplayer.UI
                 panelRect.anchorMax = new Vector2(0.5f, 0.5f);
                 panelRect.pivot = new Vector2(0.5f, 0.5f);
                 panelRect.anchoredPosition = Vector2.zero;
-                panelRect.sizeDelta = new Vector2(720f, 420f);
+                panelRect.sizeDelta = new Vector2(780f, 480f);
 
                 string warningColor = destructive ? "#FF3838" : "#007A28";
                 string titleText = destructive
@@ -758,13 +758,13 @@ namespace TCAMultiplayer.UI
 
                 var body = CreateNativeText(
                     $"<color={warningColor}>{message ?? string.Empty}</color>",
-                    panel.transform, 16, TextAlignmentOptions.Center);
+                    panel.transform, 18, TextAlignmentOptions.Center);
                 body.enableAutoSizing = true;
-                body.fontSizeMin = 12f;
-                body.fontSizeMax = 16f;
+                body.fontSizeMin = 16f;
+                body.fontSizeMax = 18f;
                 var bodyLayout = body.GetComponent<LayoutElement>();
-                bodyLayout.minHeight = 196f;
-                bodyLayout.preferredHeight = 196f;
+                bodyLayout.minHeight = 236f;
+                bodyLayout.preferredHeight = 236f;
 
                 CreateSpacer(panel.transform, 4, 1f);
 

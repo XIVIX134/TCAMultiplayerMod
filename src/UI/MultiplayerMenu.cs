@@ -452,7 +452,7 @@ namespace TCAMultiplayer.UI
         private void DrawHostSetup()
         {
             bool isSteam = _transportIdx == 1;
-            float height = isSteam ? 520f : 500f;
+            float height = 580f;
             var panel = CreateMenuPanel(960f, height);
             AddHeader(panel.transform, "HOST GAME", "Create a lobby and wait for peers to join.");
             DrawStatusMessage(panel.transform);
